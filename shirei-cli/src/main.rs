@@ -143,36 +143,36 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Info => {
             let auth = authorization_header(a.token.as_deref(), a.state_dir.as_deref())?;
-            let v: serde_json::Value = c
-                .get(format!("{}/api/v0.1/info", a.base_url))
-                .header("Authorization", &auth)
-                .send()
-                .await?
-                .json()
-                .await?;
+            let v: serde_json::Value = send_api_request(&a.base_url, || {
+                c.get(format!("{}/api/v0.1/info", a.base_url))
+                    .header("Authorization", auth.clone())
+            })
+            .await?
+            .json()
+            .await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Cmd::ProjectDiscover { path } => {
             let auth = authorization_header(a.token.as_deref(), a.state_dir.as_deref())?;
-            let v: serde_json::Value = c
-                .post(format!("{}/api/v0.1/projects/discover", a.base_url))
-                .header("Authorization", &auth)
-                .json(&serde_json::json!({"root_path": path}))
-                .send()
-                .await?
-                .json()
-                .await?;
+            let v: serde_json::Value = send_api_request(&a.base_url, || {
+                c.post(format!("{}/api/v0.1/projects/discover", a.base_url))
+                    .header("Authorization", auth.clone())
+                    .json(&serde_json::json!({"root_path": path.clone()}))
+            })
+            .await?
+            .json()
+            .await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Cmd::Projects => {
             let auth = authorization_header(a.token.as_deref(), a.state_dir.as_deref())?;
-            let v: serde_json::Value = c
-                .get(format!("{}/api/v0.1/projects", a.base_url))
-                .header("Authorization", &auth)
-                .send()
-                .await?
-                .json()
-                .await?;
+            let v: serde_json::Value = send_api_request(&a.base_url, || {
+                c.get(format!("{}/api/v0.1/projects", a.base_url))
+                    .header("Authorization", auth.clone())
+            })
+            .await?
+            .json()
+            .await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Cmd::Jobs { id, action } => match action {
@@ -186,13 +186,13 @@ async fn main() -> anyhow::Result<()> {
             }
             None => {
                 let auth = authorization_header(a.token.as_deref(), a.state_dir.as_deref())?;
-                let v: serde_json::Value = c
-                    .get(format!("{}/api/v0.1/projects/{}/jobs", a.base_url, id))
-                    .header("Authorization", &auth)
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
+                let v: serde_json::Value = send_api_request(&a.base_url, || {
+                    c.get(format!("{}/api/v0.1/projects/{}/jobs", a.base_url, id))
+                        .header("Authorization", auth.clone())
+                })
+                .await?
+                .json()
+                .await?;
                 println!("{}", serde_json::to_string_pretty(&v)?);
             }
         },
@@ -202,17 +202,17 @@ async fn main() -> anyhow::Result<()> {
             prompt,
         } => {
             let auth = authorization_header(a.token.as_deref(), a.state_dir.as_deref())?;
-            let v: serde_json::Value = c
-                .post(format!(
+            let v: serde_json::Value = send_api_request(&a.base_url, || {
+                c.post(format!(
                     "{}/api/v0.1/projects/{}/jobs",
                     a.base_url, project_id
                 ))
-                .header("Authorization", &auth)
-                .json(&serde_json::json!({"name": name, "prompt": prompt}))
-                .send()
-                .await?
-                .json()
-                .await?;
+                .header("Authorization", auth.clone())
+                .json(&serde_json::json!({"name": name.clone(), "prompt": prompt.clone()}))
+            })
+            .await?
+            .json()
+            .await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Cmd::WatchStart {
@@ -222,39 +222,39 @@ async fn main() -> anyhow::Result<()> {
             retention_days,
         } => {
             let auth = authorization_header(a.token.as_deref(), a.state_dir.as_deref())?;
-            let v: serde_json::Value = c
-                .post(format!("{}/api/v0.1/watch-pr", a.base_url))
-                .header("Authorization", &auth)
-                .json(&serde_json::json!({"project_id": project_id, "repo_key": repo_key, "pr_number": pr_number, "retention_days": retention_days}))
-                .send()
-                .await?
-                .json()
-                .await?;
+            let v: serde_json::Value = send_api_request(&a.base_url, || {
+                c.post(format!("{}/api/v0.1/watch-pr", a.base_url))
+                    .header("Authorization", auth.clone())
+                    .json(&serde_json::json!({"project_id": project_id.clone(), "repo_key": repo_key.clone(), "pr_number": pr_number, "retention_days": retention_days}))
+            })
+            .await?
+            .json()
+            .await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Cmd::WatchList => {
             let auth = authorization_header(a.token.as_deref(), a.state_dir.as_deref())?;
-            let v: serde_json::Value = c
-                .get(format!("{}/api/v0.1/watch-pr", a.base_url))
-                .header("Authorization", &auth)
-                .send()
-                .await?
-                .json()
-                .await?;
+            let v: serde_json::Value = send_api_request(&a.base_url, || {
+                c.get(format!("{}/api/v0.1/watch-pr", a.base_url))
+                    .header("Authorization", auth.clone())
+            })
+            .await?
+            .json()
+            .await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Cmd::WatchStop { watch_id } => {
             let auth = authorization_header(a.token.as_deref(), a.state_dir.as_deref())?;
-            let v: serde_json::Value = c
-                .post(format!(
+            let v: serde_json::Value = send_api_request(&a.base_url, || {
+                c.post(format!(
                     "{}/api/v0.1/watch-pr/{}/stop",
                     a.base_url, watch_id
                 ))
-                .header("Authorization", &auth)
-                .send()
-                .await?
-                .json()
-                .await?;
+                .header("Authorization", auth.clone())
+            })
+            .await?
+            .json()
+            .await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Cmd::Logs { job_id, tail_lines } => {
@@ -267,18 +267,79 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 format!("{}/api/v0.1/jobs/{}/logs", a.base_url, job_id)
             };
-            let v: serde_json::Value = c
-                .get(url)
-                .header("Authorization", &auth)
-                .send()
-                .await?
-                .json()
-                .await?;
+            let v: serde_json::Value = send_api_request(&a.base_url, || {
+                c.get(url.clone()).header("Authorization", auth.clone())
+            })
+            .await?
+            .json()
+            .await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
     }
 
     Ok(())
+}
+
+async fn send_api_request<F>(base_url: &str, request: F) -> anyhow::Result<reqwest::Response>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    send_api_request_with(base_url, request, || async { start_daemon_in_background() }).await
+}
+
+async fn send_api_request_with<F, B, BFut>(
+    base_url: &str,
+    mut request: F,
+    mut bootstrap: B,
+) -> anyhow::Result<reqwest::Response>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+    B: FnMut() -> BFut,
+    BFut: Future<Output = anyhow::Result<()>>,
+{
+    match request().send().await {
+        Ok(response) => Ok(response),
+        Err(err) if is_daemon_unreachable(&err) => {
+            bootstrap()
+                .await
+                .context("failed to bootstrap shirei-daemon")?;
+            wait_for_daemon_ready(base_url).await?;
+            request()
+                .send()
+                .await
+                .context("request failed after daemon bootstrap")
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn start_daemon_in_background() -> anyhow::Result<()> {
+    std::process::Command::new("shirei-daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn shirei-daemon")?;
+    Ok(())
+}
+
+async fn wait_for_daemon_ready(base_url: &str) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let health_url = format!("{}/api/v0.1/health", base_url);
+    for _ in 0..20 {
+        match client.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(_) => {}
+            Err(err) if is_daemon_unreachable(&err) => {}
+            Err(err) => return Err(err).context("daemon became reachable but health check failed"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(anyhow!("daemon did not become healthy after bootstrap"))
+}
+
+fn is_daemon_unreachable(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout()
 }
 
 fn state_dir(state_dir: Option<&str>) -> anyhow::Result<PathBuf> {
@@ -838,8 +899,8 @@ fn is_daemon_unreachable(err: &reqwest::Error) -> bool {
 mod tests {
     use super::{
         build_editor_invocation, resolve_bind_from_base_url, resolve_editor_command,
-        resolve_job_target_path, token_candidates, Args, CliConfig, Cmd, EditorConfig, JobRecord,
-        JobsCmd,
+        resolve_job_target_path, send_api_request_with, token_candidates, wait_for_daemon_ready,
+        Args, CliConfig, Cmd, EditorConfig, JobRecord, JobsCmd,
     };
     use clap::Parser;
     use std::net::SocketAddr;
@@ -967,6 +1028,83 @@ mod tests {
             err.to_string().contains("worktree is unavailable"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn bootstraps_daemon_and_retries_once_when_unreachable() {
+        let addr = reserve_local_addr();
+        let base_url = format!("http://{addr}");
+        let client = reqwest::Client::new();
+        let bootstrap_calls = Arc::new(AtomicUsize::new(0));
+        let server_handle = Arc::new(Mutex::new(None));
+
+        let response = send_api_request_with(
+            &base_url,
+            || client.get(format!("{}/api/v0.1/info", base_url)),
+            {
+                let bootstrap_calls = Arc::clone(&bootstrap_calls);
+                let server_handle = Arc::clone(&server_handle);
+                move || {
+                    let bootstrap_calls = Arc::clone(&bootstrap_calls);
+                    let server_handle = Arc::clone(&server_handle);
+                    async move {
+                        bootstrap_calls.fetch_add(1, Ordering::SeqCst);
+                        let mut guard = server_handle.lock().expect("lock handle slot");
+                        if guard.is_none() {
+                            *guard = Some(tokio::spawn(run_test_server(addr)));
+                        }
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .expect("request succeeds after bootstrap");
+
+        assert!(response.status().is_success());
+        assert_eq!(bootstrap_calls.load(Ordering::SeqCst), 1);
+
+        let handle = {
+            let mut guard = server_handle.lock().expect("lock handle slot");
+            guard.take()
+        };
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_bootstrap_when_daemon_is_already_healthy() {
+        let addr = reserve_local_addr();
+        let base_url = format!("http://{addr}");
+        let client = reqwest::Client::new();
+        let bootstrap_calls = Arc::new(AtomicUsize::new(0));
+        let server_handle = tokio::spawn(run_test_server(addr));
+        wait_for_daemon_ready(&base_url)
+            .await
+            .expect("test server becomes healthy");
+
+        let response = send_api_request_with(
+            &base_url,
+            || client.get(format!("{}/api/v0.1/info", base_url)),
+            {
+                let bootstrap_calls = Arc::clone(&bootstrap_calls);
+                move || {
+                    let bootstrap_calls = Arc::clone(&bootstrap_calls);
+                    async move {
+                        bootstrap_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .expect("request succeeds without bootstrap");
+
+        assert!(response.status().is_success());
+        assert_eq!(bootstrap_calls.load(Ordering::SeqCst), 0);
+
+        server_handle.abort();
     }
 
     #[test]
