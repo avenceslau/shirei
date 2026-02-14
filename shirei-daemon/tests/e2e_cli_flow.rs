@@ -218,6 +218,126 @@ async fn full_cli_api_flow_with_mock_opencode() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn cli_lifecycle_and_tui_commands_work() -> Result<()> {
+    let td = TempDir::new()?;
+    let state_dir = td.path().join("state");
+    tokio::fs::create_dir_all(&state_dir).await?;
+
+    let bin_dir = td.path().join("bin");
+    tokio::fs::create_dir_all(&bin_dir).await?;
+    write_mock_tui(&bin_dir).await?;
+
+    let bind = format!("127.0.0.1:{}", free_tcp_port()?);
+    let base = format!("http://{bind}");
+
+    let cli = workspace_bin("shirei")?;
+    let daemon = workspace_bin("shirei-daemon")?;
+    let tui_log = td.path().join("tui.log");
+
+    let start = std::process::Command::new(&cli)
+        .arg("--base-url")
+        .arg(&base)
+        .arg("--state-dir")
+        .arg(state_dir.to_string_lossy().to_string())
+        .arg("start")
+        .env("SHIREI_DAEMON_BIN", daemon.to_string_lossy().to_string())
+        .output()
+        .with_context(|| format!("failed running {}", cli.display()))?;
+    if !start.status.success() {
+        return Err(anyhow!(
+            "cli start failed (status={}): {}",
+            start.status,
+            String::from_utf8_lossy(&start.stderr)
+        ));
+    }
+
+    let token = wait_for_token(&state_dir.join("token")).await?;
+    wait_for_health(&base).await?;
+
+    let start_again = std::process::Command::new(&cli)
+        .arg("--base-url")
+        .arg(&base)
+        .arg("--state-dir")
+        .arg(state_dir.to_string_lossy().to_string())
+        .arg("start")
+        .env("SHIREI_DAEMON_BIN", daemon.to_string_lossy().to_string())
+        .output()
+        .with_context(|| format!("failed running {}", cli.display()))?;
+    assert!(start_again.status.success());
+
+    let restart = std::process::Command::new(&cli)
+        .arg("--base-url")
+        .arg(&base)
+        .arg("--state-dir")
+        .arg(state_dir.to_string_lossy().to_string())
+        .arg("restart")
+        .env("SHIREI_DAEMON_BIN", daemon.to_string_lossy().to_string())
+        .output()
+        .with_context(|| format!("failed running {}", cli.display()))?;
+    if !restart.status.success() {
+        return Err(anyhow!(
+            "cli restart failed (status={}): {}",
+            restart.status,
+            String::from_utf8_lossy(&restart.stderr)
+        ));
+    }
+    wait_for_health(&base).await?;
+
+    let tui = std::process::Command::new(&cli)
+        .arg("--base-url")
+        .arg(&base)
+        .arg("--state-dir")
+        .arg(state_dir.to_string_lossy().to_string())
+        .args(["tui", "--", "--discover-path", "."])
+        .env(
+            "SHIREI_TUI_BIN",
+            bin_dir.join("mock-tui").to_string_lossy().to_string(),
+        )
+        .env("SHIREI_TUI_LOG", tui_log.to_string_lossy().to_string())
+        .output()
+        .with_context(|| format!("failed running {}", cli.display()))?;
+    if !tui.status.success() {
+        return Err(anyhow!(
+            "cli tui failed (status={}): {}",
+            tui.status,
+            String::from_utf8_lossy(&tui.stderr)
+        ));
+    }
+    let tui_args = tokio::fs::read_to_string(&tui_log).await?;
+    assert!(tui_args.contains(&format!("--base-url {base}")));
+    assert!(tui_args.contains(&format!("--token {token}")));
+    assert!(tui_args.contains("--discover-path ."));
+
+    let stop = std::process::Command::new(&cli)
+        .arg("--base-url")
+        .arg(&base)
+        .arg("--state-dir")
+        .arg(state_dir.to_string_lossy().to_string())
+        .arg("stop")
+        .output()
+        .with_context(|| format!("failed running {}", cli.display()))?;
+    if !stop.status.success() {
+        return Err(anyhow!(
+            "cli stop failed (status={}): {}",
+            stop.status,
+            String::from_utf8_lossy(&stop.stderr)
+        ));
+    }
+
+    let stop_again = std::process::Command::new(&cli)
+        .arg("--base-url")
+        .arg(&base)
+        .arg("--state-dir")
+        .arg(state_dir.to_string_lossy().to_string())
+        .arg("stop")
+        .output()
+        .with_context(|| format!("failed running {}", cli.display()))?;
+    assert!(stop_again.status.success());
+
+    Ok(())
+}
+
 fn workspace_bin(name: &str) -> Result<PathBuf> {
     let package = match name {
         "shirei" => "shirei",
@@ -325,6 +445,30 @@ while [[ $# -gt 0 ]]; do
 done
 if [[ -n "${SHIREI_EDITOR_LOG:-}" ]]; then
   echo "$target" > "$SHIREI_EDITOR_LOG"
+fi
+exit 0
+"#,
+        )
+        .await?;
+        let mut perms = tokio::fs::metadata(&mock).await?.permissions();
+        perms.set_mode(0o755);
+        tokio::fs::set_permissions(&mock, perms).await?;
+    }
+    Ok(())
+}
+
+async fn write_mock_tui(bin_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncWriteExt;
+
+        let mock = bin_dir.join("mock-tui");
+        let mut f = tokio::fs::File::create(&mock).await?;
+        f.write_all(
+            br#"#!/usr/bin/env bash
+if [[ -n "${SHIREI_TUI_LOG:-}" ]]; then
+  echo "$*" > "$SHIREI_TUI_LOG"
 fi
 exit 0
 "#,
