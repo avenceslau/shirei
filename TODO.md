@@ -31,3 +31,4 @@
 
 - [ ] add a way to restart an existing job from CLI/TUI/API
 - [x] add in-TUI action to answer permission/input prompts for running jobs
+- [ ] support mid-prompt Shirei attach from OpenCode so closing OpenCode keeps the session managed by Shirei
