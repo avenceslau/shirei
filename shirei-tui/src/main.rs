@@ -638,39 +638,151 @@ fn status_color(job: &JobRow) -> Color {
     }
 }
 
-fn render_log_line(line: &str) -> Line<'static> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogKind {
+    Agent,
+    User,
+    Tool,
+    System,
+    Output,
+    Stderr,
+}
+
+struct ClassifiedLogLine<'a> {
+    kind: LogKind,
+    text: &'a str,
+}
+
+fn classify_log_line(line: &str) -> ClassifiedLogLine<'_> {
     if let Some(rest) = line.strip_prefix("[stderr] ") {
-        return Line::from(vec![
-            Span::styled("[stderr] ", Style::default().fg(Color::Red)),
-            Span::styled(rest.to_string(), Style::default().fg(Color::LightRed)),
-        ]);
+        return ClassifiedLogLine {
+            kind: LogKind::Stderr,
+            text: rest,
+        };
     }
 
     if let Some(rest) = line.strip_prefix("[stdout] ") {
-        if looks_like_agent_message(rest) {
-            return Line::from(vec![
-                Span::styled("[agent]  ", Style::default().fg(Color::Cyan)),
-                Span::styled(rest.to_string(), Style::default().fg(Color::White)),
-            ]);
-        }
-        return Line::from(vec![
-            Span::styled("[output] ", Style::default().fg(Color::Blue)),
-            Span::styled(rest.to_string(), Style::default().fg(Color::Gray)),
-        ]);
+        return ClassifiedLogLine {
+            kind: classify_semantic_kind(rest).unwrap_or(LogKind::Output),
+            text: rest,
+        };
     }
 
-    Line::from(Span::styled(
-        line.to_string(),
-        Style::default().fg(Color::DarkGray),
-    ))
+    ClassifiedLogLine {
+        kind: classify_semantic_kind(line).unwrap_or(LogKind::System),
+        text: line,
+    }
 }
 
-fn looks_like_agent_message(line: &str) -> bool {
-    let lower = line.trim_start().to_ascii_lowercase();
-    lower.starts_with("assistant")
-        || lower.starts_with("agent")
-        || lower.contains("\"role\":\"assistant\"")
-        || lower.contains("\"type\":\"assistant\"")
+fn classify_semantic_kind(line: &str) -> Option<LogKind> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Some(LogKind::System);
+    }
+
+    if let Some(kind) = kind_from_json_line(trimmed) {
+        return Some(kind);
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("assistant") || lower.starts_with("agent") {
+        return Some(LogKind::Agent);
+    }
+    if lower.starts_with("user") {
+        return Some(LogKind::User);
+    }
+    if lower.starts_with("system") || lower.starts_with("[runner]") || lower.starts_with("runner") {
+        return Some(LogKind::System);
+    }
+    if lower.starts_with("tool")
+        || lower.contains("called the ")
+        || lower.contains("tool call")
+        || lower.contains("tool result")
+        || lower.contains("\"recipient_name\":\"functions.")
+    {
+        return Some(LogKind::Tool);
+    }
+    None
+}
+
+fn kind_from_json_line(line: &str) -> Option<LogKind> {
+    if !line.starts_with('{') {
+        return None;
+    }
+    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    kind_from_json_value(&v)
+}
+
+fn kind_from_json_value(v: &serde_json::Value) -> Option<LogKind> {
+    if let Some(role) = v.get("role").and_then(|x| x.as_str()) {
+        return kind_from_role(role);
+    }
+
+    if let Some(role) = v
+        .get("message")
+        .and_then(|m| m.get("role"))
+        .and_then(|x| x.as_str())
+    {
+        return kind_from_role(role);
+    }
+
+    if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
+        return kind_from_type(t);
+    }
+
+    if v.get("tool_calls").is_some()
+        || v.get("tool_call_id").is_some()
+        || v.get("tool_name").is_some()
+        || v.get("recipient_name").is_some()
+    {
+        return Some(LogKind::Tool);
+    }
+
+    None
+}
+
+fn kind_from_role(role: &str) -> Option<LogKind> {
+    match role.to_ascii_lowercase().as_str() {
+        "assistant" | "agent" => Some(LogKind::Agent),
+        "user" => Some(LogKind::User),
+        "system" => Some(LogKind::System),
+        "tool" => Some(LogKind::Tool),
+        _ => None,
+    }
+}
+
+fn kind_from_type(t: &str) -> Option<LogKind> {
+    let lower = t.to_ascii_lowercase();
+    if lower.contains("assistant") || lower == "agent" {
+        return Some(LogKind::Agent);
+    }
+    if lower.contains("user") {
+        return Some(LogKind::User);
+    }
+    if lower.contains("system") || lower == "runner" {
+        return Some(LogKind::System);
+    }
+    if lower.contains("tool") || lower.contains("function") {
+        return Some(LogKind::Tool);
+    }
+    None
+}
+
+fn render_log_line(line: &str) -> Line<'static> {
+    let classified = classify_log_line(line);
+    let (label, label_color, text_color) = match classified.kind {
+        LogKind::Agent => ("[agent]  ", Color::Cyan, Color::White),
+        LogKind::User => ("[user]   ", Color::Yellow, Color::White),
+        LogKind::Tool => ("[tool]   ", Color::Magenta, Color::White),
+        LogKind::System => ("[system] ", Color::Green, Color::Gray),
+        LogKind::Output => ("[output] ", Color::Blue, Color::Gray),
+        LogKind::Stderr => ("[stderr] ", Color::Red, Color::LightRed),
+    };
+
+    Line::from(vec![
+        Span::styled(label, Style::default().fg(label_color)),
+        Span::styled(classified.text.to_string(), Style::default().fg(text_color)),
+    ])
 }
 
 fn shell_escape_single(input: &str) -> String {
@@ -948,7 +1060,9 @@ async fn main() -> Result<()> {
                 .wrap(Wrap { trim: false })
                 .block(
                     Block::default()
-                        .title(format!("{logs_title} | legend: agent/output/stderr"))
+                        .title(format!(
+                            "{logs_title} | legend: agent/user/tool/system/output/stderr"
+                        ))
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(Color::Blue)),
                 );
@@ -1269,7 +1383,10 @@ fn read_default_token(state_dir: Option<&str>) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fuzzy_match, is_awaiting_review, is_waiting_input, token_candidates, JobRow};
+    use super::{
+        classify_log_line, fuzzy_match, is_awaiting_review, is_waiting_input, token_candidates,
+        JobRow, LogKind,
+    };
 
     #[test]
     fn token_candidates_include_state_dir_first() {
@@ -1313,5 +1430,41 @@ mod tests {
         assert!(!is_waiting_input(&running));
         assert!(is_waiting_input(&waiting));
         assert!(is_awaiting_review(&review));
+    }
+
+    #[test]
+    fn classify_richer_log_semantics() {
+        let c = classify_log_line("[stderr] failed to parse response");
+        assert_eq!(c.kind, LogKind::Stderr);
+
+        let c = classify_log_line("[stdout] assistant: generated a patch");
+        assert_eq!(c.kind, LogKind::Agent);
+
+        let c = classify_log_line("[stdout] user asked for a retry");
+        assert_eq!(c.kind, LogKind::User);
+
+        let c = classify_log_line("[stdout] Called the Read tool with the following input");
+        assert_eq!(c.kind, LogKind::Tool);
+
+        let c = classify_log_line("[stdout] [runner] opencode run \"prompt\"");
+        assert_eq!(c.kind, LogKind::System);
+
+        let c = classify_log_line("[stdout] plain text output from process");
+        assert_eq!(c.kind, LogKind::Output);
+    }
+
+    #[test]
+    fn classify_json_role_and_type_lines() {
+        let c = classify_log_line("[stdout] {\"role\":\"assistant\",\"content\":\"ok\"}");
+        assert_eq!(c.kind, LogKind::Agent);
+
+        let c = classify_log_line("[stdout] {\"message\":{\"role\":\"user\"}}");
+        assert_eq!(c.kind, LogKind::User);
+
+        let c = classify_log_line("[stdout] {\"type\":\"tool_call\",\"name\":\"read\"}");
+        assert_eq!(c.kind, LogKind::Tool);
+
+        let c = classify_log_line("[stdout] {\"type\":\"system\",\"content\":\"boot\"}");
+        assert_eq!(c.kind, LogKind::System);
     }
 }

@@ -14,7 +14,7 @@
 ## TUI
 
 - [x] I want to be able to scroll look back at the logs for a given session
-- [ ] improve log styling with richer semantics (agent/user/tool/system) beyond stdout/stderr heuristics
+- [x] improve log styling with richer semantics (agent/user/tool/system) beyond stdout/stderr heuristics
 - [ ] add true interactive attach that opens in a dedicated terminal window while keeping TUI non-blocking
 
 ## CLI / Daemon UX
