@@ -82,7 +82,7 @@ cargo run -p shirei-tui -- --token "$TOKEN" --discover-path .
 cargo run -p shirei -- tui -- --discover-path .
 ```
 
-Useful keys: `d` discover project, `n` create job, `y` approve, `c` request changes (rerun), `a` ack, `u` unack, `k` kill, `r` refresh, `m` maximize logs, `t` attach in background, `e` edit in background, `o` open linked PR in browser. Logs are colorized by source (`agent`, `output`, `stderr`).
+Useful keys: `d` discover project, `n` create job, `y` approve, `c` request changes (rerun), `a` ack, `u` unack, `k` kill, `r` refresh, `m` maximize logs, `t` attach in background, `e` edit in background, `o` open linked PR in browser. Logs are colorized by source (`agent`, `user`, `tool`, `system`, `output`, `stderr`).
 
 ## Configuration
 
