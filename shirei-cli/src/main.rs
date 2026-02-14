@@ -21,12 +21,20 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    Setup {
+        #[command(subcommand)]
+        target: SetupCmd,
+    },
     Start,
     Stop,
     Restart,
     Tui {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    Doctor {
+        #[arg(long)]
+        project_id: Option<String>,
     },
     Health,
     Info,
@@ -66,6 +74,18 @@ enum Cmd {
 enum JobsCmd {
     Attach,
     Edit,
+    AttachStatus,
+    AttachStop,
+}
+
+#[derive(Subcommand, Debug)]
+enum SetupCmd {
+    Opencode {
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        print: bool,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +110,29 @@ struct AttachRecord {
     cwd: String,
     cmd: String,
     argv: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectsApiResponse {
+    projects: Vec<ProjectSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectSummary {
+    project_id: String,
+    git_remote: String,
+    default_branch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InfoApiResponse {
+    providers: Option<ProviderInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderInfo {
+    github_configured: bool,
+    gitlab_configured: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -118,6 +161,9 @@ async fn main() -> anyhow::Result<()> {
     let c = reqwest::Client::new();
 
     match a.cmd {
+        Cmd::Setup { target } => match target {
+            SetupCmd::Opencode { force, print } => setup_opencode_commands(force, print)?,
+        },
         Cmd::Start => start_daemon(&c, &a.base_url, a.state_dir.as_deref()).await?,
         Cmd::Stop => stop_daemon(&a.base_url, a.state_dir.as_deref()).await?,
         Cmd::Restart => {
@@ -131,6 +177,16 @@ async fn main() -> anyhow::Result<()> {
                 a.state_dir.as_deref(),
                 &args,
             )?;
+        }
+        Cmd::Doctor { project_id } => {
+            run_doctor(
+                &c,
+                &a.base_url,
+                a.token.as_deref(),
+                a.state_dir.as_deref(),
+                project_id,
+            )
+            .await?;
         }
         Cmd::Health => {
             let v: serde_json::Value = send_api_request(&a.base_url, || {
@@ -183,6 +239,14 @@ async fn main() -> anyhow::Result<()> {
             Some(JobsCmd::Edit) => {
                 let auth = authorization_header(a.token.as_deref(), a.state_dir.as_deref())?;
                 edit_job(&c, &a.base_url, &auth, &id).await?
+            }
+            Some(JobsCmd::AttachStatus) => {
+                let auth = authorization_header(a.token.as_deref(), a.state_dir.as_deref())?;
+                attach_status_job(&c, &a.base_url, &auth, &id).await?
+            }
+            Some(JobsCmd::AttachStop) => {
+                let auth = authorization_header(a.token.as_deref(), a.state_dir.as_deref())?;
+                attach_stop_job(&c, &a.base_url, &auth, &id).await?
             }
             None => {
                 let auth = authorization_header(a.token.as_deref(), a.state_dir.as_deref())?;
@@ -340,6 +404,250 @@ async fn wait_for_daemon_ready(base_url: &str) -> anyhow::Result<()> {
 
 fn is_daemon_unreachable(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout()
+}
+
+async fn run_doctor(
+    client: &reqwest::Client,
+    base_url: &str,
+    token_arg: Option<&str>,
+    state_dir_arg: Option<&str>,
+    project_filter: Option<String>,
+) -> anyhow::Result<()> {
+    let mut failures = 0_usize;
+    let mut warnings = 0_usize;
+
+    let mut record = |level: &str, name: &str, detail: String| {
+        match level {
+            "FAIL" => failures += 1,
+            "WARN" => warnings += 1,
+            _ => {}
+        }
+        println!("[{level}] {name}: {detail}");
+    };
+
+    println!("Shirei Doctor");
+
+    let state = state_dir(state_dir_arg)?;
+    record("OK", "state_dir", state.display().to_string());
+
+    let token = match token_arg {
+        Some(t) if !t.trim().is_empty() => {
+            record("OK", "token", "provided via --token".to_string());
+            Some(t.to_string())
+        }
+        _ => match read_default_token(state_dir_arg) {
+            Ok(t) => {
+                let path_hint = token_candidates(state_dir_arg)?
+                    .into_iter()
+                    .find(|p| p.exists())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "token file".to_string());
+                record("OK", "token", format!("loaded from {path_hint}"));
+                Some(t)
+            }
+            Err(e) => {
+                record("WARN", "token", format!("{e}"));
+                None
+            }
+        },
+    };
+
+    let health_ok = match client
+        .get(format!("{base_url}/api/v0.1/health"))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            record("OK", "daemon", format!("reachable at {base_url}"));
+            true
+        }
+        Ok(resp) => {
+            record(
+                "FAIL",
+                "daemon",
+                format!("health returned non-success status {}", resp.status()),
+            );
+            false
+        }
+        Err(err) => {
+            record("FAIL", "daemon", format!("unreachable: {err}"));
+            false
+        }
+    };
+
+    if health_ok {
+        let auth = token.as_ref().map(|t| format!("Bearer {t}"));
+        if let Some(auth) = auth {
+            match client
+                .get(format!("{base_url}/api/v0.1/info"))
+                .header("Authorization", auth.clone())
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let info = resp.json::<InfoApiResponse>().await.ok();
+                    let (github_cfg, gitlab_cfg) = info
+                        .and_then(|i| i.providers)
+                        .map(|p| (p.github_configured, p.gitlab_configured))
+                        .unwrap_or((false, false));
+                    record(
+                        if github_cfg { "OK" } else { "WARN" },
+                        "provider.github",
+                        if github_cfg {
+                            "SHIREI_GITHUB_TOKEN configured in daemon".to_string()
+                        } else {
+                            "missing SHIREI_GITHUB_TOKEN in daemon env".to_string()
+                        },
+                    );
+                    record(
+                        if gitlab_cfg { "OK" } else { "WARN" },
+                        "provider.gitlab",
+                        if gitlab_cfg {
+                            "SHIREI_GITLAB_HOST + SHIREI_GITLAB_TOKEN configured".to_string()
+                        } else {
+                            "missing SHIREI_GITLAB_HOST/SHIREI_GITLAB_TOKEN".to_string()
+                        },
+                    );
+
+                    match client
+                        .get(format!("{base_url}/api/v0.1/projects"))
+                        .header("Authorization", auth)
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            let projects = resp
+                                .json::<ProjectsApiResponse>()
+                                .await
+                                .map(|v| v.projects)
+                                .unwrap_or_default();
+                            if projects.is_empty() {
+                                record(
+                                    "WARN",
+                                    "projects",
+                                    "no discovered projects; run: shirei project-discover ."
+                                        .to_string(),
+                                );
+                            } else {
+                                let selected = if let Some(pid) = project_filter.as_deref() {
+                                    projects
+                                        .into_iter()
+                                        .filter(|p| p.project_id == pid)
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    projects
+                                };
+
+                                if selected.is_empty() {
+                                    record(
+                                        "WARN",
+                                        "projects",
+                                        "project filter matched no project".to_string(),
+                                    );
+                                } else {
+                                    record(
+                                        "OK",
+                                        "projects",
+                                        format!("{} project(s) checked", selected.len()),
+                                    );
+                                    let needs_github =
+                                        selected.iter().any(|p| is_github_remote(&p.git_remote));
+                                    let needs_gitlab =
+                                        selected.iter().any(|p| is_gitlab_remote(&p.git_remote));
+
+                                    if needs_github && !github_cfg {
+                                        record(
+                                            "FAIL",
+                                            "auto_pr.github",
+                                            "project remote requires GitHub; daemon missing SHIREI_GITHUB_TOKEN"
+                                                .to_string(),
+                                        );
+                                    } else if needs_github {
+                                        record(
+                                            "OK",
+                                            "auto_pr.github",
+                                            "GitHub remote + token ready for auto PR/watch"
+                                                .to_string(),
+                                        );
+                                    }
+
+                                    if needs_gitlab && !gitlab_cfg {
+                                        record(
+                                            "FAIL",
+                                            "auto_pr.gitlab",
+                                            "project remote requires GitLab; daemon missing SHIREI_GITLAB_HOST/TOKEN"
+                                                .to_string(),
+                                        );
+                                    } else if needs_gitlab {
+                                        record(
+                                            "OK",
+                                            "auto_pr.gitlab",
+                                            "GitLab remote + token ready for auto PR/watch"
+                                                .to_string(),
+                                        );
+                                    }
+
+                                    for p in selected {
+                                        if p.default_branch.trim().is_empty() {
+                                            record(
+                                                "WARN",
+                                                &format!("project.{}", p.project_id),
+                                                "default_branch is empty".to_string(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(resp) => record(
+                            "WARN",
+                            "projects",
+                            format!("failed to list projects: {}", resp.status()),
+                        ),
+                        Err(err) => record(
+                            "WARN",
+                            "projects",
+                            format!("failed to list projects: {err}"),
+                        ),
+                    }
+                }
+                Ok(resp) => record(
+                    "WARN",
+                    "auth",
+                    format!("/info denied with status {}; check token", resp.status()),
+                ),
+                Err(err) => record("WARN", "auth", format!("failed querying /info: {err}")),
+            }
+        } else {
+            record(
+                "WARN",
+                "auth",
+                "token missing; cannot inspect provider/project auth readiness".to_string(),
+            );
+        }
+    }
+
+    let summary = format!("doctor summary: {} fail, {} warn", failures, warnings);
+    if failures > 0 {
+        println!("[FAIL] {summary}");
+        return Err(anyhow!(summary));
+    }
+    if warnings > 0 {
+        println!("[WARN] {summary}");
+    } else {
+        println!("[OK] doctor summary: all checks passed");
+    }
+    Ok(())
+}
+
+fn is_github_remote(remote: &str) -> bool {
+    let lower = remote.to_ascii_lowercase();
+    lower.contains("github.com") || lower.starts_with("github:")
+}
+
+fn is_gitlab_remote(remote: &str) -> bool {
+    let lower = remote.to_ascii_lowercase();
+    lower.contains("gitlab") || lower.starts_with("gitlab:")
 }
 
 fn state_dir(state_dir: Option<&str>) -> anyhow::Result<PathBuf> {
@@ -640,6 +948,141 @@ fn launch_tui(
     Ok(())
 }
 
+fn setup_opencode_commands(force: bool, print_only: bool) -> anyhow::Result<()> {
+    let commands_dir = opencode_commands_dir()?;
+    std::fs::create_dir_all(&commands_dir)
+        .with_context(|| format!("failed creating {}", commands_dir.display()))?;
+
+    let files = [
+        (
+            "shirei-attach.md",
+            r#"---
+description: Attach shirei session in this terminal
+---
+Run this command in the shell and replace `<job-id>` with the session id:
+
+`shirei jobs <job-id> attach`
+
+Use this when you want to open OpenCode directly inside a Shirei job worktree.
+If the `shirei-workflow` skill is available, load it first.
+"#,
+        ),
+        (
+            "shirei-edit.md",
+            r#"---
+description: Open editor on a shirei job worktree
+---
+Run this command in the shell and replace `<job-id>` with the session id:
+
+`shirei jobs <job-id> edit`
+
+This opens your configured editor at the selected Shirei job worktree.
+If the `shirei-workflow` skill is available, load it first.
+"#,
+        ),
+    ];
+
+    for (name, content) in files {
+        let path = commands_dir.join(name);
+        write_setup_file(&path, content, force, print_only)?;
+    }
+
+    let skills_dir = opencode_skills_dir()?;
+    std::fs::create_dir_all(&skills_dir)
+        .with_context(|| format!("failed creating {}", skills_dir.display()))?;
+    let skill_path = skills_dir.join("shirei-workflow").join("SKILL.md");
+    let skill_parent = skill_path
+        .parent()
+        .ok_or_else(|| anyhow!("invalid skill path {}", skill_path.display()))?;
+    std::fs::create_dir_all(skill_parent)
+        .with_context(|| format!("failed creating {}", skill_parent.display()))?;
+    write_setup_file(
+        &skill_path,
+        r#"---
+name: shirei-workflow
+description: Operate Shirei sessions correctly from OpenCode
+license: MIT
+compatibility: opencode
+---
+## What this skill does
+- Use Shirei for session lifecycle, job discovery, logs, and review actions.
+- Keep work in the selected Shirei job worktree when attaching/editing sessions.
+
+## Core commands
+- Health/discovery:
+  - `TOKEN=$(cat ~/.local/share/shirei/token)`
+  - `shirei --token "$TOKEN" health`
+  - `shirei --token "$TOKEN" project-discover .`
+- Job operations:
+  - `shirei --token "$TOKEN" jobs <project-id>`
+  - `shirei --token "$TOKEN" jobs <job-id> attach`
+  - Detach from attached OpenCode with `/q` (backend remains running)
+  - `shirei --token "$TOKEN" jobs <job-id> attach-status`
+  - `shirei --token "$TOKEN" jobs <job-id> attach-stop`
+  - `shirei --token "$TOKEN" jobs <job-id> edit`
+  - `shirei --token "$TOKEN" logs <job-id> --tail-lines 200`
+- Review loop:
+  - Use TUI keys `y` (approve) and `c` (request changes)
+  - In PR/MR comments: `/shirei approve` or `/shirei request-changes <feedback>`
+
+## When to use
+- Use this skill whenever a task involves Shirei sessions, reruns, attach/edit, or PR review decisions.
+"#,
+        force,
+        print_only,
+    )?;
+
+    if !print_only {
+        println!(
+            "OpenCode commands installed in {}: /shirei-attach, /shirei-edit",
+            commands_dir.display()
+        );
+        println!("OpenCode skill installed: {}", skill_path.display());
+    }
+    Ok(())
+}
+
+fn write_setup_file(
+    path: &Path,
+    content: &str,
+    force: bool,
+    print_only: bool,
+) -> anyhow::Result<()> {
+    if print_only {
+        println!("--- {} ---", path.display());
+        println!("{}", content.trim_end());
+        return Ok(());
+    }
+
+    if path.exists() && !force {
+        println!(
+            "skip existing {} (use --force to overwrite)",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    std::fs::write(path, content).with_context(|| format!("failed writing {}", path.display()))?;
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+fn opencode_commands_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(dir) = std::env::var("OPENCODE_CONFIG_DIR") {
+        return Ok(PathBuf::from(dir).join("commands"));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
+    Ok(PathBuf::from(home).join(".config/opencode/commands"))
+}
+
+fn opencode_skills_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(dir) = std::env::var("OPENCODE_CONFIG_DIR") {
+        return Ok(PathBuf::from(dir).join("skills"));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
+    Ok(PathBuf::from(home).join(".config/opencode/skills"))
+}
+
 async fn attach_job(
     client: &reqwest::Client,
     base_url: &str,
@@ -723,6 +1166,47 @@ async fn edit_job(
         }))?
     );
 
+    Ok(())
+}
+
+async fn attach_status_job(
+    client: &reqwest::Client,
+    base_url: &str,
+    auth: &str,
+    job_id: &str,
+) -> anyhow::Result<()> {
+    let v: serde_json::Value = send_api_request(base_url, || {
+        client
+            .get(format!(
+                "{}/api/v0.1/jobs/{}/attach-status",
+                base_url, job_id
+            ))
+            .header("Authorization", auth)
+    })
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+async fn attach_stop_job(
+    client: &reqwest::Client,
+    base_url: &str,
+    auth: &str,
+    job_id: &str,
+) -> anyhow::Result<()> {
+    let v: serde_json::Value = send_api_request(base_url, || {
+        client
+            .post(format!("{}/api/v0.1/jobs/{}/attach-stop", base_url, job_id))
+            .header("Authorization", auth)
+    })
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(())
 }
 
@@ -838,7 +1322,7 @@ mod tests {
     use super::{
         build_editor_invocation, resolve_bind_from_base_url, resolve_editor_command,
         resolve_job_target_path, send_api_request_with, token_candidates, wait_for_daemon_ready,
-        Args, CliConfig, Cmd, EditorConfig, JobRecord, JobsCmd,
+        Args, CliConfig, Cmd, EditorConfig, JobRecord, JobsCmd, SetupCmd,
     };
     use clap::Parser;
     use std::net::SocketAddr;
@@ -919,6 +1403,10 @@ mod tests {
             Args::parse_from(["shirei", "restart"]).cmd,
             Cmd::Restart
         ));
+        assert!(matches!(
+            Args::parse_from(["shirei", "doctor"]).cmd,
+            Cmd::Doctor { .. }
+        ));
     }
 
     #[test]
@@ -928,6 +1416,20 @@ mod tests {
             Cmd::Tui { args } => {
                 assert_eq!(args, vec!["--discover-path", "/tmp/repo"]);
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_setup_opencode_command() {
+        let args = Args::parse_from(["shirei", "setup", "opencode", "--force"]);
+        match args.cmd {
+            Cmd::Setup { target } => match target {
+                SetupCmd::Opencode { force, print } => {
+                    assert!(force);
+                    assert!(!print);
+                }
+            },
             other => panic!("unexpected command: {other:?}"),
         }
     }

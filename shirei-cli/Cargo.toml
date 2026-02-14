@@ -1,6 +1,6 @@
 [package]
 name = "shirei"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 rust-version.workspace = true
 description = "CLI for the Shirei local daemon"
@@ -8,14 +8,59 @@ license = "MIT"
 readme = "../README.md"
 keywords = ["cli", "automation", "agent"]
 categories = ["command-line-utilities", "development-tools"]
+include = [
+  "src/**",
+  "../README.md",
+]
+
+[[bin]]
+name = "shirei"
+path = "src/main.rs"
+
+[[bin]]
+name = "shirei-daemon"
+path = "src/bin/shirei-daemon/main.rs"
+
+[[bin]]
+name = "shirei-tui"
+path = "src/bin/shirei-tui/main.rs"
+
+[features]
+default = ["bundle-bins"]
+bundle-bins = []
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-libc = "0.2"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shell-words = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "io-util", "fs", "time"] }
 toml = "0.8"
+libc = "0.2"
+
+axum = "0.7"
+tower-http = { version = "0.5", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+async-stream = "0.3"
+futures = "0.3"
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+uuid = { version = "1", features = ["v4", "v5"] }
+time = { version = "0.3", features = ["formatting"] }
+thiserror = "1"
+git2 = "0.19"
+async-trait = "0.1"
+octocrab = "0.41"
+gitlab = "0.1808.0"
+hex = "0.4"
+url = "2"
+opencode-sdk = "0.1.6"
+
+crossterm = "0.28"
+ratatui = "0.28"
+
+[dev-dependencies]
+tempfile = "3"
