@@ -833,68 +833,6 @@ fn build_editor_invocation(
     Ok((program, parts))
 }
 
-async fn send_api_request<F>(base_url: &str, request: F) -> anyhow::Result<reqwest::Response>
-where
-    F: FnMut() -> reqwest::RequestBuilder,
-{
-    send_api_request_with(base_url, request, || async { start_daemon_in_background() }).await
-}
-
-async fn send_api_request_with<F, B, BFut>(
-    base_url: &str,
-    mut request: F,
-    mut bootstrap: B,
-) -> anyhow::Result<reqwest::Response>
-where
-    F: FnMut() -> reqwest::RequestBuilder,
-    B: FnMut() -> BFut,
-    BFut: Future<Output = anyhow::Result<()>>,
-{
-    match request().send().await {
-        Ok(response) => Ok(response),
-        Err(err) if is_daemon_unreachable(&err) => {
-            bootstrap()
-                .await
-                .context("failed to bootstrap shirei-daemon")?;
-            wait_for_daemon_ready(base_url).await?;
-            request()
-                .send()
-                .await
-                .context("request failed after daemon bootstrap")
-        }
-        Err(err) => Err(err.into()),
-    }
-}
-
-fn start_daemon_in_background() -> anyhow::Result<()> {
-    std::process::Command::new("shirei-daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to spawn shirei-daemon")?;
-    Ok(())
-}
-
-async fn wait_for_daemon_ready(base_url: &str) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-    let health_url = format!("{}/api/v0.1/health", base_url);
-    for _ in 0..20 {
-        match client.get(&health_url).send().await {
-            Ok(resp) if resp.status().is_success() => return Ok(()),
-            Ok(_) => {}
-            Err(err) if is_daemon_unreachable(&err) => {}
-            Err(err) => return Err(err).context("daemon became reachable but health check failed"),
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    Err(anyhow!("daemon did not become healthy after bootstrap"))
-}
-
-fn is_daemon_unreachable(err: &reqwest::Error) -> bool {
-    err.is_connect() || err.is_timeout()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
