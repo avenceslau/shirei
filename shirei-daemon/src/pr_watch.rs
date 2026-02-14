@@ -1,7 +1,11 @@
 use anyhow::Result;
 use sqlx::Row;
 use sqlx::SqlitePool;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::time::interval;
 
 use crate::{
@@ -53,7 +57,7 @@ pub async fn start(
 async fn poll_once(
     pool: &SqlitePool,
     bus: &EventBus,
-    state_dir: &PathBuf,
+    state_dir: &Path,
     providers: &Arc<ProviderFactory>,
     config: &Arc<ShireiConfig>,
 ) -> Result<()> {
@@ -162,10 +166,11 @@ async fn poll_once(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     pool: &SqlitePool,
     bus: &EventBus,
-    state_dir: &PathBuf,
+    state_dir: &Path,
     providers: &Arc<ProviderFactory>,
     config: &Arc<ShireiConfig>,
     project_id: &str,
@@ -228,7 +233,7 @@ async fn handle_command(
             let runner = JobRunner::new(
                 pool.clone(),
                 bus.clone(),
-                state_dir.clone(),
+                state_dir.to_path_buf(),
                 providers.clone(),
                 config.clone(),
             );
@@ -360,7 +365,7 @@ async fn handle_command(
         let runner = JobRunner::new(
             pool.clone(),
             bus.clone(),
-            state_dir.clone(),
+            state_dir.to_path_buf(),
             providers.clone(),
             config.clone(),
         );

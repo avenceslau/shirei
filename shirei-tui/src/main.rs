@@ -74,6 +74,7 @@ struct JobRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct PermissionPrompt {
     id: String,
     permission: String,
@@ -81,6 +82,7 @@ struct PermissionPrompt {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct QuestionPrompt {
     id: String,
     header: String,

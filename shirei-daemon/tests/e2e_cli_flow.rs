@@ -339,11 +339,7 @@ async fn cli_lifecycle_and_tui_commands_work() -> Result<()> {
 }
 
 fn workspace_bin(name: &str) -> Result<PathBuf> {
-    let package = match name {
-        "shirei" => "shirei",
-        "shirei-daemon" => "shirei-daemon",
-        other => other,
-    };
+    let package = name;
     let status = std::process::Command::new("cargo")
         .args(["build", "-p", package])
         .status()

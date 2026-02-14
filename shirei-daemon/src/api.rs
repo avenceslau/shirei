@@ -265,10 +265,10 @@ async fn job_attach_status(
     }
     match store::get_job(&state.pool, &job_id).await {
         Ok(job) => {
-            let running = match (job.attach_pid, job.attach_host.as_deref(), job.attach_port) {
-                (Some(pid), Some(_), Some(_)) if process_alive(pid) => true,
-                _ => false,
-            };
+            let running = matches!(
+                (job.attach_pid, job.attach_host.as_deref(), job.attach_port),
+                (Some(pid), Some(_), Some(_)) if process_alive(pid)
+            );
             Json(serde_json::json!({
                 "job_id": job_id,
                 "running": running,
