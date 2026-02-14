@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -132,12 +133,12 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Cmd::Health => {
-            let v: serde_json::Value = c
-                .get(format!("{}/api/v0.1/health", a.base_url))
-                .send()
-                .await?
-                .json()
-                .await?;
+            let v: serde_json::Value = send_api_request(&a.base_url, || {
+                c.get(format!("{}/api/v0.1/health", a.base_url))
+            })
+            .await?
+            .json()
+            .await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Cmd::Info => {
@@ -584,14 +585,15 @@ async fn attach_job(
     auth: &str,
     job_id: &str,
 ) -> anyhow::Result<()> {
-    let v: AttachApiResponse = client
-        .post(format!("{}/api/v0.1/jobs/{}/attach", base_url, job_id))
-        .header("Authorization", auth)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let v: AttachApiResponse = send_api_request(base_url, || {
+        client
+            .post(format!("{}/api/v0.1/jobs/{}/attach", base_url, job_id))
+            .header("Authorization", auth)
+    })
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
 
     if !Path::new(&v.attach.cwd).exists() {
         return Err(anyhow!(
@@ -631,14 +633,15 @@ async fn edit_job(
     auth: &str,
     job_id: &str,
 ) -> anyhow::Result<()> {
-    let v: JobApiResponse = client
-        .get(format!("{}/api/v0.1/jobs/{}", base_url, job_id))
-        .header("Authorization", auth)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let v: JobApiResponse = send_api_request(base_url, || {
+        client
+            .get(format!("{}/api/v0.1/jobs/{}", base_url, job_id))
+            .header("Authorization", auth)
+    })
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
 
     let target_path = resolve_job_target_path(&v.job)?;
     let editor_cmd = resolve_editor_command(&load_config()?)?;
@@ -769,6 +772,68 @@ fn build_editor_invocation(
     Ok((program, parts))
 }
 
+async fn send_api_request<F>(base_url: &str, request: F) -> anyhow::Result<reqwest::Response>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    send_api_request_with(base_url, request, || async { start_daemon_in_background() }).await
+}
+
+async fn send_api_request_with<F, B, BFut>(
+    base_url: &str,
+    mut request: F,
+    mut bootstrap: B,
+) -> anyhow::Result<reqwest::Response>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+    B: FnMut() -> BFut,
+    BFut: Future<Output = anyhow::Result<()>>,
+{
+    match request().send().await {
+        Ok(response) => Ok(response),
+        Err(err) if is_daemon_unreachable(&err) => {
+            bootstrap()
+                .await
+                .context("failed to bootstrap shirei-daemon")?;
+            wait_for_daemon_ready(base_url).await?;
+            request()
+                .send()
+                .await
+                .context("request failed after daemon bootstrap")
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn start_daemon_in_background() -> anyhow::Result<()> {
+    std::process::Command::new("shirei-daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn shirei-daemon")?;
+    Ok(())
+}
+
+async fn wait_for_daemon_ready(base_url: &str) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let health_url = format!("{}/api/v0.1/health", base_url);
+    for _ in 0..20 {
+        match client.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(_) => {}
+            Err(err) if is_daemon_unreachable(&err) => {}
+            Err(err) => return Err(err).context("daemon became reachable but health check failed"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(anyhow!("daemon did not become healthy after bootstrap"))
+}
+
+fn is_daemon_unreachable(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -777,6 +842,48 @@ mod tests {
         JobsCmd,
     };
     use clap::Parser;
+    use std::net::SocketAddr;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn reserve_local_addr() -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral addr");
+        let addr = listener.local_addr().expect("resolve local addr");
+        drop(listener);
+        addr
+    }
+
+    async fn run_test_server(addr: SocketAddr) {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("bind test server");
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("accept test request");
+            let mut buf = [0_u8; 2048];
+            let n = stream.read(&mut buf).await.expect("read request");
+            let req = String::from_utf8_lossy(&buf[..n]);
+
+            let (status, body) = if req.starts_with("GET /api/v0.1/health ") {
+                ("200 OK", r#"{"ok":true}"#)
+            } else if req.starts_with("GET /api/v0.1/info ") {
+                ("200 OK", r#"{"name":"shirei-test"}"#)
+            } else {
+                ("404 Not Found", r#"{"error":"missing"}"#)
+            };
+
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        }
+    }
 
     #[test]
     fn appends_path_when_placeholder_absent() {
