@@ -152,7 +152,7 @@ async fn full_cli_api_flow_with_mock_opencode() -> Result<()> {
             arr.iter().any(|l| {
                 l.as_str()
                     .unwrap_or("")
-                    .contains("mock opencode args: run mock prompt")
+                    .contains("mock opencode args: run mock prompt --agent shirei")
             })
         })
         .unwrap_or(false));
@@ -339,11 +339,7 @@ async fn cli_lifecycle_and_tui_commands_work() -> Result<()> {
 }
 
 fn workspace_bin(name: &str) -> Result<PathBuf> {
-    let package = match name {
-        "shirei" => "shirei",
-        "shirei-daemon" => "shirei-daemon",
-        other => other,
-    };
+    let package = name;
     let status = std::process::Command::new("cargo")
         .args(["build", "-p", package])
         .status()

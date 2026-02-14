@@ -22,6 +22,7 @@ impl RepoId {
             name: name.to_string(),
         })
     }
+    #[allow(dead_code)]
     pub fn full_name(&self) -> String {
         format!("{}/{}", self.owner, self.name)
     }
@@ -65,6 +66,7 @@ pub struct PrComment {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[allow(dead_code)]
 pub enum VcsError {
     #[error("auth: {0}")]
     Auth(String),
@@ -90,6 +92,7 @@ pub fn parse_repo_key(repo_key: &str) -> Option<(VcsKind, RepoId)> {
 
 #[async_trait]
 pub trait VcsProvider: Send + Sync {
+    #[allow(dead_code)]
     fn kind(&self) -> &'static str;
     async fn get_pr(&self, pr: &PullRequestId) -> Result<PrInfo, VcsError>;
     async fn list_comments(&self, pr: &PullRequestId) -> Result<Vec<PrComment>, VcsError>;
@@ -134,6 +137,7 @@ pub fn repo_key_from_remote(remote: &str) -> Option<String> {
     None
 }
 
+#[allow(dead_code)]
 pub fn pr_web_url(repo_key: &str, pr_number: u64) -> Option<String> {
     let (kind, repo) = parse_repo_key(repo_key)?;
     match kind {

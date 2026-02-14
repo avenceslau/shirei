@@ -149,5 +149,5 @@ async fn default_branch(repo: &str) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    s.split('/').last().map(|x| x.to_string())
+    s.split('/').next_back().map(|x| x.to_string())
 }

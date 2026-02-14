@@ -89,6 +89,7 @@ pub async fn list_projects(pool: &SqlitePool) -> Result<Vec<ProjectRow>> {
     .await?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create_job(
     pool: &SqlitePool,
     project_id: &str,
@@ -376,6 +377,7 @@ pub async fn latest_pr_job(
     .await?)
 }
 
+#[allow(dead_code)]
 pub async fn insert_event(
     pool: &SqlitePool,
     project_id: &str,

@@ -1,7 +1,11 @@
 use anyhow::Result;
 use sqlx::Row;
 use sqlx::SqlitePool;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::time::interval;
 
 use crate::{
@@ -10,7 +14,7 @@ use crate::{
     git_ops,
     runner::JobRunner,
     store,
-    util::now_rfc3339,
+    util::{now_rfc3339, request_changes_prompt_notes},
     vcs::{factory::ProviderFactory, parse_repo_key, PullRequestId},
     worktrees,
 };
@@ -53,7 +57,7 @@ pub async fn start(
 async fn poll_once(
     pool: &SqlitePool,
     bus: &EventBus,
-    state_dir: &PathBuf,
+    state_dir: &Path,
     providers: &Arc<ProviderFactory>,
     config: &Arc<ShireiConfig>,
 ) -> Result<()> {
@@ -162,10 +166,11 @@ async fn poll_once(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     pool: &SqlitePool,
     bus: &EventBus,
-    state_dir: &PathBuf,
+    state_dir: &Path,
     providers: &Arc<ProviderFactory>,
     config: &Arc<ShireiConfig>,
     project_id: &str,
@@ -219,8 +224,7 @@ async fn handle_command(
         tracing::info!(project_id = %project_id, repo_key = %repo_key, pr_number, command_id = %command_id, "processing request-changes command");
         let feedback = cmd.trim_start_matches("request-changes").trim().to_string();
         if let Some(job) = store::latest_pr_job(pool, repo_key, pr_number).await? {
-            if !feedback.is_empty() {
-                let notes = format!("Reviewer feedback:\n{}", feedback);
+            if let Some(notes) = request_changes_prompt_notes(Some(&feedback), true) {
                 store::append_job_prompt(pool, &job.job_id, &notes).await?;
             }
             store::request_changes(pool, &job.job_id).await?;
@@ -229,7 +233,7 @@ async fn handle_command(
             let runner = JobRunner::new(
                 pool.clone(),
                 bus.clone(),
-                state_dir.clone(),
+                state_dir.to_path_buf(),
                 providers.clone(),
                 config.clone(),
             );
@@ -361,7 +365,7 @@ async fn handle_command(
         let runner = JobRunner::new(
             pool.clone(),
             bus.clone(),
-            state_dir.clone(),
+            state_dir.to_path_buf(),
             providers.clone(),
             config.clone(),
         );

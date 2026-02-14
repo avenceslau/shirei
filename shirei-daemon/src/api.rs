@@ -17,7 +17,7 @@ use sqlx::SqlitePool;
 use std::{convert::Infallible, path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 
 use crate::{
-    config::ShireiConfig, events::EventBus, git_ops, runner::JobRunner, store,
+    config::ShireiConfig, events::EventBus, git_ops, runner::JobRunner, store, util,
     vcs::factory::ProviderFactory, worktrees,
 };
 
@@ -265,10 +265,10 @@ async fn job_attach_status(
     }
     match store::get_job(&state.pool, &job_id).await {
         Ok(job) => {
-            let running = match (job.attach_pid, job.attach_host.as_deref(), job.attach_port) {
-                (Some(pid), Some(_), Some(_)) if process_alive(pid) => true,
-                _ => false,
-            };
+            let running = matches!(
+                (job.attach_pid, job.attach_host.as_deref(), job.attach_port),
+                (Some(pid), Some(_), Some(_)) if process_alive(pid)
+            );
             Json(serde_json::json!({
                 "job_id": job_id,
                 "running": running,
@@ -677,16 +677,15 @@ async fn request_changes_job(
         Err(_) => return (StatusCode::NOT_FOUND, "JOB_NOT_FOUND").into_response(),
     };
 
-    if let Some(feedback) = req.feedback.as_deref() {
-        let trimmed = feedback.trim();
-        if !trimmed.is_empty() {
-            let notes = format!("Reviewer feedback:\n{trimmed}");
-            if store::append_job_prompt(&state.pool, &job_id, &notes)
-                .await
-                .is_err()
-            {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL").into_response();
-            }
+    let require_pr_push = job.origin_type == "pr_watch";
+    if let Some(notes) =
+        util::request_changes_prompt_notes(req.feedback.as_deref(), require_pr_push)
+    {
+        if store::append_job_prompt(&state.pool, &job_id, &notes)
+            .await
+            .is_err()
+        {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL").into_response();
         }
     }
 
