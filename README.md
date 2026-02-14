@@ -11,7 +11,8 @@ export SHIREI_GITHUB_TOKEN=...
 export SHIREI_GITLAB_TOKEN=...
 export SHIREI_GITLAB_HOST=gitlab.com
 
-cargo run -p shirei-daemon
+# start daemon in background (idempotent)
+cargo run -p shirei -- start
 ```
 
 In another terminal:
@@ -25,6 +26,10 @@ cargo run -p shirei -- --token "$TOKEN" project-discover .
 cargo run -p shirei -- --token "$TOKEN" jobs "$PROJECT_ID"
 # attach opencode to an existing job session
 cargo run -p shirei -- --token "$TOKEN" jobs <job-id> attach
+
+# lifecycle helpers (all idempotent)
+cargo run -p shirei -- stop
+cargo run -p shirei -- restart
 ```
 
 ## CLI config
@@ -70,7 +75,11 @@ shirei --token "$TOKEN" jobs <job-id> edit
 Run the terminal UI against a running daemon:
 
 ```bash
+# direct TUI
 cargo run -p shirei-tui -- --token "$TOKEN" --discover-path .
+
+# or through CLI wrapper (inherits --base-url/--token defaults)
+cargo run -p shirei -- tui -- --discover-path .
 ```
 
 Useful keys: `d` discover project, `n` create job, `y` approve, `c` request changes (rerun), `a` ack, `u` unack, `k` kill, `r` refresh, `m` maximize logs, `t` attach in background, `e` edit in background, `o` open linked PR in browser. Logs are colorized by source (`agent`, `output`, `stderr`).
