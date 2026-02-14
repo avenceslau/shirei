@@ -21,6 +21,7 @@ use crate::{
 
 const DEFAULT_CONTINUE_RETRIES: u32 = 6;
 const CONTINUE_PROMPT: &str = "continue";
+const SHIREI_AGENT: &str = "shirei";
 
 pub struct JobRunner {
     pool: SqlitePool,
@@ -187,6 +188,7 @@ impl JobRunner {
         if let Some(p) = prompt {
             cmd.arg("run").arg(p);
         }
+        cmd.arg("--agent").arg(SHIREI_AGENT);
         cmd.current_dir(&job.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -219,7 +221,14 @@ impl JobRunner {
 
         if let Some(p) = prompt {
             let _ = log_out
-                .write_all(format!("[runner] opencode run \"{}\"\n", p).as_bytes())
+                .write_all(
+                    format!("[runner] opencode run \"{}\" --agent {}\n", p, SHIREI_AGENT)
+                        .as_bytes(),
+                )
+                .await;
+        } else {
+            let _ = log_out
+                .write_all(format!("[runner] opencode --agent {}\n", SHIREI_AGENT).as_bytes())
                 .await;
         }
 

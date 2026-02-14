@@ -10,7 +10,7 @@ use crate::{
     git_ops,
     runner::JobRunner,
     store,
-    util::now_rfc3339,
+    util::{now_rfc3339, request_changes_prompt_notes},
     vcs::{factory::ProviderFactory, parse_repo_key, PullRequestId},
     worktrees,
 };
@@ -219,8 +219,7 @@ async fn handle_command(
         tracing::info!(project_id = %project_id, repo_key = %repo_key, pr_number, command_id = %command_id, "processing request-changes command");
         let feedback = cmd.trim_start_matches("request-changes").trim().to_string();
         if let Some(job) = store::latest_pr_job(pool, repo_key, pr_number).await? {
-            if !feedback.is_empty() {
-                let notes = format!("Reviewer feedback:\n{}", feedback);
+            if let Some(notes) = request_changes_prompt_notes(Some(&feedback), true) {
                 store::append_job_prompt(pool, &job.job_id, &notes).await?;
             }
             store::request_changes(pool, &job.job_id).await?;

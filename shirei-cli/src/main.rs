@@ -1032,12 +1032,40 @@ compatibility: opencode
         print_only,
     )?;
 
+    let agents_dir = opencode_agents_dir()?;
+    std::fs::create_dir_all(&agents_dir)
+        .with_context(|| format!("failed creating {}", agents_dir.display()))?;
+    let agent_path = agents_dir.join("shirei.md");
+    write_setup_file(
+        &agent_path,
+        r#"---
+description: Use for Shirei-managed coding and PR feedback sessions
+mode: primary
+---
+You are the Shirei agent. Use this agent for sessions launched by Shirei jobs.
+
+Core behavior:
+- Follow repository instructions and local conventions first.
+- Keep changes minimal, production-safe, and verifiable.
+- When addressing PR feedback, apply fixes, run relevant tests, commit, and push before reporting completion.
+- Prefer loading the `shirei-workflow` skill for Shirei lifecycle operations.
+
+Output expectations:
+- Be concise and actionable.
+- Include changed file paths in final summaries.
+- Include test/validation commands run and their result.
+"#,
+        force,
+        print_only,
+    )?;
+
     if !print_only {
         println!(
             "OpenCode commands installed in {}: /shirei-attach, /shirei-edit",
             commands_dir.display()
         );
         println!("OpenCode skill installed: {}", skill_path.display());
+        println!("OpenCode agent installed: {}", agent_path.display());
     }
     Ok(())
 }
@@ -1081,6 +1109,14 @@ fn opencode_skills_dir() -> anyhow::Result<PathBuf> {
     }
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
     Ok(PathBuf::from(home).join(".config/opencode/skills"))
+}
+
+fn opencode_agents_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(dir) = std::env::var("OPENCODE_CONFIG_DIR") {
+        return Ok(PathBuf::from(dir).join("agent"));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
+    Ok(PathBuf::from(home).join(".config/opencode/agent"))
 }
 
 async fn attach_job(

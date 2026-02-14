@@ -111,6 +111,9 @@ This writes files to `~/.config/opencode/commands` for:
 
 It also installs a global skill at `~/.config/opencode/skills/shirei-workflow/SKILL.md` so OpenCode agents can load Shirei-specific operational guidance.
 
+`shirei setup opencode` also installs a primary OpenCode agent at `~/.config/opencode/agent/shirei.md`.
+Shirei job sessions run `opencode` with `--agent shirei` by default.
+
 ## Configuration
 
 Shirei daemon loads config from `~/.local/share/shirei/config.json` by default (or from

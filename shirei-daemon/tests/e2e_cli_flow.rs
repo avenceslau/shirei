@@ -152,7 +152,7 @@ async fn full_cli_api_flow_with_mock_opencode() -> Result<()> {
             arr.iter().any(|l| {
                 l.as_str()
                     .unwrap_or("")
-                    .contains("mock opencode args: run mock prompt")
+                    .contains("mock opencode args: run mock prompt --agent shirei")
             })
         })
         .unwrap_or(false));
