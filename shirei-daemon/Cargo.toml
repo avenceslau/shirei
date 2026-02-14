@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+bundle-bins = []
+
 [dependencies]
 anyhow = "1"
 axum = "0.7"
@@ -34,6 +37,7 @@ gitlab = "0.1808.0"
 
 hex = "0.4"
 url = "2"
+opencode-sdk = "0.1.6"
 
 
 [dev-dependencies]

@@ -19,5 +19,16 @@
 
 ## CLI / Daemon UX
 
-- [ ] CLI should auto-start the daemon in the background when running a command and daemon is not up
-- [ ] add `shirei start|stop|restart` lifecycle commands and `shirei tui` to launch the TUI
+- [x] CLI should auto-start the daemon in the background when running a command and daemon is not up
+- [x] add `shirei start|stop|restart` lifecycle commands and `shirei tui` to launch the TUI
+- [ ] add `shirei doctor --json` for machine-readable health/readiness checks
+
+## Packaging
+
+- [x] bundle `shirei-daemon` and `shirei-tui` into the published `shirei` package so one install provides all binaries
+
+## Jobs UX
+
+- [ ] add a way to restart an existing job from CLI/TUI/API
+- [x] add in-TUI action to answer permission/input prompts for running jobs
+- [ ] support mid-prompt Shirei attach from OpenCode so closing OpenCode keeps the session managed by Shirei

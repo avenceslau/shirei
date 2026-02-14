@@ -33,6 +33,10 @@ pub struct JobRow {
     pub origin_command_id: Option<String>,
     pub worktree_name: Option<String>,
     pub worktree_path: Option<String>,
+    pub attach_pid: Option<i64>,
+    pub attach_host: Option<String>,
+    pub attach_port: Option<i64>,
+    pub attach_url: Option<String>,
     pub ended_at: Option<String>,
     pub exit_code: Option<i64>,
 }
@@ -134,6 +138,7 @@ pub async fn get_job(pool: &SqlitePool, job_id: &str) -> Result<JobRow> {
                pid, log_path, prompt, acknowledged_at,
                origin_type, origin_repo_key, origin_pr_number, origin_command_id,
                worktree_name, worktree_path,
+               attach_pid, attach_host, attach_port, attach_url,
                ended_at, exit_code
         FROM jobs WHERE job_id=?1
         "#,
@@ -150,6 +155,7 @@ pub async fn list_jobs(pool: &SqlitePool, project_id: &str) -> Result<Vec<JobRow
                pid, log_path, prompt, acknowledged_at,
                origin_type, origin_repo_key, origin_pr_number, origin_command_id,
                worktree_name, worktree_path,
+               attach_pid, attach_host, attach_port, attach_url,
                ended_at, exit_code
         FROM jobs WHERE project_id=?1 ORDER BY updated_at DESC
         "#,
@@ -279,6 +285,57 @@ pub async fn request_changes(pool: &SqlitePool, job_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn set_job_attention(
+    pool: &SqlitePool,
+    job_id: &str,
+    needs_attention: bool,
+) -> Result<()> {
+    let now = now_rfc3339();
+    sqlx::query("UPDATE jobs SET needs_attention=?1, updated_at=?2 WHERE job_id=?3")
+        .bind(if needs_attention { 1_i64 } else { 0_i64 })
+        .bind(&now)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn set_attach_runtime(
+    pool: &SqlitePool,
+    job_id: &str,
+    pid: i64,
+    host: &str,
+    port: i64,
+    url: &str,
+) -> Result<()> {
+    let now = now_rfc3339();
+    sqlx::query(
+        "UPDATE jobs SET attach_pid=?1, attach_host=?2, attach_port=?3, attach_url=?4, attach_started_at=?5, updated_at=?6 WHERE job_id=?7",
+    )
+    .bind(pid)
+    .bind(host)
+    .bind(port)
+    .bind(url)
+    .bind(&now)
+    .bind(&now)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn clear_attach_runtime(pool: &SqlitePool, job_id: &str) -> Result<()> {
+    let now = now_rfc3339();
+    sqlx::query(
+        "UPDATE jobs SET attach_pid=NULL, attach_host=NULL, attach_port=NULL, attach_url=NULL, attach_started_at=NULL, updated_at=?1 WHERE job_id=?2",
+    )
+    .bind(&now)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn append_job_prompt(pool: &SqlitePool, job_id: &str, extra: &str) -> Result<()> {
     let now = now_rfc3339();
     sqlx::query(
@@ -305,6 +362,7 @@ pub async fn latest_pr_job(
                pid, log_path, prompt, acknowledged_at,
                origin_type, origin_repo_key, origin_pr_number, origin_command_id,
                worktree_name, worktree_path,
+               attach_pid, attach_host, attach_port, attach_url,
                ended_at, exit_code
         FROM jobs
         WHERE origin_repo_key=?1 AND origin_pr_number=?2

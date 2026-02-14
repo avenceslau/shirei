@@ -19,7 +19,17 @@ impl Db {
             .max_connections(5)
             .connect_with(opts)
             .await?;
-        sqlx::migrate!("./src/migrations").run(&pool).await?;
+        #[cfg(feature = "bundle-bins")]
+        {
+            sqlx::migrate!("./src/bin/shirei-daemon/migrations")
+                .run(&pool)
+                .await?;
+        }
+
+        #[cfg(not(feature = "bundle-bins"))]
+        {
+            sqlx::migrate!("./src/migrations").run(&pool).await?;
+        }
         Ok(Self { pool })
     }
 }

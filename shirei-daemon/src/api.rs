@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Context};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -8,9 +9,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use opencode_sdk::types::permission::{PermissionReply, PermissionReplyRequest};
+use opencode_sdk::types::question::QuestionReplyRequest;
+use opencode_sdk::{Client as OpencodeClient, ClientBuilder as OpencodeClientBuilder};
 use sqlx::Row;
 use sqlx::SqlitePool;
-use std::{convert::Infallible, path::PathBuf, sync::Arc};
+use std::{convert::Infallible, path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 
 use crate::{
     config::ShireiConfig, events::EventBus, git_ops, runner::JobRunner, store,
@@ -39,11 +43,29 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v0.1/jobs/:job_id", get(get_job))
         .route("/api/v0.1/jobs/:job_id/attach", post(job_attach))
+        .route(
+            "/api/v0.1/jobs/:job_id/attach-status",
+            get(job_attach_status),
+        )
+        .route("/api/v0.1/jobs/:job_id/attach-stop", post(job_attach_stop))
         .route("/api/v0.1/jobs/:job_id/logs", get(job_logs))
         .route("/api/v0.1/jobs/:job_id/kill", post(kill_job))
         .route("/api/v0.1/jobs/:job_id/ack", post(ack_job))
         .route("/api/v0.1/jobs/:job_id/unack", post(unack_job))
         .route("/api/v0.1/jobs/:job_id/approve", post(approve_job))
+        .route("/api/v0.1/jobs/:job_id/inputs", get(job_inputs))
+        .route(
+            "/api/v0.1/jobs/:job_id/permissions/:request_id/reply",
+            post(job_permission_reply),
+        )
+        .route(
+            "/api/v0.1/jobs/:job_id/questions/:request_id/reply",
+            post(job_question_reply),
+        )
+        .route(
+            "/api/v0.1/jobs/:job_id/questions/:request_id/reject",
+            post(job_question_reject),
+        )
         .route(
             "/api/v0.1/jobs/:job_id/request-changes",
             post(request_changes_job),
@@ -75,9 +97,20 @@ async fn info(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRes
     if let Err(code) = require_auth(&headers, &state.auth_token) {
         return code.into_response();
     }
+    let opencode_program = state.config.commands.opencode.program.clone();
+    let opencode_args = state.config.commands.opencode.args.clone();
     Json(serde_json::json!({
         "state_dir": state.state_dir.display().to_string(),
-        "db": state.state_dir.join("shirei.db").display().to_string()
+        "db": state.state_dir.join("shirei.db").display().to_string(),
+        "providers": {
+            "github_configured": std::env::var("SHIREI_GITHUB_TOKEN").ok().map(|v| !v.trim().is_empty()).unwrap_or(false),
+            "gitlab_configured": std::env::var("SHIREI_GITLAB_TOKEN").ok().map(|v| !v.trim().is_empty()).unwrap_or(false)
+                && std::env::var("SHIREI_GITLAB_HOST").ok().map(|v| !v.trim().is_empty()).unwrap_or(false)
+        },
+        "commands": {
+            "opencode_program": opencode_program,
+            "opencode_args": opencode_args,
+        }
     }))
     .into_response()
 }
@@ -174,27 +207,204 @@ async fn job_attach(
 
     match store::get_job(&state.pool, &job_id).await {
         Ok(job) => {
-            let mut argv = state.config.commands.opencode.args.clone();
-            if argv.iter().any(|arg| arg.contains("{job_id}")) {
-                argv = argv
-                    .into_iter()
-                    .map(|arg| arg.replace("{job_id}", &job_id))
-                    .collect();
+            if std::env::var("SHIREI_OPENCODE_CMD").is_ok() {
+                let mut argv = state.config.commands.opencode.args.clone();
+                if argv.iter().any(|arg| arg.contains("{job_id}")) {
+                    argv = argv
+                        .into_iter()
+                        .map(|arg| arg.replace("{job_id}", &job_id))
+                        .collect();
+                }
+
+                return Json(serde_json::json!({
+                    "attach": {
+                        "job_id": job_id,
+                        "status": job.status,
+                        "cwd": job.cwd,
+                        "cmd": state.config.commands.opencode.program.clone(),
+                        "argv": argv,
+                    }
+                }))
+                .into_response();
             }
 
-            Json(serde_json::json!({
-                "attach": {
-                    "job_id": job_id,
-                    "status": job.status,
-                    "cwd": job.cwd,
-                    "cmd": state.config.commands.opencode.program.clone(),
-                    "argv": argv,
+            match ensure_job_attach_runtime(&state, &job).await {
+                Ok(attach_url) => {
+                    let mut argv = state.config.commands.opencode.args.clone();
+                    argv.push("attach".to_string());
+                    argv.push(attach_url);
+
+                    Json(serde_json::json!({
+                        "attach": {
+                            "job_id": job_id,
+                            "status": job.status,
+                            "cwd": job.cwd,
+                            "cmd": state.config.commands.opencode.program.clone(),
+                            "argv": argv,
+                        }
+                    }))
+                    .into_response()
                 }
+                Err(e) => {
+                    tracing::error!(job_id = %job_id, error = ?e, "ensure attach runtime failed");
+                    (StatusCode::BAD_GATEWAY, "ATTACH_RUNTIME_FAILED").into_response()
+                }
+            }
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "JOB_NOT_FOUND").into_response(),
+    }
+}
+
+async fn job_attach_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(code) = require_auth(&headers, &state.auth_token) {
+        return code.into_response();
+    }
+    match store::get_job(&state.pool, &job_id).await {
+        Ok(job) => {
+            let running = match (job.attach_pid, job.attach_host.as_deref(), job.attach_port) {
+                (Some(pid), Some(_), Some(_)) if process_alive(pid) => true,
+                _ => false,
+            };
+            Json(serde_json::json!({
+                "job_id": job_id,
+                "running": running,
+                "attach_url": job.attach_url,
+                "attach_pid": job.attach_pid,
+                "attach_host": job.attach_host,
+                "attach_port": job.attach_port,
             }))
             .into_response()
         }
         Err(_) => (StatusCode::NOT_FOUND, "JOB_NOT_FOUND").into_response(),
     }
+}
+
+async fn job_attach_stop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(code) = require_auth(&headers, &state.auth_token) {
+        return code.into_response();
+    }
+    match stop_job_attach_runtime(&state, &job_id).await {
+        Ok(stopped) => Json(serde_json::json!({"ok": true, "stopped": stopped})).into_response(),
+        Err(e) => {
+            tracing::error!(job_id = %job_id, error = ?e, "attach-stop failed");
+            (StatusCode::BAD_GATEWAY, "ATTACH_STOP_FAILED").into_response()
+        }
+    }
+}
+
+async fn ensure_job_attach_runtime(
+    state: &AppState,
+    job: &store::JobRow,
+) -> anyhow::Result<String> {
+    if let (Some(pid), Some(url)) = (job.attach_pid, job.attach_url.clone()) {
+        if process_alive(pid) && attach_health_ok(&url).await {
+            return Ok(url);
+        }
+        let _ = stop_pid(pid);
+        let _ = store::clear_attach_runtime(&state.pool, &job.job_id).await;
+    }
+
+    let host = "127.0.0.1";
+    let listener = std::net::TcpListener::bind((host, 0)).context("bind ephemeral attach port")?;
+    let port = listener
+        .local_addr()
+        .map(|a| a.port())
+        .context("read attach port")?;
+    drop(listener);
+
+    let mut cmd = std::process::Command::new(&state.config.commands.opencode.program);
+    cmd.args(&state.config.commands.opencode.args)
+        .arg("serve")
+        .arg("--hostname")
+        .arg(host)
+        .arg("--port")
+        .arg(port.to_string())
+        .current_dir(&job.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let child = cmd.spawn().context("spawn opencode serve for attach")?;
+    let pid = child.id() as i64;
+    let url = format!("http://{host}:{port}");
+
+    wait_for_attach_health(&url)
+        .await
+        .with_context(|| format!("attach backend did not become healthy at {url}"))?;
+
+    store::set_attach_runtime(&state.pool, &job.job_id, pid, host, port as i64, &url).await?;
+    Ok(url)
+}
+
+async fn stop_job_attach_runtime(state: &AppState, job_id: &str) -> anyhow::Result<bool> {
+    let job = store::get_job(&state.pool, job_id).await?;
+    if let Some(pid) = job.attach_pid {
+        let _ = stop_pid(pid);
+        store::clear_attach_runtime(&state.pool, job_id).await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn wait_for_attach_health(url: &str) -> anyhow::Result<()> {
+    for _ in 0..50 {
+        if attach_health_ok(url).await {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(anyhow!("attach backend health timeout"))
+}
+
+async fn attach_health_ok(url: &str) -> bool {
+    let client = reqwest::Client::new();
+    match client.get(format!("{url}/global/health")).send().await {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+#[cfg(unix)]
+fn process_alive(pid: i64) -> bool {
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let err = std::io::Error::last_os_error().raw_os_error();
+    !matches!(err, Some(libc::ESRCH))
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: i64) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn stop_pid(pid: i64) -> bool {
+    unsafe {
+        let _ = libc::kill(pid as i32, libc::SIGTERM);
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    if !process_alive(pid) {
+        return true;
+    }
+    unsafe {
+        let _ = libc::kill(pid as i32, libc::SIGKILL);
+    }
+    !process_alive(pid)
+}
+
+#[cfg(not(unix))]
+fn stop_pid(_pid: i64) -> bool {
+    false
 }
 
 #[derive(serde::Deserialize)]
@@ -387,6 +597,8 @@ async fn kill_job(
     if let Err(code) = require_auth(&headers, &state.auth_token) {
         return code.into_response();
     }
+    let _ = stop_job_attach_runtime(&state, &job_id).await;
+
     let pid = sqlx::query("SELECT pid FROM jobs WHERE job_id=?1")
         .bind(&job_id)
         .fetch_optional(&state.pool)
@@ -438,6 +650,7 @@ async fn approve_job(
     if let Err(code) = require_auth(&headers, &state.auth_token) {
         return code.into_response();
     }
+    let _ = stop_job_attach_runtime(&state, &job_id).await;
     match store::approve_job(&state.pool, &job_id).await {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL").into_response(),
@@ -495,6 +708,192 @@ async fn request_changes_job(
     });
 
     Json(serde_json::json!({"ok": true, "job_id": job.job_id})).into_response()
+}
+
+fn opencode_client_for_dir(dir: &str) -> Result<OpencodeClient, String> {
+    let base_url = std::env::var("SHIREI_OPENCODE_BASE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:4096".to_string());
+    OpencodeClientBuilder::new()
+        .base_url(base_url)
+        .directory(dir.to_string())
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct PermissionPrompt {
+    id: String,
+    session_id: Option<String>,
+    permission: String,
+    patterns: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct QuestionPrompt {
+    id: String,
+    session_id: String,
+    header: String,
+    question: String,
+    options: Vec<String>,
+    multiple: bool,
+    custom: bool,
+}
+
+async fn job_inputs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(code) = require_auth(&headers, &state.auth_token) {
+        return code.into_response();
+    }
+
+    let job = match store::get_job(&state.pool, &job_id).await {
+        Ok(job) => job,
+        Err(_) => return (StatusCode::NOT_FOUND, "JOB_NOT_FOUND").into_response(),
+    };
+
+    let client = match opencode_client_for_dir(&job.cwd) {
+        Ok(client) => client,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "OPENCODE_CLIENT_FAILED").into_response()
+        }
+    };
+
+    let permissions = client.permissions().list().await.unwrap_or_default();
+    let questions = client.questions().list().await.unwrap_or_default();
+
+    let p: Vec<PermissionPrompt> = permissions
+        .into_iter()
+        .map(|it| PermissionPrompt {
+            id: it.id,
+            session_id: it.session_id,
+            permission: it.permission,
+            patterns: it.patterns,
+        })
+        .collect();
+
+    let q: Vec<QuestionPrompt> = questions
+        .into_iter()
+        .flat_map(|it| {
+            let sid = it.session_id;
+            it.questions.into_iter().map(move |qq| QuestionPrompt {
+                id: it.id.clone(),
+                session_id: sid.clone(),
+                header: qq.header,
+                question: qq.question,
+                options: qq.options.into_iter().map(|o| o.label).collect(),
+                multiple: qq.multiple.unwrap_or(false),
+                custom: qq.custom.unwrap_or(false),
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "job_id": job_id,
+        "permissions": p,
+        "questions": q,
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct PermissionReplyReq {
+    reply: String,
+    message: Option<String>,
+}
+
+async fn job_permission_reply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((job_id, request_id)): Path<(String, String)>,
+    Json(req): Json<PermissionReplyReq>,
+) -> impl IntoResponse {
+    if let Err(code) = require_auth(&headers, &state.auth_token) {
+        return code.into_response();
+    }
+    let job = match store::get_job(&state.pool, &job_id).await {
+        Ok(job) => job,
+        Err(_) => return (StatusCode::NOT_FOUND, "JOB_NOT_FOUND").into_response(),
+    };
+    let client = match opencode_client_for_dir(&job.cwd) {
+        Ok(client) => client,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "OPENCODE_CLIENT_FAILED").into_response()
+        }
+    };
+
+    let reply = match req.reply.to_ascii_lowercase().as_str() {
+        "once" => PermissionReply::Once,
+        "always" => PermissionReply::Always,
+        "reject" => PermissionReply::Reject,
+        _ => return (StatusCode::BAD_REQUEST, "INVALID_REPLY").into_response(),
+    };
+    let body = PermissionReplyRequest {
+        reply,
+        message: req.message,
+    };
+    match client.permissions().reply(&request_id, &body).await {
+        Ok(_) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(_) => (StatusCode::BAD_GATEWAY, "OPENCODE_REPLY_FAILED").into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct QuestionReplyReq {
+    answers: Vec<Vec<String>>,
+}
+
+async fn job_question_reply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((job_id, request_id)): Path<(String, String)>,
+    Json(req): Json<QuestionReplyReq>,
+) -> impl IntoResponse {
+    if let Err(code) = require_auth(&headers, &state.auth_token) {
+        return code.into_response();
+    }
+    let job = match store::get_job(&state.pool, &job_id).await {
+        Ok(job) => job,
+        Err(_) => return (StatusCode::NOT_FOUND, "JOB_NOT_FOUND").into_response(),
+    };
+    let client = match opencode_client_for_dir(&job.cwd) {
+        Ok(client) => client,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "OPENCODE_CLIENT_FAILED").into_response()
+        }
+    };
+    let body = QuestionReplyRequest {
+        answers: req.answers,
+    };
+    match client.questions().reply(&request_id, &body).await {
+        Ok(ok) => Json(serde_json::json!({"ok": ok})).into_response(),
+        Err(_) => (StatusCode::BAD_GATEWAY, "OPENCODE_REPLY_FAILED").into_response(),
+    }
+}
+
+async fn job_question_reject(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((job_id, request_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if let Err(code) = require_auth(&headers, &state.auth_token) {
+        return code.into_response();
+    }
+    let job = match store::get_job(&state.pool, &job_id).await {
+        Ok(job) => job,
+        Err(_) => return (StatusCode::NOT_FOUND, "JOB_NOT_FOUND").into_response(),
+    };
+    let client = match opencode_client_for_dir(&job.cwd) {
+        Ok(client) => client,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "OPENCODE_CLIENT_FAILED").into_response()
+        }
+    };
+    match client.questions().reject(&request_id).await {
+        Ok(ok) => Json(serde_json::json!({"ok": ok})).into_response(),
+        Err(_) => (StatusCode::BAD_GATEWAY, "OPENCODE_REPLY_FAILED").into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]

@@ -10,11 +10,10 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::prelude::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::Terminal;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
@@ -73,6 +72,21 @@ struct JobRow {
     origin_pr_number: Option<i64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct PermissionPrompt {
+    id: String,
+    permission: String,
+    patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct QuestionPrompt {
+    id: String,
+    header: String,
+    question: String,
+    options: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Focus {
     Projects,
@@ -125,21 +139,52 @@ impl ApiClient {
         Ok(Self { base_url, client })
     }
 
+    async fn send_with_bootstrap<F>(&self, mut build: F) -> Result<reqwest::Response>
+    where
+        F: FnMut() -> reqwest::RequestBuilder,
+    {
+        match build().send().await {
+            Ok(resp) => Ok(resp),
+            Err(err) if is_daemon_unreachable(&err) => {
+                start_daemon_in_background().context("failed to bootstrap shirei-daemon")?;
+                self.wait_for_daemon_ready().await?;
+                Ok(build().send().await?)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn wait_for_daemon_ready(&self) -> Result<()> {
+        let health_url = format!("{}/api/v0.1/health", self.base_url);
+        for _ in 0..20 {
+            match self.client.get(&health_url).send().await {
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(_) => {}
+                Err(err) if is_daemon_unreachable(&err) => {}
+                Err(err) => return Err(err).context("daemon reachable but health check failed"),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(anyhow!("daemon did not become healthy after bootstrap"))
+    }
+
     async fn discover_project(&self, path: &str) -> Result<()> {
-        self.client
-            .post(format!("{}/api/v0.1/projects/discover", self.base_url))
-            .json(&serde_json::json!({"root_path": path}))
-            .send()
-            .await?
-            .error_for_status()?;
+        self.send_with_bootstrap(|| {
+            self.client
+                .post(format!("{}/api/v0.1/projects/discover", self.base_url))
+                .json(&serde_json::json!({"root_path": path}))
+        })
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
     async fn projects(&self) -> Result<Vec<ProjectRow>> {
         let v = self
-            .client
-            .get(format!("{}/api/v0.1/projects", self.base_url))
-            .send()
+            .send_with_bootstrap(|| {
+                self.client
+                    .get(format!("{}/api/v0.1/projects", self.base_url))
+            })
             .await?
             .error_for_status()?
             .json::<serde_json::Value>()
@@ -154,12 +199,12 @@ impl ApiClient {
 
     async fn jobs(&self, project_id: &str) -> Result<Vec<JobRow>> {
         let v = self
-            .client
-            .get(format!(
-                "{}/api/v0.1/projects/{project_id}/jobs",
-                self.base_url
-            ))
-            .send()
+            .send_with_bootstrap(|| {
+                self.client.get(format!(
+                    "{}/api/v0.1/projects/{project_id}/jobs",
+                    self.base_url
+                ))
+            })
             .await?
             .error_for_status()?
             .json::<serde_json::Value>()
@@ -173,26 +218,27 @@ impl ApiClient {
     }
 
     async fn spawn_job(&self, project_id: &str, name: &str, prompt: &str) -> Result<()> {
-        self.client
-            .post(format!(
-                "{}/api/v0.1/projects/{project_id}/jobs",
-                self.base_url
-            ))
-            .json(&serde_json::json!({"name": name, "prompt": prompt}))
-            .send()
-            .await?
-            .error_for_status()?;
+        self.send_with_bootstrap(|| {
+            self.client
+                .post(format!(
+                    "{}/api/v0.1/projects/{project_id}/jobs",
+                    self.base_url
+                ))
+                .json(&serde_json::json!({"name": name, "prompt": prompt}))
+        })
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
     async fn logs(&self, job_id: &str) -> Result<Vec<String>> {
         let v = self
-            .client
-            .get(format!(
-                "{}/api/v0.1/jobs/{job_id}/logs?tail_lines=200",
-                self.base_url
-            ))
-            .send()
+            .send_with_bootstrap(|| {
+                self.client.get(format!(
+                    "{}/api/v0.1/jobs/{job_id}/logs?tail_lines=200",
+                    self.base_url
+                ))
+            })
             .await?
             .error_for_status()?
             .json::<serde_json::Value>()
@@ -207,9 +253,10 @@ impl ApiClient {
 
     async fn job(&self, job_id: &str) -> Result<JobRecord> {
         let v = self
-            .client
-            .get(format!("{}/api/v0.1/jobs/{job_id}", self.base_url))
-            .send()
+            .send_with_bootstrap(|| {
+                self.client
+                    .get(format!("{}/api/v0.1/jobs/{job_id}", self.base_url))
+            })
             .await?
             .error_for_status()?
             .json::<JobApiResponse>()
@@ -219,9 +266,10 @@ impl ApiClient {
 
     async fn attach_spec(&self, job_id: &str) -> Result<AttachRecord> {
         let v = self
-            .client
-            .post(format!("{}/api/v0.1/jobs/{job_id}/attach", self.base_url))
-            .send()
+            .send_with_bootstrap(|| {
+                self.client
+                    .post(format!("{}/api/v0.1/jobs/{job_id}/attach", self.base_url))
+            })
             .await?
             .error_for_status()?
             .json::<AttachApiResponse>()
@@ -230,51 +278,123 @@ impl ApiClient {
     }
 
     async fn kill_job(&self, job_id: &str) -> Result<()> {
-        self.client
-            .post(format!("{}/api/v0.1/jobs/{job_id}/kill", self.base_url))
-            .send()
-            .await?
-            .error_for_status()?;
+        self.send_with_bootstrap(|| {
+            self.client
+                .post(format!("{}/api/v0.1/jobs/{job_id}/kill", self.base_url))
+        })
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
     async fn ack_job(&self, job_id: &str) -> Result<()> {
-        self.client
-            .post(format!("{}/api/v0.1/jobs/{job_id}/ack", self.base_url))
-            .send()
-            .await?
-            .error_for_status()?;
+        self.send_with_bootstrap(|| {
+            self.client
+                .post(format!("{}/api/v0.1/jobs/{job_id}/ack", self.base_url))
+        })
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
     async fn unack_job(&self, job_id: &str) -> Result<()> {
-        self.client
-            .post(format!("{}/api/v0.1/jobs/{job_id}/unack", self.base_url))
-            .send()
-            .await?
-            .error_for_status()?;
+        self.send_with_bootstrap(|| {
+            self.client
+                .post(format!("{}/api/v0.1/jobs/{job_id}/unack", self.base_url))
+        })
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
     async fn approve_job(&self, job_id: &str) -> Result<()> {
-        self.client
-            .post(format!("{}/api/v0.1/jobs/{job_id}/approve", self.base_url))
-            .send()
-            .await?
-            .error_for_status()?;
+        self.send_with_bootstrap(|| {
+            self.client
+                .post(format!("{}/api/v0.1/jobs/{job_id}/approve", self.base_url))
+        })
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
     async fn request_changes_job(&self, job_id: &str) -> Result<()> {
-        self.client
-            .post(format!(
-                "{}/api/v0.1/jobs/{job_id}/request-changes",
+        self.send_with_bootstrap(|| {
+            self.client
+                .post(format!(
+                    "{}/api/v0.1/jobs/{job_id}/request-changes",
+                    self.base_url
+                ))
+                .json(&serde_json::json!({"feedback": null}))
+        })
+        .await?
+        .error_for_status()?;
+        Ok(())
+    }
+
+    async fn job_inputs(
+        &self,
+        job_id: &str,
+    ) -> Result<(Vec<PermissionPrompt>, Vec<QuestionPrompt>)> {
+        #[derive(Deserialize)]
+        struct InputsResp {
+            permissions: Vec<PermissionPrompt>,
+            questions: Vec<QuestionPrompt>,
+        }
+
+        let v = self
+            .send_with_bootstrap(|| {
+                self.client
+                    .get(format!("{}/api/v0.1/jobs/{job_id}/inputs", self.base_url))
+            })
+            .await?
+            .error_for_status()?
+            .json::<InputsResp>()
+            .await?;
+        Ok((v.permissions, v.questions))
+    }
+
+    async fn reply_permission(&self, job_id: &str, request_id: &str, reply: &str) -> Result<()> {
+        self.send_with_bootstrap(|| {
+            self.client
+                .post(format!(
+                    "{}/api/v0.1/jobs/{job_id}/permissions/{request_id}/reply",
+                    self.base_url
+                ))
+                .json(&serde_json::json!({"reply": reply, "message": null}))
+        })
+        .await?
+        .error_for_status()?;
+        Ok(())
+    }
+
+    async fn reply_question(
+        &self,
+        job_id: &str,
+        request_id: &str,
+        answers: Vec<Vec<String>>,
+    ) -> Result<()> {
+        self.send_with_bootstrap(|| {
+            self.client
+                .post(format!(
+                    "{}/api/v0.1/jobs/{job_id}/questions/{request_id}/reply",
+                    self.base_url
+                ))
+                .json(&serde_json::json!({"answers": answers}))
+        })
+        .await?
+        .error_for_status()?;
+        Ok(())
+    }
+
+    async fn reject_question(&self, job_id: &str, request_id: &str) -> Result<()> {
+        self.send_with_bootstrap(|| {
+            self.client.post(format!(
+                "{}/api/v0.1/jobs/{job_id}/questions/{request_id}/reject",
                 self.base_url
             ))
-            .json(&serde_json::json!({"feedback": null}))
-            .send()
-            .await?
-            .error_for_status()?;
+        })
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 }
@@ -285,12 +405,15 @@ struct App {
     projects: Vec<ProjectRow>,
     jobs: Vec<JobRow>,
     logs: Vec<String>,
+    pending_permissions: Vec<PermissionPrompt>,
+    pending_questions: Vec<QuestionPrompt>,
     selected_project_id: Option<String>,
     selected_job_id: Option<String>,
     focus: Focus,
     job_view: JobView,
     search: String,
     search_mode: bool,
+    help_mode: bool,
     logs_maximized: bool,
     log_scroll: usize,
     status: String,
@@ -325,12 +448,7 @@ impl App {
             Ok(jobs) => {
                 self.jobs = jobs;
                 self.ensure_selected_job_visible();
-                self.status = format!(
-                    "Jobs: {} running, {} waiting input, {} awaiting review",
-                    self.count_running(),
-                    self.count_waiting_input(),
-                    self.count_awaiting_review()
-                );
+                self.status = format!("Loaded {} sessions", self.jobs.len());
             }
             Err(e) => self.status = format!("Refresh jobs failed: {e}"),
         }
@@ -345,6 +463,101 @@ impl App {
         match self.api.logs(&job.job_id).await {
             Ok(lines) => self.logs = lines,
             Err(e) => self.status = format!("Refresh logs failed: {e}"),
+        }
+    }
+
+    async fn refresh_inputs(&mut self) {
+        let Some(job) = self.selected_job() else {
+            self.pending_permissions.clear();
+            self.pending_questions.clear();
+            return;
+        };
+        match self.api.job_inputs(&job.job_id).await {
+            Ok((permissions, questions)) => {
+                self.pending_permissions = permissions;
+                self.pending_questions = questions;
+            }
+            Err(_) => {
+                self.pending_permissions.clear();
+                self.pending_questions.clear();
+            }
+        }
+    }
+
+    async fn allow_first_permission(&mut self, always: bool) {
+        let Some(job_id) = self.selected_job().map(|j| j.job_id.clone()) else {
+            return;
+        };
+        let Some(req) = self.pending_permissions.first() else {
+            self.status = "No pending permission requests".to_string();
+            return;
+        };
+        let reply = if always { "always" } else { "once" };
+        match self.api.reply_permission(&job_id, &req.id, reply).await {
+            Ok(()) => {
+                self.status = format!("Permission {} replied: {reply}", req.id);
+                self.refresh_inputs().await;
+            }
+            Err(e) => self.status = format!("Permission reply failed: {e}"),
+        }
+    }
+
+    async fn reject_first_permission(&mut self) {
+        let Some(job_id) = self.selected_job().map(|j| j.job_id.clone()) else {
+            return;
+        };
+        let Some(req) = self.pending_permissions.first() else {
+            self.status = "No pending permission requests".to_string();
+            return;
+        };
+        match self.api.reply_permission(&job_id, &req.id, "reject").await {
+            Ok(()) => {
+                self.status = format!("Permission {} rejected", req.id);
+                self.refresh_inputs().await;
+            }
+            Err(e) => self.status = format!("Permission reject failed: {e}"),
+        }
+    }
+
+    async fn answer_first_question_option(&mut self, option_index: usize) {
+        let Some(job_id) = self.selected_job().map(|j| j.job_id.clone()) else {
+            return;
+        };
+        let Some(req) = self.pending_questions.first() else {
+            self.status = "No pending question requests".to_string();
+            return;
+        };
+        let Some(label) = req.options.get(option_index).cloned() else {
+            self.status = format!("Question has no option {}", option_index + 1);
+            return;
+        };
+        match self
+            .api
+            .reply_question(&job_id, &req.id, vec![vec![label.clone()]])
+            .await
+        {
+            Ok(()) => {
+                self.status = format!("Question {} answered: {}", req.id, label);
+                self.refresh_inputs().await;
+            }
+            Err(e) => self.status = format!("Question answer failed: {e}"),
+        }
+    }
+
+    async fn reject_first_question(&mut self) {
+        let Some(job_id) = self.selected_job().map(|j| j.job_id.clone()) else {
+            return;
+        };
+        let Some(req) = self.pending_questions.first() else {
+            self.status = "No pending question requests".to_string();
+            return;
+        };
+        match self.api.reject_question(&job_id, &req.id).await {
+            Ok(()) => {
+                self.status = format!("Question {} rejected", req.id);
+                self.refresh_inputs().await;
+            }
+            Err(e) => self.status = format!("Question reject failed: {e}"),
         }
     }
 
@@ -445,6 +658,7 @@ impl App {
                 self.refresh_jobs().await;
                 self.log_scroll = 0;
                 self.refresh_logs().await;
+                self.refresh_inputs().await;
             }
             Focus::Jobs => {
                 let visible = self.filtered_job_indices();
@@ -460,21 +674,9 @@ impl App {
                 self.selected_job_id = Some(self.jobs[visible[next]].job_id.clone());
                 self.log_scroll = 0;
                 self.refresh_logs().await;
+                self.refresh_inputs().await;
             }
         }
-    }
-
-    fn scroll_logs_up(&mut self, lines: usize, viewport_height: usize) {
-        if self.logs.is_empty() {
-            self.log_scroll = 0;
-            return;
-        }
-        let max_scroll = self.logs.len().saturating_sub(viewport_height.max(1));
-        self.log_scroll = (self.log_scroll + lines).min(max_scroll);
-    }
-
-    fn scroll_logs_down(&mut self, lines: usize) {
-        self.log_scroll = self.log_scroll.saturating_sub(lines);
     }
 
     fn log_viewport_bounds(&self, viewport_height: usize) -> (usize, usize) {
@@ -533,6 +735,50 @@ impl App {
         }
     }
 
+    async fn attach_selected_job_interactive(&mut self) {
+        let Some(job_id) = self.selected_job().map(|j| j.job_id.clone()) else {
+            return;
+        };
+
+        match self.api.attach_spec(&job_id).await {
+            Ok(spec) => {
+                if !std::path::Path::new(&spec.cwd).exists() {
+                    self.status = format!("Attach cwd missing for {job_id}: {}", spec.cwd);
+                    return;
+                }
+
+                let mut cmd = std::process::Command::new(&spec.cmd);
+                cmd.args(&spec.argv)
+                    .current_dir(&spec.cwd)
+                    .stdin(std::process::Stdio::inherit())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit());
+                match run_interactive_command(cmd) {
+                    Ok(status) if status.success() => {
+                        self.status = format!(
+                            "Detached from {job_id}; attach backend still running (use /q in OpenCode to detach)"
+                        );
+                    }
+                    Ok(status) => {
+                        self.status = format!(
+                            "Attach exited non-zero for {job_id}: {}",
+                            status.code().unwrap_or(-1)
+                        );
+                    }
+                    Err(e) => {
+                        self.status = format!("Attach failed for {job_id}: {e}");
+                    }
+                }
+                self.refresh_jobs().await;
+                self.refresh_logs().await;
+                self.refresh_inputs().await;
+            }
+            Err(e) => {
+                self.status = format!("Attach failed for {job_id}: {e}");
+            }
+        }
+    }
+
     async fn edit_selected_job_background(&mut self) {
         let Some(job_id) = self.selected_job().map(|j| j.job_id.clone()) else {
             return;
@@ -582,6 +828,66 @@ impl App {
                 self.status = format!("Editor launch failed for {job_id}: {e}");
             }
         }
+    }
+
+    async fn edit_selected_job_interactive(&mut self) {
+        let Some(job_id) = self.selected_job().map(|j| j.job_id.clone()) else {
+            return;
+        };
+
+        let job = match self.api.job(&job_id).await {
+            Ok(job) => job,
+            Err(e) => {
+                self.status = format!("Edit failed for {job_id}: {e}");
+                return;
+            }
+        };
+
+        let target = job.worktree_path.unwrap_or(job.cwd);
+        if !std::path::Path::new(&target).exists() {
+            self.status = format!("Edit path missing for {job_id}: {target}");
+            return;
+        }
+
+        let editor_cmd = std::env::var("VISUAL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                std::env::var("EDITOR")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            })
+            .unwrap_or_else(|| "code".to_string());
+        let escaped_path = shell_escape_single(&target);
+        let command_line = if editor_cmd.contains("{path}") {
+            editor_cmd.replace("{path}", &escaped_path)
+        } else {
+            format!("{editor_cmd} '{escaped_path}'")
+        };
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-lc")
+            .arg(command_line)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+        match run_interactive_command(cmd) {
+            Ok(status) if status.success() => {
+                self.status = format!("Editor exited for {job_id}");
+            }
+            Ok(status) => {
+                self.status = format!(
+                    "Editor exited non-zero for {job_id}: {}",
+                    status.code().unwrap_or(-1)
+                );
+            }
+            Err(e) => {
+                self.status = format!("Editor failed for {job_id}: {e}");
+            }
+        }
+        self.refresh_jobs().await;
+        self.refresh_logs().await;
+        self.refresh_inputs().await;
     }
 
     fn open_selected_job_pr(&mut self) {
@@ -789,6 +1095,29 @@ fn shell_escape_single(input: &str) -> String {
     input.replace('\'', "'\"'\"'")
 }
 
+fn run_interactive_command(mut cmd: std::process::Command) -> Result<std::process::ExitStatus> {
+    disable_raw_mode()?;
+    execute!(io::stdout(), LeaveAlternateScreen)?;
+    let result = cmd.status().context("failed launching interactive command");
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    enable_raw_mode()?;
+    result
+}
+
+fn start_daemon_in_background() -> Result<()> {
+    std::process::Command::new("shirei-daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("failed to spawn shirei-daemon")?;
+    Ok(())
+}
+
+fn is_daemon_unreachable(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout()
+}
+
 fn pr_web_url(repo_key: &str, pr_number: u64) -> Option<String> {
     let (kind, repo_path) = repo_key.split_once(':')?;
     if repo_path.is_empty() || !repo_path.contains('/') {
@@ -850,20 +1179,24 @@ async fn main() -> Result<()> {
         projects: Vec::new(),
         jobs: Vec::new(),
         logs: Vec::new(),
+        pending_permissions: Vec::new(),
+        pending_questions: Vec::new(),
         selected_project_id: None,
         selected_job_id: None,
         focus: Focus::Jobs,
         job_view: JobView::Actionable,
         search: String::new(),
         search_mode: false,
+        help_mode: false,
         logs_maximized: false,
         log_scroll: 0,
-        status: "v: view, /: fuzzy search, tab: focus, q: quit".to_string(),
+        status: "?: help, /: search, tab: focus, q: quit".to_string(),
     };
 
     app.refresh_projects().await;
     app.refresh_jobs().await;
     app.refresh_logs().await;
+    app.refresh_inputs().await;
     let mut last_refresh = Instant::now();
 
     loop {
@@ -895,12 +1228,22 @@ async fn main() -> Result<()> {
             };
 
             let header = Line::from(vec![
-                Span::styled(" Shirei TUI ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " Shirei TUI ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  Actionable sessions and reviews"),
             ]);
             f.render_widget(Paragraph::new(header), chunks[0]);
 
-            let search_title = if app.search_mode { "Search *" } else { "Search" };
+            let search_title = if app.search_mode {
+                "Search *"
+            } else {
+                "Search"
+            };
             let search = Paragraph::new(if app.search.is_empty() {
                 "(type / to fuzzy-find sessions/projects)".to_string()
             } else {
@@ -922,10 +1265,15 @@ async fn main() -> Result<()> {
             f.render_widget(search, chunks[1]);
 
             if !app.logs_maximized {
-                let tab_titles = ["Running", "Waiting Input", "Awaiting Review", "All Actionable"]
-                    .into_iter()
-                    .map(Line::from)
-                    .collect::<Vec<_>>();
+                let tab_titles = [
+                    "Running",
+                    "Waiting Input",
+                    "Awaiting Review",
+                    "All Actionable",
+                ]
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<_>>();
                 let tabs = Tabs::new(tab_titles)
                     .select(match app.job_view {
                         JobView::Running => 0,
@@ -967,7 +1315,10 @@ async fn main() -> Result<()> {
                                 Style::default().add_modifier(Modifier::BOLD),
                             ),
                             Span::raw("  "),
-                            Span::styled(truncate(&p.root_path, 38), Style::default().fg(Color::Gray)),
+                            Span::styled(
+                                truncate(&p.root_path, 38),
+                                Style::default().fg(Color::Gray),
+                            ),
                         ]))
                     })
                     .collect();
@@ -1069,32 +1420,69 @@ async fn main() -> Result<()> {
             f.render_widget(logs, chunks[logs_idx]);
 
             let footer = Paragraph::new(format!(
-                "{} | keys: q quit, tab focus, arrows move, pgup/pgdn logs, home/end logs, m maximize logs, v view, / search, esc clear, r refresh, n new, y approve, c request-changes, a ack, u unack, k kill, t attach(bg), e edit(bg), o open PR",
+                "{} | keys: ? help, q quit, / search, tab focus, r refresh, n new, m max logs, t attach, e edit, y approve, c changes",
                 app.status
             ))
-            .style(Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+            .style(
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
             f.render_widget(footer, chunks[footer_idx]);
+
+            if app.help_mode {
+                let area = centered_rect(78, 80, f.area());
+                f.render_widget(Clear, area);
+                let help = Paragraph::new(ratatui::text::Text::from(action_help_lines()))
+                    .wrap(Wrap { trim: false })
+                    .block(
+                        Block::default()
+                            .title("Actions (press ? or Esc to close)")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Cyan)),
+                    );
+                f.render_widget(help, area);
+            }
         })?;
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
+                if app.help_mode {
+                    match k.code {
+                        KeyCode::Esc | KeyCode::Char('?') => {
+                            app.help_mode = false;
+                            app.status = "Closed action help".to_string();
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 if app.search_mode {
                     match k.code {
                         KeyCode::Esc | KeyCode::Enter => {
                             app.search_mode = false;
                             app.ensure_selected_job_visible();
                             app.refresh_logs().await;
+                            app.refresh_inputs().await;
                         }
                         KeyCode::Backspace => {
                             app.search.pop();
                             app.ensure_selected_job_visible();
                             app.refresh_logs().await;
+                            app.refresh_inputs().await;
                         }
                         KeyCode::Char(c) => {
                             app.search.push(c);
                             app.ensure_selected_job_visible();
                             app.refresh_logs().await;
+                            app.refresh_inputs().await;
                         }
                         _ => {}
                     }
@@ -1103,6 +1491,10 @@ async fn main() -> Result<()> {
 
                 match k.code {
                     KeyCode::Char('q') => break,
+                    KeyCode::Char('?') => {
+                        app.help_mode = true;
+                        app.status = "Action help opened".to_string();
+                    }
                     KeyCode::Tab => {
                         app.focus = if app.focus == Focus::Projects {
                             Focus::Jobs
@@ -1118,12 +1510,14 @@ async fn main() -> Result<()> {
                         app.ensure_selected_job_visible();
                         app.log_scroll = 0;
                         app.refresh_logs().await;
+                        app.refresh_inputs().await;
                     }
                     KeyCode::Char('v') => {
                         app.job_view = app.job_view.next();
                         app.ensure_selected_job_visible();
                         app.log_scroll = 0;
                         app.refresh_logs().await;
+                        app.refresh_inputs().await;
                         app.status = format!("Session view: {}", app.job_view.label());
                     }
                     KeyCode::Char('m') => {
@@ -1146,6 +1540,7 @@ async fn main() -> Result<()> {
                         app.refresh_projects().await;
                         app.refresh_jobs().await;
                         app.refresh_logs().await;
+                        app.refresh_inputs().await;
                         last_refresh = Instant::now();
                     }
                     KeyCode::Char('n') => {
@@ -1164,6 +1559,7 @@ async fn main() -> Result<()> {
                             app.refresh_jobs().await;
                             app.log_scroll = 0;
                             app.refresh_logs().await;
+                            app.refresh_inputs().await;
                             last_refresh = Instant::now();
                         }
                     }
@@ -1176,6 +1572,7 @@ async fn main() -> Result<()> {
                             app.refresh_jobs().await;
                             app.log_scroll = 0;
                             app.refresh_logs().await;
+                            app.refresh_inputs().await;
                         }
                     }
                     KeyCode::Char('u') => {
@@ -1187,6 +1584,7 @@ async fn main() -> Result<()> {
                             app.refresh_jobs().await;
                             app.log_scroll = 0;
                             app.refresh_logs().await;
+                            app.refresh_inputs().await;
                         }
                     }
                     KeyCode::Char('k') => {
@@ -1198,6 +1596,7 @@ async fn main() -> Result<()> {
                             app.refresh_jobs().await;
                             app.log_scroll = 0;
                             app.refresh_logs().await;
+                            app.refresh_inputs().await;
                         }
                     }
                     KeyCode::Char('y') => {
@@ -1209,6 +1608,7 @@ async fn main() -> Result<()> {
                             app.refresh_jobs().await;
                             app.log_scroll = 0;
                             app.refresh_logs().await;
+                            app.refresh_inputs().await;
                         }
                     }
                     KeyCode::Char('c') => {
@@ -1222,15 +1622,35 @@ async fn main() -> Result<()> {
                             app.refresh_jobs().await;
                             app.log_scroll = 0;
                             app.refresh_logs().await;
+                            app.refresh_inputs().await;
                             last_refresh = Instant::now();
                         }
                     }
-                    KeyCode::Char('t') => {
-                        app.attach_selected_job_background().await;
+                    KeyCode::Char('g') => {
+                        app.allow_first_permission(false).await;
                     }
-                    KeyCode::Char('e') => {
-                        app.edit_selected_job_background().await;
+                    KeyCode::Char('G') => {
+                        app.allow_first_permission(true).await;
                     }
+                    KeyCode::Char('x') => {
+                        app.reject_first_permission().await;
+                    }
+                    KeyCode::Char('0') => {
+                        app.reject_first_question().await;
+                    }
+                    KeyCode::Char('1') => app.answer_first_question_option(0).await,
+                    KeyCode::Char('2') => app.answer_first_question_option(1).await,
+                    KeyCode::Char('3') => app.answer_first_question_option(2).await,
+                    KeyCode::Char('4') => app.answer_first_question_option(3).await,
+                    KeyCode::Char('5') => app.answer_first_question_option(4).await,
+                    KeyCode::Char('6') => app.answer_first_question_option(5).await,
+                    KeyCode::Char('7') => app.answer_first_question_option(6).await,
+                    KeyCode::Char('8') => app.answer_first_question_option(7).await,
+                    KeyCode::Char('9') => app.answer_first_question_option(8).await,
+                    KeyCode::Char('t') => app.attach_selected_job_interactive().await,
+                    KeyCode::Char('e') => app.edit_selected_job_interactive().await,
+                    KeyCode::Char('T') => app.attach_selected_job_background().await,
+                    KeyCode::Char('E') => app.edit_selected_job_background().await,
                     KeyCode::Char('o') => {
                         app.open_selected_job_pr();
                     }
@@ -1243,21 +1663,7 @@ async fn main() -> Result<()> {
                     KeyCode::Enter => {
                         app.log_scroll = 0;
                         app.refresh_logs().await;
-                    }
-                    KeyCode::PageUp => {
-                        let viewport_height = chunks_for_log_height(&terminal, app.logs_maximized)?;
-                        app.scroll_logs_up(viewport_height / 2 + 1, viewport_height);
-                    }
-                    KeyCode::PageDown => {
-                        let viewport_height = chunks_for_log_height(&terminal, app.logs_maximized)?;
-                        app.scroll_logs_down(viewport_height / 2 + 1);
-                    }
-                    KeyCode::Home => {
-                        let viewport_height = chunks_for_log_height(&terminal, app.logs_maximized)?;
-                        app.scroll_logs_up(usize::MAX / 2, viewport_height);
-                    }
-                    KeyCode::End => {
-                        app.log_scroll = 0;
+                        app.refresh_inputs().await;
                     }
                     _ => {}
                 }
@@ -1266,6 +1672,7 @@ async fn main() -> Result<()> {
             app.refresh_projects().await;
             app.refresh_jobs().await;
             app.refresh_logs().await;
+            app.refresh_inputs().await;
             last_refresh = Instant::now();
         }
     }
@@ -1274,11 +1681,83 @@ async fn main() -> Result<()> {
 }
 
 fn is_waiting_input(job: &JobRow) -> bool {
-    if job.status == "RUNNING" && job.needs_attention > 0 {
-        return true;
-    }
     let s = job.status.to_ascii_uppercase();
-    s.contains("WAIT") || s.contains("INPUT")
+    (job.status == "RUNNING" && job.needs_attention > 0)
+        || s == "WAITING_INPUT"
+        || s == "WAIT_INPUT"
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn action_help_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "Navigation",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from("tab  switch project/session focus"),
+        Line::from("up/down  move selection"),
+        Line::from("/  open fuzzy search mode"),
+        Line::from("v  cycle session view buckets"),
+        Line::from("m  toggle maximized logs"),
+        Line::from("r  refresh projects/jobs/logs"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Session Actions",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from("n  create new session on selected project"),
+        Line::from("t  attach OpenCode interactively (use /q there to detach)"),
+        Line::from("e  open editor interactively in selected session"),
+        Line::from("T  attach OpenCode in background"),
+        Line::from("E  open editor in background"),
+        Line::from("o  open linked PR/MR in browser"),
+        Line::from("k  kill selected session"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Review & Input",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from("y  approve selected session"),
+        Line::from("c  request changes and rerun"),
+        Line::from("g/G  allow first permission (once/always)"),
+        Line::from("x  reject first permission"),
+        Line::from("1-9  answer first pending question by option index"),
+        Line::from("0  reject first pending question"),
+        Line::from("a/u  ack or unack selected session"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Global",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from("? or Esc  close this help"),
+        Line::from("q  quit TUI"),
+    ]
 }
 
 fn is_awaiting_review(job: &JobRow) -> bool {
@@ -1312,38 +1791,6 @@ fn fuzzy_match(query: &str, haystack: &str) -> bool {
         }
     }
     false
-}
-
-fn chunks_for_log_height<B: ratatui::backend::Backend>(
-    terminal: &Terminal<B>,
-    logs_maximized: bool,
-) -> Result<usize> {
-    let size = terminal.size()?;
-    let area = Rect::new(0, 0, size.width, size.height);
-    let chunks = if logs_maximized {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(3),
-                Constraint::Min(5),
-                Constraint::Length(3),
-            ])
-            .split(area)
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(3),
-                Constraint::Percentage(55),
-                Constraint::Percentage(37),
-                Constraint::Length(3),
-            ])
-            .split(area)
-    };
-    let logs_idx = if logs_maximized { 2 } else { 3 };
-    Ok(chunks[logs_idx].height.saturating_sub(2) as usize)
 }
 
 fn token_candidates(state_dir: Option<&str>) -> Result<Vec<PathBuf>> {

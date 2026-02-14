@@ -48,6 +48,7 @@ exit 0
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_shirei-daemon"))
         .env("SHIREI_STATE_DIR", state_dir.to_string_lossy().to_string())
         .env("SHIREI_BIND", &bind)
+        .env("SHIREI_OPENCODE_CMD", "opencode")
         .env("SHIREI_GITHUB_TOKEN", "dummy") // not used in this smoke test
         .env(
             "PATH",

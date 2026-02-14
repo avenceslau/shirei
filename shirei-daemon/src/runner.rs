@@ -5,6 +5,7 @@ use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
+    sync::Mutex,
 };
 
 use crate::{
@@ -88,6 +89,7 @@ impl JobRunner {
             );
 
             let prompt = prompt_override.take().or_else(|| job.prompt.clone());
+            let _ = store::set_job_attention(&self.pool, job_id, false).await;
 
             let (ok, exit_code) = self
                 .spawn_once(&job, &log_path, &log_path_str, prompt.as_deref())
@@ -224,15 +226,20 @@ impl JobRunner {
         let mut stdout_lines = child.stdout.take().map(|s| BufReader::new(s).lines());
         let mut stderr_lines = child.stderr.take().map(|s| BufReader::new(s).lines());
 
+        let attention_flag = std::sync::Arc::new(Mutex::new(false));
+
         let bus1 = self.bus.clone();
         let proj1 = job.project_id.clone();
         let jid1 = job.job_id.clone();
+        let pool1 = self.pool.clone();
+        let attention1 = attention_flag.clone();
         let out_task = tokio::spawn(async move {
             if let Some(ref mut lines) = stdout_lines {
                 while let Ok(Some(line)) = lines.next_line().await {
                     let _ = log_out
                         .write_all(format!("[stdout] {line}\n").as_bytes())
                         .await;
+                    maybe_mark_waiting_input(&pool1, &jid1, &line, &attention1).await;
                     bus1.publish(ShireiEvent {
                         event_id: format!("evt_{}", uuid::Uuid::new_v4()),
                         ts: now_rfc3339(),
@@ -248,12 +255,15 @@ impl JobRunner {
         let bus2 = self.bus.clone();
         let proj2 = job.project_id.clone();
         let jid2 = job.job_id.clone();
+        let pool2 = self.pool.clone();
+        let attention2 = attention_flag.clone();
         let err_task = tokio::spawn(async move {
             if let Some(ref mut lines) = stderr_lines {
                 while let Ok(Some(line)) = lines.next_line().await {
                     let _ = log_err
                         .write_all(format!("[stderr] {line}\n").as_bytes())
                         .await;
+                    maybe_mark_waiting_input(&pool2, &jid2, &line, &attention2).await;
                     bus2.publish(ShireiEvent {
                         event_id: format!("evt_{}", uuid::Uuid::new_v4()),
                         ts: now_rfc3339(),
@@ -483,4 +493,38 @@ fn process_alive(pid: i64) -> bool {
 #[cfg(not(unix))]
 fn process_alive(_pid: i64) -> bool {
     false
+}
+
+async fn maybe_mark_waiting_input(
+    pool: &SqlitePool,
+    job_id: &str,
+    line: &str,
+    attention_flag: &std::sync::Arc<Mutex<bool>>,
+) {
+    if !looks_like_waiting_input(line) {
+        return;
+    }
+
+    let mut flag = attention_flag.lock().await;
+    if *flag {
+        return;
+    }
+    *flag = true;
+    drop(flag);
+
+    if let Err(e) = store::set_job_attention(pool, job_id, true).await {
+        tracing::warn!(job_id = %job_id, error = ?e, "failed setting waiting-input attention");
+    } else {
+        tracing::info!(job_id = %job_id, "job requires user input/permission");
+    }
+}
+
+fn looks_like_waiting_input(line: &str) -> bool {
+    let s = line.to_ascii_lowercase();
+    s.contains("permission requested")
+        || s.contains("needs approval")
+        || s.contains("awaiting input")
+        || s.contains("waiting for user")
+        || s.contains("type your own answer")
+        || s.contains("choose an option")
 }
