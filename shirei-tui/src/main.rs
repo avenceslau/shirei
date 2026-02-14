@@ -13,7 +13,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Terminal;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
@@ -64,6 +64,7 @@ struct ProjectRow {
 
 #[derive(Debug, Clone, Deserialize)]
 struct JobRow {
+    project_id: String,
     job_id: String,
     name: String,
     status: String,
@@ -88,17 +89,12 @@ struct QuestionPrompt {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Focus {
-    Projects,
-    Jobs,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JobView {
     Running,
     WaitingInput,
     AwaitingReview,
     Actionable,
+    All,
 }
 
 impl JobView {
@@ -107,7 +103,8 @@ impl JobView {
             JobView::Running => JobView::WaitingInput,
             JobView::WaitingInput => JobView::AwaitingReview,
             JobView::AwaitingReview => JobView::Actionable,
-            JobView::Actionable => JobView::Running,
+            JobView::Actionable => JobView::All,
+            JobView::All => JobView::Running,
         }
     }
 
@@ -117,6 +114,7 @@ impl JobView {
             JobView::WaitingInput => "Waiting Input",
             JobView::AwaitingReview => "Awaiting Review",
             JobView::Actionable => "All Actionable",
+            JobView::All => "All Jobs",
         }
     }
 }
@@ -407,51 +405,109 @@ struct App {
     logs: Vec<String>,
     pending_permissions: Vec<PermissionPrompt>,
     pending_questions: Vec<QuestionPrompt>,
-    selected_project_id: Option<String>,
     selected_job_id: Option<String>,
-    focus: Focus,
     job_view: JobView,
     search: String,
     search_mode: bool,
     help_mode: bool,
-    logs_maximized: bool,
+    project_picker_mode: bool,
+    project_picker_query: String,
+    project_picker_index: usize,
     log_scroll: usize,
     status: String,
 }
 
 impl App {
-    async fn refresh_projects(&mut self) {
+    async fn refresh_jobs(&mut self) {
         match self.api.projects().await {
             Ok(projects) => {
                 self.projects = projects;
-                if self
-                    .selected_project_id
-                    .as_ref()
-                    .is_some_and(|id| self.projects.iter().any(|p| &p.project_id == id))
-                {
+            }
+            Err(e) => {
+                self.status = format!("Refresh projects failed: {e}");
+                return;
+            }
+        }
+
+        let mut all_jobs = Vec::new();
+        for project in &self.projects {
+            match self.api.jobs(&project.project_id).await {
+                Ok(mut jobs) => all_jobs.append(&mut jobs),
+                Err(e) => {
+                    self.status = format!("Refresh jobs failed for {}: {e}", project.project_id);
                     return;
                 }
-                self.selected_project_id = self.projects.first().map(|p| p.project_id.clone());
-                self.status = format!("Loaded {} projects", self.projects.len());
             }
-            Err(e) => self.status = format!("Refresh projects failed: {e}"),
+        }
+        self.jobs = all_jobs;
+        self.ensure_selected_job_visible();
+        self.status = format!(
+            "Loaded {} sessions across {} projects",
+            self.jobs.len(),
+            self.projects.len()
+        );
+    }
+
+    fn filtered_project_indices(&self) -> Vec<usize> {
+        self.projects
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                fuzzy_match(&self.project_picker_query, &p.project_id)
+                    || fuzzy_match(&self.project_picker_query, &p.root_path)
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn clamp_project_picker_index(&mut self) {
+        let visible = self.filtered_project_indices();
+        if visible.is_empty() {
+            self.project_picker_index = 0;
+            return;
+        }
+        self.project_picker_index = self.project_picker_index.min(visible.len() - 1);
+    }
+
+    fn selected_project_for_spawn(&self) -> Option<&ProjectRow> {
+        let visible = self.filtered_project_indices();
+        let idx = *visible.get(self.project_picker_index)?;
+        self.projects.get(idx)
+    }
+
+    fn open_project_picker(&mut self) {
+        self.project_picker_mode = true;
+        self.project_picker_query.clear();
+        self.project_picker_index = 0;
+        self.status =
+            "Select a project for new session (type to filter, Enter to create)".to_string();
+    }
+
+    fn close_project_picker(&mut self, cancelled: bool) {
+        self.project_picker_mode = false;
+        self.project_picker_query.clear();
+        self.project_picker_index = 0;
+        if cancelled {
+            self.status = "New session cancelled".to_string();
         }
     }
 
-    async fn refresh_jobs(&mut self) {
-        let Some(project) = self.selected_project() else {
-            self.jobs.clear();
-            self.selected_job_id = None;
-            return;
-        };
-        match self.api.jobs(&project.project_id).await {
-            Ok(jobs) => {
-                self.jobs = jobs;
-                self.ensure_selected_job_visible();
-                self.status = format!("Loaded {} sessions", self.jobs.len());
-            }
-            Err(e) => self.status = format!("Refresh jobs failed: {e}"),
+    async fn spawn_job_for_project(&mut self, project_id: &str) {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let name = format!("tui-{ts}");
+        let prompt = std::env::var("SHIREI_TUI_PROMPT")
+            .unwrap_or_else(|_| "start an interactive session".to_string());
+        match self.api.spawn_job(project_id, &name, &prompt).await {
+            Ok(()) => self.status = format!("Spawned session {name}"),
+            Err(e) => self.status = format!("Spawn failed: {e}"),
         }
+        self.refresh_jobs().await;
+        self.log_scroll = 0;
+        self.refresh_logs().await;
+        self.refresh_inputs().await;
     }
 
     async fn refresh_logs(&mut self) {
@@ -561,25 +617,9 @@ impl App {
         }
     }
 
-    fn selected_project(&self) -> Option<&ProjectRow> {
-        let id = self.selected_project_id.as_ref()?;
-        self.projects.iter().find(|p| &p.project_id == id)
-    }
-
     fn selected_job(&self) -> Option<&JobRow> {
         let id = self.selected_job_id.as_ref()?;
         self.jobs.iter().find(|j| &j.job_id == id)
-    }
-
-    fn filtered_project_indices(&self) -> Vec<usize> {
-        self.projects
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| {
-                fuzzy_match(&self.search, &p.project_id) || fuzzy_match(&self.search, &p.root_path)
-            })
-            .map(|(idx, _)| idx)
-            .collect()
     }
 
     fn filtered_job_indices(&self) -> Vec<usize> {
@@ -588,7 +628,7 @@ impl App {
             .enumerate()
             .filter(|(_, j)| self.job_matches_view(j))
             .filter(|(_, j)| {
-                let haystack = format!("{} {} {}", j.job_id, j.name, j.status);
+                let haystack = format!("{} {} {} {}", j.project_id, j.job_id, j.name, j.status);
                 fuzzy_match(&self.search, &haystack)
             })
             .map(|(idx, _)| idx)
@@ -634,49 +674,25 @@ impl App {
                     || is_waiting_input(job)
                     || is_awaiting_review(job)
             }
+            JobView::All => true,
         }
     }
 
     async fn move_selection(&mut self, delta: i32) {
-        match self.focus {
-            Focus::Projects => {
-                let visible = self.filtered_project_indices();
-                if visible.is_empty() {
-                    return;
-                }
-                let current = self
-                    .selected_project_id
-                    .as_ref()
-                    .and_then(|id| {
-                        visible
-                            .iter()
-                            .position(|idx| self.projects[*idx].project_id == *id)
-                    })
-                    .unwrap_or(0) as i32;
-                let next = (current + delta).clamp(0, visible.len() as i32 - 1) as usize;
-                self.selected_project_id = Some(self.projects[visible[next]].project_id.clone());
-                self.refresh_jobs().await;
-                self.log_scroll = 0;
-                self.refresh_logs().await;
-                self.refresh_inputs().await;
-            }
-            Focus::Jobs => {
-                let visible = self.filtered_job_indices();
-                if visible.is_empty() {
-                    return;
-                }
-                let current = self
-                    .selected_job_id
-                    .as_ref()
-                    .and_then(|id| visible.iter().position(|idx| self.jobs[*idx].job_id == *id))
-                    .unwrap_or(0) as i32;
-                let next = (current + delta).clamp(0, visible.len() as i32 - 1) as usize;
-                self.selected_job_id = Some(self.jobs[visible[next]].job_id.clone());
-                self.log_scroll = 0;
-                self.refresh_logs().await;
-                self.refresh_inputs().await;
-            }
+        let visible = self.filtered_job_indices();
+        if visible.is_empty() {
+            return;
         }
+        let current = self
+            .selected_job_id
+            .as_ref()
+            .and_then(|id| visible.iter().position(|idx| self.jobs[*idx].job_id == *id))
+            .unwrap_or(0) as i32;
+        let next = (current + delta).clamp(0, visible.len() as i32 - 1) as usize;
+        self.selected_job_id = Some(self.jobs[visible[next]].job_id.clone());
+        self.log_scroll = 0;
+        self.refresh_logs().await;
+        self.refresh_inputs().await;
     }
 
     fn log_viewport_bounds(&self, viewport_height: usize) -> (usize, usize) {
@@ -1181,51 +1197,36 @@ async fn main() -> Result<()> {
         logs: Vec::new(),
         pending_permissions: Vec::new(),
         pending_questions: Vec::new(),
-        selected_project_id: None,
         selected_job_id: None,
-        focus: Focus::Jobs,
         job_view: JobView::Actionable,
         search: String::new(),
         search_mode: false,
         help_mode: false,
-        logs_maximized: false,
+        project_picker_mode: false,
+        project_picker_query: String::new(),
+        project_picker_index: 0,
         log_scroll: 0,
-        status: "?: help, /: search, tab: focus, q: quit".to_string(),
+        status: "?: help, /: search, v: filter, q: quit".to_string(),
     };
 
-    app.refresh_projects().await;
     app.refresh_jobs().await;
     app.refresh_logs().await;
     app.refresh_inputs().await;
     let mut last_refresh = Instant::now();
 
     loop {
-        let project_visible = app.filtered_project_indices();
         let job_visible = app.filtered_job_indices();
 
         terminal.draw(|f| {
-            let chunks = if app.logs_maximized {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(1),
-                        Constraint::Length(3),
-                        Constraint::Min(5),
-                        Constraint::Length(3),
-                    ])
-                    .split(f.area())
-            } else {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(1),
-                        Constraint::Length(3),
-                        Constraint::Percentage(55),
-                        Constraint::Percentage(37),
-                        Constraint::Length(3),
-                    ])
-                    .split(f.area())
-            };
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(3),
+                    Constraint::Min(5),
+                    Constraint::Length(3),
+                ])
+                .split(f.area());
 
             let header = Line::from(vec![
                 Span::styled(
@@ -1235,7 +1236,7 @@ async fn main() -> Result<()> {
                         .bg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw("  Actionable sessions and reviews"),
+                Span::raw("  Session sidebar and live logs"),
             ]);
             f.render_widget(Paragraph::new(header), chunks[0]);
 
@@ -1245,7 +1246,7 @@ async fn main() -> Result<()> {
                 "Search"
             };
             let search = Paragraph::new(if app.search.is_empty() {
-                "(type / to fuzzy-find sessions/projects)".to_string()
+                "(type / to fuzzy-find sessions)".to_string()
             } else {
                 app.search.clone()
             })
@@ -1264,146 +1265,55 @@ async fn main() -> Result<()> {
             );
             f.render_widget(search, chunks[1]);
 
-            if !app.logs_maximized {
-                let tab_titles = [
-                    "Running",
-                    "Waiting Input",
-                    "Awaiting Review",
-                    "All Actionable",
-                ]
-                .into_iter()
-                .map(Line::from)
-                .collect::<Vec<_>>();
-                let tabs = Tabs::new(tab_titles)
-                    .select(match app.job_view {
-                        JobView::Running => 0,
-                        JobView::WaitingInput => 1,
-                        JobView::AwaitingReview => 2,
-                        JobView::Actionable => 3,
-                    })
-                    .style(Style::default().fg(Color::Gray))
-                    .highlight_style(
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    );
-                let top_sections = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(1), Constraint::Min(0)])
-                    .split(chunks[2]);
-                f.render_widget(tabs, top_sections[0]);
+            let body = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(46), Constraint::Min(24)])
+                .split(chunks[2]);
 
-                let top = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-                    .split(top_sections[1]);
+            let job_items: Vec<ListItem> = job_visible
+                .iter()
+                .map(|idx| {
+                    let j = &app.jobs[*idx];
+                    let marker = if Some(&j.job_id) == app.selected_job_id.as_ref() {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    let indicator = Span::styled("● ", Style::default().fg(status_color(j)));
+                    let tag = if is_waiting_input(j) {
+                        "WAIT"
+                    } else if is_awaiting_review(j) {
+                        "REVIEW"
+                    } else if j.status == "RUNNING" {
+                        "RUN"
+                    } else {
+                        "DONE"
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("{} ", marker), Style::default().fg(Color::Cyan)),
+                        indicator,
+                        Span::styled(format!("{tag:<6}"), Style::default().fg(status_color(j))),
+                        Span::raw(" "),
+                        Span::styled(truncate(&j.name, 18), Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(" "),
+                        Span::styled(truncate(&j.job_id, 10), Style::default().fg(Color::Gray)),
+                    ]))
+                })
+                .collect();
+            f.render_widget(
+                List::new(job_items).block(
+                    Block::default()
+                        .title("Sessions")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan)),
+                ),
+                body[0],
+            );
 
-                let project_items: Vec<ListItem> = project_visible
-                    .iter()
-                    .map(|idx| {
-                        let p = &app.projects[*idx];
-                        let marker = if Some(&p.project_id) == app.selected_project_id.as_ref() {
-                            ">"
-                        } else {
-                            " "
-                        };
-                        ListItem::new(Line::from(vec![
-                            Span::styled(format!("{} ", marker), Style::default().fg(Color::Cyan)),
-                            Span::styled(
-                                truncate(&p.project_id, 20),
-                                Style::default().add_modifier(Modifier::BOLD),
-                            ),
-                            Span::raw("  "),
-                            Span::styled(
-                                truncate(&p.root_path, 38),
-                                Style::default().fg(Color::Gray),
-                            ),
-                        ]))
-                    })
-                    .collect();
-                let project_title = if app.focus == Focus::Projects {
-                    "Projects *"
-                } else {
-                    "Projects"
-                };
-                f.render_widget(
-                    List::new(project_items).block(
-                        Block::default()
-                            .title(project_title)
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(if app.focus == Focus::Projects {
-                                Color::Cyan
-                            } else {
-                                Color::DarkGray
-                            })),
-                    ),
-                    top[0],
-                );
-
-                let job_items: Vec<ListItem> = job_visible
-                    .iter()
-                    .map(|idx| {
-                        let j = &app.jobs[*idx];
-                        let marker = if Some(&j.job_id) == app.selected_job_id.as_ref() {
-                            ">"
-                        } else {
-                            " "
-                        };
-                        let tag = if is_waiting_input(j) {
-                            "WAIT_INPUT"
-                        } else if is_awaiting_review(j) {
-                            "AWAIT_REVIEW"
-                        } else {
-                            "RUNNING"
-                        };
-                        ListItem::new(Line::from(vec![
-                            Span::styled(format!("{} ", marker), Style::default().fg(Color::Cyan)),
-                            Span::styled(
-                                format!("[{tag}] "),
-                                Style::default()
-                                    .fg(status_color(j))
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                truncate(&j.name, 30),
-                                Style::default().add_modifier(Modifier::BOLD),
-                            ),
-                            Span::raw("  "),
-                            Span::styled(truncate(&j.job_id, 20), Style::default().fg(Color::Gray)),
-                        ]))
-                    })
-                    .collect();
-                let jobs_title = if app.focus == Focus::Jobs {
-                    "Sessions *"
-                } else {
-                    "Sessions"
-                };
-                f.render_widget(
-                    List::new(job_items).block(
-                        Block::default()
-                            .title(jobs_title)
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(if app.focus == Focus::Jobs {
-                                Color::Cyan
-                            } else {
-                                Color::DarkGray
-                            })),
-                    ),
-                    top[1],
-                );
-            }
-
-            let logs_idx = if app.logs_maximized { 2 } else { 3 };
-            let footer_idx = if app.logs_maximized { 3 } else { 4 };
-            let log_viewport_height = chunks[logs_idx].height.saturating_sub(2) as usize;
+            let log_viewport_height = body[1].height.saturating_sub(2) as usize;
             let log_lines = app.log_viewport_lines(log_viewport_height);
             let logs_title = if app.log_scroll == 0 {
-                if app.logs_maximized {
-                    "Logs (live tail, maximized)".to_string()
-                } else {
-                    "Logs (live tail)".to_string()
-                }
+                "Logs (live tail)".to_string()
             } else {
                 format!("Logs (scrolled {} lines)", app.log_scroll)
             };
@@ -1417,10 +1327,10 @@ async fn main() -> Result<()> {
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(Color::Blue)),
                 );
-            f.render_widget(logs, chunks[logs_idx]);
+            f.render_widget(logs, body[1]);
 
             let footer = Paragraph::new(format!(
-                "{} | keys: ? help, q quit, / search, tab focus, r refresh, n new, m max logs, t attach, e edit, y approve, c changes",
+                "{} | keys: ? help, q quit, / search, v filter, r refresh, n new, t attach, e edit, y approve, c changes",
                 app.status
             ))
             .style(
@@ -1434,7 +1344,71 @@ async fn main() -> Result<()> {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray)),
             );
-            f.render_widget(footer, chunks[footer_idx]);
+            f.render_widget(footer, chunks[3]);
+
+            if app.project_picker_mode {
+                let area = centered_rect(72, 74, f.area());
+                f.render_widget(Clear, area);
+                let sections = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(5), Constraint::Length(1)])
+                    .split(area);
+
+                let picker_search = Paragraph::new(if app.project_picker_query.is_empty() {
+                    "(type to fuzzy-find projects)".to_string()
+                } else {
+                    app.project_picker_query.clone()
+                })
+                .block(
+                    Block::default()
+                        .title("Create Session: Project Filter")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan)),
+                );
+                f.render_widget(picker_search, sections[0]);
+
+                let visible = app.filtered_project_indices();
+                let picker_items = if visible.is_empty() {
+                    vec![ListItem::new(Line::from(Span::styled(
+                        "No matching projects",
+                        Style::default().fg(Color::DarkGray),
+                    )))]
+                } else {
+                    visible
+                        .iter()
+                        .enumerate()
+                        .map(|(row, idx)| {
+                            let p = &app.projects[*idx];
+                            let marker = if row == app.project_picker_index { ">" } else { " " };
+                            ListItem::new(Line::from(vec![
+                                Span::styled(format!("{} ", marker), Style::default().fg(Color::Cyan)),
+                                Span::styled(
+                                    truncate(&p.project_id, 30),
+                                    Style::default().add_modifier(Modifier::BOLD),
+                                ),
+                                Span::raw("  "),
+                                Span::styled(truncate(&p.root_path, 45), Style::default().fg(Color::Gray)),
+                            ]))
+                        })
+                        .collect()
+                };
+
+                f.render_widget(
+                    List::new(picker_items).block(
+                        Block::default()
+                            .title("Projects")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Cyan)),
+                    ),
+                    sections[1],
+                );
+
+                f.render_widget(
+                    Paragraph::new("Enter create session | Esc cancel | Up/Down select")
+                        .style(Style::default().fg(Color::Gray)),
+                    sections[2],
+                );
+            }
 
             if app.help_mode {
                 let area = centered_rect(78, 80, f.area());
@@ -1453,6 +1427,42 @@ async fn main() -> Result<()> {
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
+                if app.project_picker_mode {
+                    match k.code {
+                        KeyCode::Esc => app.close_project_picker(true),
+                        KeyCode::Up => {
+                            app.project_picker_index = app.project_picker_index.saturating_sub(1);
+                        }
+                        KeyCode::Down => {
+                            app.project_picker_index = app.project_picker_index.saturating_add(1);
+                            app.clamp_project_picker_index();
+                        }
+                        KeyCode::Backspace => {
+                            app.project_picker_query.pop();
+                            app.clamp_project_picker_index();
+                        }
+                        KeyCode::Char(c) => {
+                            app.project_picker_query.push(c);
+                            app.project_picker_index = 0;
+                            app.clamp_project_picker_index();
+                        }
+                        KeyCode::Enter => {
+                            let project_id = app
+                                .selected_project_for_spawn()
+                                .map(|p| p.project_id.clone());
+                            if let Some(project_id) = project_id {
+                                app.close_project_picker(false);
+                                app.spawn_job_for_project(&project_id).await;
+                                last_refresh = Instant::now();
+                            } else {
+                                app.status = "No matching project selected".to_string();
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 if app.help_mode {
                     match k.code {
                         KeyCode::Esc | KeyCode::Char('?') => {
@@ -1495,13 +1505,6 @@ async fn main() -> Result<()> {
                         app.help_mode = true;
                         app.status = "Action help opened".to_string();
                     }
-                    KeyCode::Tab => {
-                        app.focus = if app.focus == Focus::Projects {
-                            Focus::Jobs
-                        } else {
-                            Focus::Projects
-                        };
-                    }
                     KeyCode::Char('/') => {
                         app.search_mode = true;
                     }
@@ -1520,47 +1523,25 @@ async fn main() -> Result<()> {
                         app.refresh_inputs().await;
                         app.status = format!("Session view: {}", app.job_view.label());
                     }
-                    KeyCode::Char('m') => {
-                        app.logs_maximized = !app.logs_maximized;
-                        app.status = if app.logs_maximized {
-                            "Logs maximized".to_string()
-                        } else {
-                            "Logs returned to split layout".to_string()
-                        };
-                    }
                     KeyCode::Char('d') => {
                         match app.api.discover_project(&app.discover_path).await {
                             Ok(()) => app.status = format!("Discovered {}", app.discover_path),
                             Err(e) => app.status = format!("Discover failed: {e}"),
                         }
-                        app.refresh_projects().await;
                         app.refresh_jobs().await;
                     }
                     KeyCode::Char('r') => {
-                        app.refresh_projects().await;
                         app.refresh_jobs().await;
                         app.refresh_logs().await;
                         app.refresh_inputs().await;
                         last_refresh = Instant::now();
                     }
                     KeyCode::Char('n') => {
-                        if let Some(project) = app.selected_project() {
-                            let ts = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            let name = format!("tui-{ts}");
-                            let prompt = std::env::var("SHIREI_TUI_PROMPT")
-                                .unwrap_or_else(|_| "start an interactive session".to_string());
-                            match app.api.spawn_job(&project.project_id, &name, &prompt).await {
-                                Ok(()) => app.status = format!("Spawned session {name}"),
-                                Err(e) => app.status = format!("Spawn failed: {e}"),
-                            }
-                            app.refresh_jobs().await;
-                            app.log_scroll = 0;
-                            app.refresh_logs().await;
-                            app.refresh_inputs().await;
-                            last_refresh = Instant::now();
+                        if app.projects.is_empty() {
+                            app.status =
+                                "No projects available; press d to discover one".to_string();
+                        } else {
+                            app.open_project_picker();
                         }
                     }
                     KeyCode::Char('a') => {
@@ -1669,7 +1650,6 @@ async fn main() -> Result<()> {
                 }
             }
         } else if last_refresh.elapsed() >= refresh_interval {
-            app.refresh_projects().await;
             app.refresh_jobs().await;
             app.refresh_logs().await;
             app.refresh_inputs().await;
@@ -1714,12 +1694,10 @@ fn action_help_lines() -> Vec<Line<'static>> {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from("tab  switch project/session focus"),
         Line::from("up/down  move selection"),
         Line::from("/  open fuzzy search mode"),
-        Line::from("v  cycle session view buckets"),
-        Line::from("m  toggle maximized logs"),
-        Line::from("r  refresh projects/jobs/logs"),
+        Line::from("v  cycle session state filter"),
+        Line::from("r  refresh sessions/logs"),
         Line::from(""),
         Line::from(Span::styled(
             "Session Actions",
@@ -1727,7 +1705,7 @@ fn action_help_lines() -> Vec<Line<'static>> {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from("n  create new session on selected project"),
+        Line::from("n  create new session (fuzzy-pick project)"),
         Line::from("t  attach OpenCode interactively (use /q there to detach)"),
         Line::from("e  open editor interactively in selected session"),
         Line::from("T  attach OpenCode in background"),
@@ -1851,6 +1829,7 @@ mod tests {
     #[test]
     fn job_bucket_helpers() {
         let running = JobRow {
+            project_id: "p".to_string(),
             job_id: "a".to_string(),
             name: "n".to_string(),
             status: "RUNNING".to_string(),
@@ -1859,6 +1838,7 @@ mod tests {
             origin_pr_number: None,
         };
         let waiting = JobRow {
+            project_id: "p".to_string(),
             job_id: "b".to_string(),
             name: "n".to_string(),
             status: "RUNNING".to_string(),
@@ -1867,6 +1847,7 @@ mod tests {
             origin_pr_number: None,
         };
         let review = JobRow {
+            project_id: "p".to_string(),
             job_id: "c".to_string(),
             name: "n".to_string(),
             status: "DONE_UNREAD".to_string(),

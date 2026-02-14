@@ -92,7 +92,7 @@ Run the terminal UI against a running daemon:
 cargo run -p shirei-tui -- --token "$TOKEN" --discover-path .
 ```
 
-Useful keys: `?` show actions help, `d` discover project, `n` create job, `y` approve, `c` request changes (rerun), `g` grant permission once, `G` grant permission always, `x` reject permission, `1-9` answer first pending question option, `0` reject question, `a` ack, `u` unack, `k` kill, `r` refresh, `m` maximize logs, `t` attach interactive, `e` edit interactive, `T` attach background, `E` edit background, `o` open linked PR in browser. Logs are colorized by source (`agent`, `output`, `stderr`).
+Useful keys: `?` show actions help, `d` discover project, `n` create job (opens fuzzy project picker), `v` cycle job-state filter, `y` approve, `c` request changes (rerun), `g` grant permission once, `G` grant permission always, `x` reject permission, `1-9` answer first pending question option, `0` reject question, `a` ack, `u` unack, `k` kill, `r` refresh, `t` attach interactive, `e` edit interactive, `T` attach background, `E` edit background, `o` open linked PR in browser. The left sidebar shows all sessions with a state indicator; the right pane shows logs for the selected session.
 
 `t` and `e` run attach/edit interactively in the current terminal and return to TUI on exit. `t` now attaches to a persistent per-job OpenCode backend, so exiting OpenCode (`/q`) detaches while keeping the backend running for later reattach. Use `T` / `E` for background launch.
 
