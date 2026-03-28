@@ -11,7 +11,7 @@ use tokio::{
 use crate::{
     config::ShireiConfig,
     events::{EventBus, ShireiEvent},
-    git_ops, store,
+    git_ops, notifications, store,
     util::now_rfc3339,
     vcs::{
         factory::ProviderFactory, parse_repo_key, repo_key_from_remote, CreatePrRequest,
@@ -99,6 +99,11 @@ impl JobRunner {
             if ok {
                 self.ensure_pr_and_watch(&job).await;
                 store::update_job_end(&self.pool, job_id, "AWAITING_REVIEW", exit_code).await?;
+                notifications::send(
+                    "Shirei session ready for review",
+                    &format!("{} finished and is waiting for your review", job.name),
+                )
+                .await;
                 tracing::info!(
                     job_id = %job.job_id,
                     status = "AWAITING_REVIEW",
@@ -126,6 +131,11 @@ impl JobRunner {
 
             if continue_attempts >= max_continue_retries {
                 store::update_job_end(&self.pool, job_id, "ERROR", exit_code).await?;
+                notifications::send(
+                    "Shirei session failed",
+                    &format!("{} stopped after repeated exits", job.name),
+                )
+                .await;
                 tracing::warn!(
                     job_id = %job.job_id,
                     exit_code = ?exit_code,
@@ -189,6 +199,9 @@ impl JobRunner {
             cmd.arg("run").arg(p);
         }
         cmd.arg("--agent").arg(SHIREI_AGENT);
+        if let Some(sid) = &job.session_id {
+            cmd.arg("--session").arg(sid);
+        }
         cmd.current_dir(&job.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -524,6 +537,15 @@ async fn maybe_mark_waiting_input(
     if let Err(e) = store::set_job_attention(pool, job_id, true).await {
         tracing::warn!(job_id = %job_id, error = ?e, "failed setting waiting-input attention");
     } else {
+        let name = match store::get_job(pool, job_id).await {
+            Ok(job) => job.name,
+            Err(_) => job_id.to_string(),
+        };
+        notifications::send(
+            "Shirei session needs input",
+            &format!("{} is waiting for your input or approval", name),
+        )
+        .await;
         tracing::info!(job_id = %job_id, "job requires user input/permission");
     }
 }

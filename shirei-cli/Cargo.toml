@@ -10,6 +10,7 @@ keywords = ["cli", "automation", "agent"]
 categories = ["command-line-utilities", "development-tools"]
 include = [
   "src/**",
+  "../shirei-daemon/src/**",
   "../README.md",
 ]
 
@@ -19,11 +20,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "shirei-daemon"
-path = "src/bin/shirei-daemon/main.rs"
-
-[[bin]]
-name = "shirei-tui"
-path = "src/bin/shirei-tui/main.rs"
+path = "../shirei-daemon/src/main.rs"
 
 [features]
 default = ["bundle-bins"]
@@ -58,9 +55,6 @@ gitlab = "0.1808.0"
 hex = "0.4"
 url = "2"
 opencode-sdk = "0.1.6"
-
-crossterm = "0.28"
-ratatui = "0.28"
 
 [dev-dependencies]
 tempfile = "3"

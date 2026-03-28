@@ -9,8 +9,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use opencode_sdk::types::message::PromptRequest;
 use opencode_sdk::types::permission::{PermissionReply, PermissionReplyRequest};
 use opencode_sdk::types::question::QuestionReplyRequest;
+use opencode_sdk::types::session::Session;
 use opencode_sdk::{Client as OpencodeClient, ClientBuilder as OpencodeClientBuilder};
 use sqlx::Row;
 use sqlx::SqlitePool;
@@ -36,10 +38,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v0.1/health", get(health))
         .route("/api/v0.1/info", get(info))
         .route("/api/v0.1/projects", get(list_projects))
+        .route("/api/v0.1/sessions", get(list_active_sessions))
         .route("/api/v0.1/projects/discover", post(discover_project))
         .route(
             "/api/v0.1/projects/:project_id/jobs",
             get(list_jobs).post(create_job),
+        )
+        .route(
+            "/api/v0.1/projects/:project_id/branches",
+            get(list_project_branches).post(create_branch_session),
         )
         .route("/api/v0.1/jobs/:job_id", get(get_job))
         .route("/api/v0.1/jobs/:job_id/attach", post(job_attach))
@@ -54,6 +61,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v0.1/jobs/:job_id/unack", post(unack_job))
         .route("/api/v0.1/jobs/:job_id/approve", post(approve_job))
         .route("/api/v0.1/jobs/:job_id/inputs", get(job_inputs))
+        .route("/api/v0.1/jobs/:job_id/prompt", post(job_prompt))
         .route(
             "/api/v0.1/jobs/:job_id/permissions/:request_id/reply",
             post(job_permission_reply),
@@ -99,6 +107,19 @@ async fn info(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRes
     }
     let opencode_program = state.config.commands.opencode.program.clone();
     let opencode_args = state.config.commands.opencode.args.clone();
+    let bootstrap_program = state
+        .config
+        .commands
+        .bootstrap
+        .as_ref()
+        .map(|command| command.program.clone());
+    let bootstrap_args = state
+        .config
+        .commands
+        .bootstrap
+        .as_ref()
+        .map(|command| command.args.clone())
+        .unwrap_or_default();
     Json(serde_json::json!({
         "state_dir": state.state_dir.display().to_string(),
         "db": state.state_dir.join("shirei.db").display().to_string(),
@@ -110,6 +131,9 @@ async fn info(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRes
         "commands": {
             "opencode_program": opencode_program,
             "opencode_args": opencode_args,
+            "bootstrap_configured": bootstrap_program.is_some(),
+            "bootstrap_program": bootstrap_program,
+            "bootstrap_args": bootstrap_args,
         }
     }))
     .into_response()
@@ -165,6 +189,49 @@ async fn list_projects(State(state): State<AppState>, headers: HeaderMap) -> imp
     match store::list_projects(&state.pool).await {
         Ok(ps) => Json(serde_json::json!({"projects": ps})).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL").into_response(),
+    }
+}
+
+async fn list_active_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(code) = require_auth(&headers, &state.auth_token) {
+        return code.into_response();
+    }
+    match store::list_active_sessions(&state.pool).await {
+        Ok(sessions) => Json(serde_json::json!({"sessions": sessions})).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL").into_response(),
+    }
+}
+
+async fn list_project_branches(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(code) = require_auth(&headers, &state.auth_token) {
+        return code.into_response();
+    }
+
+    let proj = match store::get_project(&state.pool, &project_id).await {
+        Ok(project) => project,
+        Err(_) => return (StatusCode::NOT_FOUND, "PROJECT_NOT_FOUND").into_response(),
+    };
+
+    let repo = match git_ops::open_repo(std::path::Path::new(&proj.root_path)) {
+        Ok(repo) => repo,
+        Err(_) => return (StatusCode::BAD_REQUEST, "PROJECT_NOT_GIT_REPO").into_response(),
+    };
+
+    let _ = git_ops::fetch_origin(&repo);
+
+    match git_ops::list_branches(&repo) {
+        Ok(branches) => Json(serde_json::json!({"branches": branches})).into_response(),
+        Err(err) => {
+            tracing::error!(project_id = %project_id, error = ?err, "failed listing project branches");
+            (StatusCode::INTERNAL_SERVER_ERROR, "BRANCH_LIST_FAILED").into_response()
+        }
     }
 }
 
@@ -320,6 +387,17 @@ async fn ensure_job_attach_runtime(
         .context("read attach port")?;
     drop(listener);
 
+    let attach_log = state
+        .state_dir
+        .join("logs")
+        .join(format!("{}-attach.log", job.job_id));
+    if let Some(parent) = attach_log.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create attach log dir {}", parent.display()))?;
+    }
+    let log_file = std::fs::File::create(&attach_log)
+        .with_context(|| format!("create attach log {}", attach_log.display()))?;
+
     let mut cmd = std::process::Command::new(&state.config.commands.opencode.program);
     cmd.args(&state.config.commands.opencode.args)
         .arg("serve")
@@ -327,10 +405,11 @@ async fn ensure_job_attach_runtime(
         .arg(host)
         .arg("--port")
         .arg(port.to_string())
+        .arg("--print-logs")
         .current_dir(&job.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::from(log_file));
 
     let child = cmd.spawn().context("spawn opencode serve for attach")?;
     let pid = child.id() as i64;
@@ -407,9 +486,39 @@ fn stop_pid(_pid: i64) -> bool {
     false
 }
 
+/// Pre-create an OpenCode session for a job via the attach runtime.
+///
+/// Starts `opencode serve` for the job's worktree (if not already running),
+/// then creates a session scoped to that directory so the runner can target it
+/// with `--session`.
+async fn create_job_session(
+    state: &AppState,
+    job: &store::JobRow,
+    name: &str,
+) -> anyhow::Result<String> {
+    let base_url = ensure_job_attach_runtime(state, job).await?;
+    let client = opencode_client_for_dir(&base_url, &job.cwd).map_err(|e| anyhow::anyhow!(e))?;
+    let title = format!("Shirei: {}", name);
+    let session = client
+        .sessions()
+        .create_with(
+            opencode_sdk::types::session::SessionCreateOptions::new()
+                .with_title(&title)
+                .with_directory(&job.cwd),
+        )
+        .await?;
+    Ok(session.id)
+}
+
 #[derive(serde::Deserialize)]
 struct CreateJobReq {
     name: String,
+    prompt: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CreateBranchReq {
+    branch_name: String,
     prompt: Option<String>,
 }
 
@@ -490,11 +599,30 @@ async fn create_job(
         let _ = store::set_job_prompt(&state.pool, &job.job_id, p).await;
     }
 
+    // Create an OpenCode session for this job before spawning the runner.
+    // This gives us a stable session_id that the runner can target with --session.
+    let session_id = if std::env::var("SHIREI_OPENCODE_CMD").is_ok() {
+        None
+    } else {
+        match create_job_session(&state, &job, &req.name).await {
+            Ok(sid) => {
+                let _ = store::set_job_session_id(&state.pool, &job.job_id, &sid).await;
+                tracing::info!(job_id = %job.job_id, session_id = %sid, "opencode session created for job");
+                Some(sid)
+            }
+            Err(e) => {
+                tracing::warn!(job_id = %job.job_id, error = ?e, "failed to pre-create opencode session; runner will create its own");
+                None
+            }
+        }
+    };
+
     tracing::info!(
         project_id = %project_id,
         job_id = %job.job_id,
         cwd = %job.cwd,
         worktree = %worktree_path.display(),
+        session_id = ?session_id,
         "job created; scheduling runner"
     );
 
@@ -512,6 +640,163 @@ async fn create_job(
         }
     });
 
+    // Re-fetch the job so the response includes session_id
+    let job = store::get_job(&state.pool, &job.job_id)
+        .await
+        .unwrap_or(job);
+    Json(serde_json::json!({"job": job})).into_response()
+}
+
+async fn create_branch_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(req): Json<CreateBranchReq>,
+) -> impl IntoResponse {
+    if let Err(code) = require_auth(&headers, &state.auth_token) {
+        return code.into_response();
+    }
+
+    let branch_name = req.branch_name.trim();
+    if branch_name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "BRANCH_NAME_REQUIRED").into_response();
+    }
+
+    let proj = match store::get_project(&state.pool, &project_id).await {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, "PROJECT_NOT_FOUND").into_response(),
+    };
+
+    let repo = match git_ops::open_repo(std::path::Path::new(&proj.root_path)) {
+        Ok(r) => r,
+        Err(_) => return (StatusCode::BAD_REQUEST, "PROJECT_NOT_GIT_REPO").into_response(),
+    };
+    let _ = git_ops::fetch_origin(&repo);
+
+    let resolved_branch = match git_ops::resolve_branch(&repo, branch_name) {
+        Ok(resolution) => resolution,
+        Err(err) => {
+            tracing::error!(project_id = %project_id, branch_name, error = ?err, "branch resolution failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "BRANCH_RESOLVE_FAILED").into_response();
+        }
+    };
+
+    let (target_branch, base_ref) = match resolved_branch {
+        git_ops::BranchResolution::Local { branch, base_ref } => (branch, base_ref),
+        git_ops::BranchResolution::Remote {
+            branch,
+            base_ref,
+            remote_name,
+        } => {
+            tracing::info!(project_id = %project_id, branch_name = %branch_name, remote_name, "attaching existing remote branch");
+            (branch, base_ref)
+        }
+        git_ops::BranchResolution::Missing => {
+            let Some(base_ref) = resolve_manual_base_ref(&repo, &proj.default_branch) else {
+                return (StatusCode::BAD_REQUEST, "PROJECT_BASE_REF_NOT_FOUND").into_response();
+            };
+            (branch_name.to_string(), base_ref)
+        }
+        git_ops::BranchResolution::AmbiguousRemote { branch, candidates } => {
+            tracing::warn!(project_id = %project_id, branch_name = %branch, candidates = ?candidates, "branch selection is ambiguous across remotes");
+            return (StatusCode::CONFLICT, "BRANCH_REMOTE_AMBIGUOUS").into_response();
+        }
+    };
+
+    let worktree_root = worktrees::root(&state.state_dir, &project_id);
+    let _ = tokio::fs::create_dir_all(&worktree_root).await;
+
+    let worktree_name = format!("branch-{}", sanitize_name(&target_branch));
+    let worktree_path = match worktrees::alloc(&worktree_root, &worktree_name) {
+        Ok(path) => path,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "WORKTREE_ALLOC_FAILED").into_response()
+        }
+    };
+
+    if worktree_path.exists() {
+        match store::latest_job_by_worktree_name(&state.pool, &project_id, &worktree_name).await {
+            Ok(Some(job)) => {
+                if let Some(prompt) = req.prompt.as_deref() {
+                    let _ = store::append_job_prompt(&state.pool, &job.job_id, prompt).await;
+                }
+                return Json(serde_json::json!({"job": job, "reused": true})).into_response();
+            }
+            Ok(None) => {
+                return (StatusCode::CONFLICT, "WORKTREE_ALREADY_EXISTS").into_response();
+            }
+            Err(err) => {
+                tracing::error!(project_id = %project_id, worktree_name, error = ?err, "failed loading existing branch job");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "JOB_LOOKUP_FAILED").into_response();
+            }
+        }
+    }
+
+    if git_ops::create_worktree(
+        &repo,
+        &worktree_name,
+        &worktree_path,
+        &base_ref,
+        Some(&target_branch),
+    )
+    .is_err()
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "WORKTREE_CREATE_FAILED").into_response();
+    }
+
+    let job = match store::create_job(
+        &state.pool,
+        &project_id,
+        &target_branch,
+        "interactive",
+        "opencode",
+        "[]",
+        &worktree_path.display().to_string(),
+        Some(&worktree_name),
+        Some(&worktree_path.display().to_string()),
+    )
+    .await
+    {
+        Ok(job) => job,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "JOB_CREATE_FAILED").into_response(),
+    };
+
+    if let Some(prompt) = req.prompt.as_deref() {
+        let _ = store::set_job_prompt(&state.pool, &job.job_id, prompt).await;
+    }
+
+    if let Err(err) = bootstrap_branch_worktree(&state, &job).await {
+        tracing::error!(job_id = %job.job_id, branch_name = %target_branch, error = ?err, "branch bootstrap failed");
+        return (StatusCode::BAD_GATEWAY, "BRANCH_BOOTSTRAP_FAILED").into_response();
+    }
+
+    let session_id = if std::env::var("SHIREI_OPENCODE_CMD").is_ok() {
+        None
+    } else {
+        match create_job_session(&state, &job, &target_branch).await {
+            Ok(session_id) => {
+                let _ = store::set_job_session_id(&state.pool, &job.job_id, &session_id).await;
+                Some(session_id)
+            }
+            Err(e) => {
+                tracing::warn!(job_id = %job.job_id, error = ?e, "failed creating branch session");
+                None
+            }
+        }
+    };
+
+    tracing::info!(
+        project_id = %project_id,
+        job_id = %job.job_id,
+        branch_name = %target_branch,
+        session_id = ?session_id,
+        cwd = %job.cwd,
+        "interactive branch session created"
+    );
+
+    let job = store::get_job(&state.pool, &job.job_id)
+        .await
+        .unwrap_or(job);
     Json(serde_json::json!({"job": job})).into_response()
 }
 
@@ -551,6 +836,64 @@ fn resolve_manual_base_ref(repo: &git2::Repository, default_branch: &str) -> Opt
         return Some("HEAD".to_string());
     }
     None
+}
+
+async fn bootstrap_branch_worktree(state: &AppState, job: &store::JobRow) -> anyhow::Result<()> {
+    let Some(command) = state.config.commands.bootstrap.as_ref() else {
+        return Ok(());
+    };
+
+    let log_path = state
+        .state_dir
+        .join("logs")
+        .join(format!("{}-bootstrap.log", job.job_id));
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create bootstrap log dir {}", parent.display()))?;
+    }
+
+    let stdout = std::fs::File::create(&log_path)
+        .with_context(|| format!("create bootstrap log {}", log_path.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .with_context(|| format!("clone bootstrap log handle {}", log_path.display()))?;
+    let log_path_str = log_path.display().to_string();
+    store::update_job_runtime(&state.pool, &job.job_id, None, Some(&log_path_str)).await?;
+
+    let cwd = &job.cwd;
+    let program = command.program.replace("{path}", cwd);
+    let args = command
+        .args
+        .iter()
+        .map(|arg| arg.replace("{path}", cwd))
+        .collect::<Vec<_>>();
+
+    tracing::info!(job_id = %job.job_id, cwd, cmd = %program, args = ?args, "running branch bootstrap command");
+    let status = std::process::Command::new(&program)
+        .args(&args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .status()
+        .with_context(|| format!("run bootstrap command {}", program))?;
+
+    if !status.success() {
+        store::update_job_end(
+            &state.pool,
+            &job.job_id,
+            "ERROR",
+            Some(status.code().unwrap_or(-1) as i64),
+        )
+        .await?;
+        return Err(anyhow!(
+            "bootstrap command exited with status {} (logs: {})",
+            status.code().unwrap_or(-1),
+            log_path.display()
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(serde::Deserialize)]
@@ -709,14 +1052,23 @@ async fn request_changes_job(
     Json(serde_json::json!({"ok": true, "job_id": job.job_id})).into_response()
 }
 
-fn opencode_client_for_dir(dir: &str) -> Result<OpencodeClient, String> {
-    let base_url = std::env::var("SHIREI_OPENCODE_BASE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:4096".to_string());
+fn opencode_client_for_dir(base_url: &str, dir: &str) -> Result<OpencodeClient, String> {
     OpencodeClientBuilder::new()
-        .base_url(base_url)
+        .base_url(base_url.to_string())
         .directory(dir.to_string())
         .build()
         .map_err(|e| e.to_string())
+}
+
+async fn opencode_client_for_job(
+    state: &AppState,
+    job: &store::JobRow,
+) -> Result<OpencodeClient, String> {
+    let base_url = match ensure_job_attach_runtime(state, job).await {
+        Ok(url) => url,
+        Err(e) => return Err(e.to_string()),
+    };
+    opencode_client_for_dir(&base_url, &job.cwd)
 }
 
 #[derive(serde::Serialize)]
@@ -752,11 +1104,9 @@ async fn job_inputs(
         Err(_) => return (StatusCode::NOT_FOUND, "JOB_NOT_FOUND").into_response(),
     };
 
-    let client = match opencode_client_for_dir(&job.cwd) {
+    let client = match opencode_client_for_job(&state, &job).await {
         Ok(client) => client,
-        Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "OPENCODE_CLIENT_FAILED").into_response()
-        }
+        Err(_) => return (StatusCode::BAD_GATEWAY, "OPENCODE_CLIENT_FAILED").into_response(),
     };
 
     let permissions = client.permissions().list().await.unwrap_or_default();
@@ -815,11 +1165,9 @@ async fn job_permission_reply(
         Ok(job) => job,
         Err(_) => return (StatusCode::NOT_FOUND, "JOB_NOT_FOUND").into_response(),
     };
-    let client = match opencode_client_for_dir(&job.cwd) {
+    let client = match opencode_client_for_job(&state, &job).await {
         Ok(client) => client,
-        Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "OPENCODE_CLIENT_FAILED").into_response()
-        }
+        Err(_) => return (StatusCode::BAD_GATEWAY, "OPENCODE_CLIENT_FAILED").into_response(),
     };
 
     let reply = match req.reply.to_ascii_lowercase().as_str() {
@@ -856,11 +1204,9 @@ async fn job_question_reply(
         Ok(job) => job,
         Err(_) => return (StatusCode::NOT_FOUND, "JOB_NOT_FOUND").into_response(),
     };
-    let client = match opencode_client_for_dir(&job.cwd) {
+    let client = match opencode_client_for_job(&state, &job).await {
         Ok(client) => client,
-        Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "OPENCODE_CLIENT_FAILED").into_response()
-        }
+        Err(_) => return (StatusCode::BAD_GATEWAY, "OPENCODE_CLIENT_FAILED").into_response(),
     };
     let body = QuestionReplyRequest {
         answers: req.answers,
@@ -883,16 +1229,119 @@ async fn job_question_reject(
         Ok(job) => job,
         Err(_) => return (StatusCode::NOT_FOUND, "JOB_NOT_FOUND").into_response(),
     };
-    let client = match opencode_client_for_dir(&job.cwd) {
+    let client = match opencode_client_for_job(&state, &job).await {
         Ok(client) => client,
-        Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "OPENCODE_CLIENT_FAILED").into_response()
-        }
+        Err(_) => return (StatusCode::BAD_GATEWAY, "OPENCODE_CLIENT_FAILED").into_response(),
     };
     match client.questions().reject(&request_id).await {
         Ok(ok) => Json(serde_json::json!({"ok": ok})).into_response(),
         Err(_) => (StatusCode::BAD_GATEWAY, "OPENCODE_REPLY_FAILED").into_response(),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct JobPromptReq {
+    prompt: String,
+}
+
+async fn job_prompt(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Json(req): Json<JobPromptReq>,
+) -> impl IntoResponse {
+    if let Err(code) = require_auth(&headers, &state.auth_token) {
+        return code.into_response();
+    }
+
+    let prompt = req.prompt.trim();
+    if prompt.is_empty() {
+        return (StatusCode::BAD_REQUEST, "PROMPT_REQUIRED").into_response();
+    }
+
+    let job = match store::get_job(&state.pool, &job_id).await {
+        Ok(job) => job,
+        Err(_) => return (StatusCode::NOT_FOUND, "JOB_NOT_FOUND").into_response(),
+    };
+
+    let client = match opencode_client_for_job(&state, &job).await {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!(job_id = %job_id, error = %e, "opencode client setup failed");
+            return (StatusCode::BAD_GATEWAY, "OPENCODE_CLIENT_FAILED").into_response();
+        }
+    };
+
+    let session_id = match session_for_job(&client, &job).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(job_id = %job_id, dir = %job.cwd, error = ?e, "opencode session lookup failed");
+            return (StatusCode::BAD_GATEWAY, "OPENCODE_SESSION_FAILED").into_response();
+        }
+    };
+
+    match client
+        .messages()
+        .prompt(&session_id, &PromptRequest::text(prompt))
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "job_id": job_id,
+            "session_id": session_id,
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!(job_id = %job_id, session_id = %session_id, error = ?e, "opencode prompt failed");
+            (StatusCode::BAD_GATEWAY, "OPENCODE_PROMPT_FAILED").into_response()
+        }
+    }
+}
+
+/// Resolve the OpenCode session for a job.
+///
+/// Uses the stored `session_id` when available (the normal path for new jobs).
+/// Falls back to a directory-based heuristic for legacy jobs created before the
+/// session_id migration.
+async fn session_for_job(client: &OpencodeClient, job: &store::JobRow) -> anyhow::Result<String> {
+    if let Some(sid) = &job.session_id {
+        return Ok(sid.clone());
+    }
+
+    // Legacy fallback: find the latest session matching this job's directory.
+    let sessions = client.sessions().list().await?;
+    if let Some(existing) = latest_session_for_dir(&sessions, &job.cwd) {
+        return Ok(existing.id.clone());
+    }
+
+    // Last resort: create a new session scoped to the job directory.
+    let created = client
+        .sessions()
+        .create_with(
+            opencode_sdk::types::session::SessionCreateOptions::new()
+                .with_title(&format!("Shirei: {}", job.name))
+                .with_directory(&job.cwd),
+        )
+        .await?;
+    Ok(created.id)
+}
+
+fn latest_session_for_dir<'a>(sessions: &'a [Session], directory: &str) -> Option<&'a Session> {
+    sessions
+        .iter()
+        .filter(|s| {
+            s.directory
+                .as_deref()
+                .map(|d| d == directory)
+                .unwrap_or(false)
+        })
+        .max_by_key(|session| {
+            session
+                .time
+                .as_ref()
+                .map(|t| (t.updated, t.created))
+                .unwrap_or((0, 0))
+        })
 }
 
 #[derive(serde::Deserialize)]

@@ -25,6 +25,7 @@ impl CommandConfig {
 #[derive(Debug, Clone)]
 pub struct CommandsConfig {
     pub opencode: CommandConfig,
+    pub bootstrap: Option<CommandConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +41,7 @@ impl Default for ShireiConfig {
                     program: "opencode".to_string(),
                     args: Vec::new(),
                 },
+                bootstrap: None,
             },
         }
     }
@@ -77,6 +79,10 @@ impl ShireiConfig {
         {
             cfg.commands.opencode = cmd;
         }
+        cfg.commands.bootstrap = parsed
+            .commands
+            .bootstrap
+            .and_then(RawCommand::into_command_config);
 
         cfg
     }
@@ -91,6 +97,7 @@ struct RawConfig {
 #[derive(Debug, Default, serde::Deserialize)]
 struct RawCommands {
     opencode: Option<RawCommand>,
+    bootstrap: Option<RawCommand>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -130,7 +137,8 @@ mod tests {
             &path,
             r#"{
   "commands": {
-    "opencode": ["foo", "--bar"]
+    "opencode": ["foo", "--bar"],
+    "bootstrap": ["bash", "-lc", "npm install"]
   }
 }"#,
         )
@@ -139,6 +147,12 @@ mod tests {
         let cfg = ShireiConfig::load(td.path());
         assert_eq!(cfg.commands.opencode.program, "foo");
         assert_eq!(cfg.commands.opencode.args, vec!["--bar".to_string()]);
+        let bootstrap = cfg.commands.bootstrap.expect("bootstrap config");
+        assert_eq!(bootstrap.program, "bash");
+        assert_eq!(
+            bootstrap.args,
+            vec!["-lc".to_string(), "npm install".to_string()]
+        );
     }
 
     #[test]

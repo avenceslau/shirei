@@ -219,21 +219,37 @@ async fn full_cli_api_flow_with_mock_opencode() -> Result<()> {
 }
 
 #[tokio::test]
-async fn cli_lifecycle_and_tui_commands_work() -> Result<()> {
+async fn cli_lifecycle_branch_and_picker_commands_work() -> Result<()> {
     let td = TempDir::new()?;
+    init_git_repo(td.path())?;
+    add_remote_branch_ref(td.path(), "origin/feature/remote-only")?;
     let state_dir = td.path().join("state");
     tokio::fs::create_dir_all(&state_dir).await?;
+    tokio::fs::write(
+        state_dir.join("config.json"),
+        r#"{
+  "commands": {
+    "bootstrap": ["bash", "-lc", "pwd > .shirei-bootstrap"]
+  }
+}"#,
+    )
+    .await?;
 
     let bin_dir = td.path().join("bin");
     tokio::fs::create_dir_all(&bin_dir).await?;
-    write_mock_tui(&bin_dir).await?;
+    write_mock_fzf(&bin_dir).await?;
+    write_mock_tmux(&bin_dir).await?;
+    write_mock_opencode(&bin_dir).await?;
 
     let bind = format!("127.0.0.1:{}", free_tcp_port()?);
     let base = format!("http://{bind}");
 
     let cli = workspace_bin("shirei")?;
     let daemon = workspace_bin("shirei-daemon")?;
-    let tui_log = td.path().join("tui.log");
+    let tmux_log = td.path().join("tmux.log");
+    let fzf_log = td.path().join("fzf.log");
+    let tmux_state = td.path().join("tmux-state");
+    tokio::fs::create_dir_all(&tmux_state).await?;
 
     let start = std::process::Command::new(&cli)
         .arg("--base-url")
@@ -254,6 +270,16 @@ async fn cli_lifecycle_and_tui_commands_work() -> Result<()> {
 
     let token = wait_for_token(&state_dir.join("token")).await?;
     wait_for_health(&base).await?;
+    let discovered = cli_json(
+        &cli,
+        &base,
+        &token,
+        &["project-discover", td.path().to_string_lossy().as_ref()],
+    )?;
+    let project_id = discovered["project"]["project_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing project_id"))?
+        .to_string();
 
     let start_again = std::process::Command::new(&cli)
         .arg("--base-url")
@@ -284,30 +310,163 @@ async fn cli_lifecycle_and_tui_commands_work() -> Result<()> {
     }
     wait_for_health(&base).await?;
 
-    let tui = std::process::Command::new(&cli)
+    let branch = std::process::Command::new(&cli)
         .arg("--base-url")
         .arg(&base)
         .arg("--state-dir")
         .arg(state_dir.to_string_lossy().to_string())
-        .args(["tui", "--", "--discover-path", "."])
+        .arg("--token")
+        .arg(&token)
+        .args(["branch", "feature/demo"])
         .env(
-            "SHIREI_TUI_BIN",
-            bin_dir.join("mock-tui").to_string_lossy().to_string(),
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.to_string_lossy(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
         )
-        .env("SHIREI_TUI_LOG", tui_log.to_string_lossy().to_string())
+        .env("SHIREI_TMUX_LOG", tmux_log.to_string_lossy().to_string())
+        .env(
+            "SHIREI_TMUX_STATE_DIR",
+            tmux_state.to_string_lossy().to_string(),
+        )
+        .current_dir(td.path())
         .output()
         .with_context(|| format!("failed running {}", cli.display()))?;
-    if !tui.status.success() {
+    if !branch.status.success() {
         return Err(anyhow!(
-            "cli tui failed (status={}): {}",
-            tui.status,
-            String::from_utf8_lossy(&tui.stderr)
+            "cli branch failed (status={}): {}",
+            branch.status,
+            String::from_utf8_lossy(&branch.stderr)
         ));
     }
-    let tui_args = tokio::fs::read_to_string(&tui_log).await?;
-    assert!(tui_args.contains(&format!("--base-url {base}")));
-    assert!(tui_args.contains(&format!("--token {token}")));
-    assert!(tui_args.contains("--discover-path ."));
+
+    let tmux_args = tokio::fs::read_to_string(&tmux_log).await?;
+    assert!(tmux_args.contains("new-session -d -s shirei-feature-demo"));
+    assert!(tmux_args.contains(&format!("--base-url {base}")));
+    assert!(tmux_args.contains(&format!("--token {token}")));
+    assert!(tmux_args.contains("jobs job_"));
+    assert!(
+        tmux_args.contains("attach-session -t shirei-feature-demo")
+            || tmux_args.contains("switch-client -t shirei-feature-demo")
+    );
+
+    let sessions = std::process::Command::new(&cli)
+        .arg("--base-url")
+        .arg(&base)
+        .arg("--state-dir")
+        .arg(state_dir.to_string_lossy().to_string())
+        .arg("--token")
+        .arg(&token)
+        .arg("sessions")
+        .output()
+        .with_context(|| format!("failed running {}", cli.display()))?;
+    assert!(sessions.status.success());
+    let sessions_stdout = String::from_utf8(sessions.stdout)?;
+    assert!(sessions_stdout.contains("RUNNING"));
+    assert!(sessions_stdout.contains("feature/demo"));
+
+    let jobs = cli_json(&cli, &base, &token, &["jobs", &project_id])?;
+    let demo_worktree = jobs["jobs"]
+        .as_array()
+        .and_then(|jobs| {
+            jobs.iter()
+                .find(|job| job["name"].as_str() == Some("feature/demo"))
+        })
+        .and_then(|job| job["worktree_path"].as_str())
+        .ok_or_else(|| anyhow!("missing worktree for feature/demo"))?;
+    let bootstrap_path = PathBuf::from(demo_worktree).join(".shirei-bootstrap");
+    assert!(
+        bootstrap_path.exists(),
+        "bootstrap file missing at {}",
+        bootstrap_path.display()
+    );
+
+    let picker = std::process::Command::new(&cli)
+        .arg("--base-url")
+        .arg(&base)
+        .arg("--state-dir")
+        .arg(state_dir.to_string_lossy().to_string())
+        .arg("--token")
+        .arg(&token)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.to_string_lossy(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("SHIREI_FZF_LOG", fzf_log.to_string_lossy().to_string())
+        .env("SHIREI_TMUX_LOG", tmux_log.to_string_lossy().to_string())
+        .env(
+            "SHIREI_TMUX_STATE_DIR",
+            tmux_state.to_string_lossy().to_string(),
+        )
+        .current_dir(td.path())
+        .output()
+        .with_context(|| format!("failed running {}", cli.display()))?;
+    assert!(picker.status.success());
+
+    let fzf_input = tokio::fs::read_to_string(&fzf_log).await?;
+    assert!(fzf_input.contains("feature/demo"));
+
+    let tmux_args = tokio::fs::read_to_string(&tmux_log).await?;
+    assert!(tmux_args.contains("has-session -t shirei-feature-demo"));
+
+    let branch_picker = std::process::Command::new(&cli)
+        .arg("--base-url")
+        .arg(&base)
+        .arg("--state-dir")
+        .arg(state_dir.to_string_lossy().to_string())
+        .arg("--token")
+        .arg(&token)
+        .arg("branch")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.to_string_lossy(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("SHIREI_FZF_LOG", fzf_log.to_string_lossy().to_string())
+        .env("SHIREI_FZF_MATCH", "origin/feature/remote-only")
+        .env("SHIREI_TMUX_LOG", tmux_log.to_string_lossy().to_string())
+        .env(
+            "SHIREI_TMUX_STATE_DIR",
+            tmux_state.to_string_lossy().to_string(),
+        )
+        .current_dir(td.path())
+        .output()
+        .with_context(|| format!("failed running {}", cli.display()))?;
+    if !branch_picker.status.success() {
+        return Err(anyhow!(
+            "cli branch picker failed (status={}): {}",
+            branch_picker.status,
+            String::from_utf8_lossy(&branch_picker.stderr)
+        ));
+    }
+
+    let branch_picker_input = tokio::fs::read_to_string(&fzf_log).await?;
+    assert!(branch_picker_input.contains("origin/feature/remote-only"));
+
+    let jobs = cli_json(&cli, &base, &token, &["jobs", &project_id])?;
+    let remote_worktree = jobs["jobs"]
+        .as_array()
+        .and_then(|jobs| {
+            jobs.iter()
+                .find(|job| job["name"].as_str() == Some("feature/remote-only"))
+        })
+        .and_then(|job| job["worktree_path"].as_str())
+        .ok_or_else(|| anyhow!("missing worktree for feature/remote-only"))?;
+    let remote_bootstrap_path = PathBuf::from(remote_worktree).join(".shirei-bootstrap");
+    assert!(
+        remote_bootstrap_path.exists(),
+        "bootstrap file missing at {}",
+        remote_bootstrap_path.display()
+    );
 
     let stop = std::process::Command::new(&cli)
         .arg("--base-url")
@@ -397,6 +556,32 @@ fn init_git_repo(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn add_remote_branch_ref(path: &Path, remote_branch: &str) -> Result<()> {
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(path)
+        .output()
+        .with_context(|| format!("resolve HEAD for {remote_branch}"))?;
+    if !head.status.success() {
+        return Err(anyhow!("git rev-parse HEAD failed"));
+    }
+    let head_sha = String::from_utf8(head.stdout)?.trim().to_string();
+
+    let status = std::process::Command::new("git")
+        .args([
+            "update-ref",
+            &format!("refs/remotes/{remote_branch}"),
+            &head_sha,
+        ])
+        .current_dir(path)
+        .status()
+        .with_context(|| format!("create remote ref {remote_branch}"))?;
+    if !status.success() {
+        return Err(anyhow!("git update-ref failed for {remote_branch}"));
+    }
+    Ok(())
+}
+
 async fn write_mock_opencode(bin_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -453,19 +638,83 @@ exit 0
     Ok(())
 }
 
-async fn write_mock_tui(bin_dir: &Path) -> Result<()> {
+async fn write_mock_fzf(bin_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         use tokio::io::AsyncWriteExt;
 
-        let mock = bin_dir.join("mock-tui");
+        let mock = bin_dir.join("fzf");
         let mut f = tokio::fs::File::create(&mock).await?;
         f.write_all(
             br#"#!/usr/bin/env bash
-if [[ -n "${SHIREI_TUI_LOG:-}" ]]; then
-  echo "$*" > "$SHIREI_TUI_LOG"
+input="$(cat)"
+if [[ -n "${SHIREI_FZF_LOG:-}" ]]; then
+  printf '%s' "$input" > "$SHIREI_FZF_LOG"
 fi
+if [[ -n "${SHIREI_FZF_MATCH:-}" ]]; then
+  while IFS= read -r line; do
+    if [[ "$line" == *"$SHIREI_FZF_MATCH"* ]]; then
+      printf '%s\n' "$line"
+      exit 0
+    fi
+  done <<< "$input"
+fi
+printf '%s\n' "${input%%$'\n'*}"
+exit 0
+"#,
+        )
+        .await?;
+        let mut perms = tokio::fs::metadata(&mock).await?.permissions();
+        perms.set_mode(0o755);
+        tokio::fs::set_permissions(&mock, perms).await?;
+    }
+    Ok(())
+}
+
+async fn write_mock_tmux(bin_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncWriteExt;
+
+        let mock = bin_dir.join("tmux");
+        let mut f = tokio::fs::File::create(&mock).await?;
+        f.write_all(
+            br#"#!/usr/bin/env bash
+log="${SHIREI_TMUX_LOG:-}"
+state_dir="${SHIREI_TMUX_STATE_DIR:-}"
+mkdir -p "$state_dir"
+if [[ -n "$log" ]]; then
+  printf '%s\n' "$*" >> "$log"
+fi
+
+case "$1" in
+  has-session)
+    session="$3"
+    if [[ -f "$state_dir/$session" ]]; then
+      exit 0
+    fi
+    exit 1
+    ;;
+  new-session)
+    session=""
+    for ((i=1; i<=$#; i++)); do
+      if [[ "${!i}" == "-s" ]]; then
+        j=$((i+1))
+        session="${!j}"
+      fi
+    done
+    if [[ -n "$session" ]]; then
+      touch "$state_dir/$session"
+    fi
+    exit 0
+    ;;
+  attach-session|switch-client)
+    exit 0
+    ;;
+esac
+
 exit 0
 "#,
         )

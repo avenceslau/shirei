@@ -1,6 +1,6 @@
 # Shirei
 
-Local daemon + CLI to supervise agent jobs (OpenCode) in isolated git worktrees and watch GitHub/GitLab PR/MR comments for commands.
+Local daemon + CLI to supervise OpenCode sessions in isolated git worktrees.
 
 ## Quick start
 
@@ -10,7 +10,15 @@ Install bundled binaries from crates.io:
 cargo install shirei
 ```
 
-This installs `shirei`, `shirei-daemon`, and `shirei-tui` together.
+This installs `shirei` and `shirei-daemon`.
+
+The CLI-first flow expects `fzf` and `tmux` to be available on your machine.
+
+Run `shirei` with no subcommand to open the CLI session picker:
+
+- loads active Shirei sessions into `fzf`,
+- shows which sessions need `INPUT` or `REVIEW`,
+- opens the selected session inside `tmux` and attaches OpenCode there.
 
 ```bash
 # required for GitHub provider (unless using mock):
@@ -31,10 +39,14 @@ cargo run -p shirei -- --token "$TOKEN" doctor
 cargo run -p shirei -- --token "$TOKEN" doctor --project-id <project-id>
 cargo run -p shirei -- --token "$TOKEN" project-discover .
 
-# list jobs for a project
-cargo run -p shirei -- --token "$TOKEN" jobs "$PROJECT_ID"
+# list active sessions
+cargo run -p shirei -- --token "$TOKEN" sessions
 # attach opencode to an existing job session
 cargo run -p shirei -- --token "$TOKEN" jobs <job-id> attach
+# create a fresh branch worktree or attach an existing branch
+cargo run -p shirei -- --token "$TOKEN" branch feature/my-change
+# open an fzf branch picker (includes local + remote branches)
+cargo run -p shirei -- --token "$TOKEN" branch
 
 # inspect or stop persistent attach backend
 cargo run -p shirei -- --token "$TOKEN" jobs <job-id> attach-status
@@ -78,23 +90,21 @@ Commands recognized in PR/MR comments:
 
 Manual jobs now enter a review loop when the agent run exits: Shirei marks them `AWAITING_REVIEW`, auto-creates a draft PR/MR when it can (and attaches a watch), and waits for `/shirei approve` or `/shirei request-changes ...`.
 
+When a background session finishes or starts waiting for user input, the daemon sends a desktop notification.
+
 Open a job branch/worktree in your configured editor:
 
 ```bash
 shirei --token "$TOKEN" jobs <job-id> edit
 ```
 
-## TUI
+## Session flow
 
-Run the terminal UI against a running daemon:
-
-```bash
-cargo run -p shirei-tui -- --token "$TOKEN" --discover-path .
-```
-
-Useful keys: `?` show actions help, `d` discover project, `n` create job (opens fuzzy project picker), `v` cycle job-state filter, `y` approve, `c` request changes (rerun), `g` grant permission once, `G` grant permission always, `x` reject permission, `1-9` answer first pending question option, `0` reject question, `a` ack, `u` unack, `k` kill, `r` refresh, `t` attach interactive, `e` edit interactive, `T` attach background, `E` edit background, `o` open linked PR in browser. The left sidebar shows all sessions with a state indicator; the right pane shows logs for the selected session.
-
-`t` and `e` run attach/edit interactively in the current terminal and return to TUI on exit. `t` now attaches to a persistent per-job OpenCode backend, so exiting OpenCode (`/q`) detaches while keeping the backend running for later reattach. Use `T` / `E` for background launch.
+- `shirei` opens an `fzf` picker for active sessions.
+- `shirei branch` opens an `fzf` picker of local and remote branches, creates or reuses the matching worktree, and opens OpenCode in tmux.
+- `shirei branch <branch-name>` attaches that existing local/remote branch when it exists, or creates a new branch worktree when it does not.
+- Session rows are badged as `RUNNING`, `INPUT`, `REVIEW`, or `ERROR`.
+- `shirei jobs <job-id> attach` still attaches directly when you already know the session id.
 
 ## OpenCode setup
 
@@ -124,13 +134,17 @@ Current schema:
 ```json
 {
   "commands": {
-    "opencode": ["opencode"]
+    "opencode": ["opencode"],
+    "bootstrap": ["bash", "-lc", "pnpm install"]
   }
 }
 ```
 
 - `commands.opencode` may be a string (`"opencode"`) or an argv array.
 - If omitted, default is `opencode`.
+- `commands.bootstrap` is optional and runs inside new branch worktrees before tmux/OpenCode opens.
+- `commands.bootstrap` may also be a string or argv array; use an argv array like `["bash", "-lc", "pnpm install"]` for shell pipelines.
+- `commands.bootstrap` supports `{path}` placeholders, although it already runs with the worktree as its current directory.
 - `SHIREI_OPENCODE_CMD` still works and overrides config for compatibility.
 
 ## Testing (mock opencode)

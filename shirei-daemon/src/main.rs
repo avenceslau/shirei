@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod events;
 mod git_ops;
+mod notifications;
 mod pr_watch;
 mod purge;
 mod runner;

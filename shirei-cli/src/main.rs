@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ struct Args {
     #[arg(long)]
     state_dir: Option<String>,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -28,10 +29,6 @@ enum Cmd {
     Start,
     Stop,
     Restart,
-    Tui {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
     Doctor {
         #[arg(long)]
         project_id: Option<String>,
@@ -42,6 +39,12 @@ enum Cmd {
         path: String,
     },
     Projects,
+    Sessions,
+    Branch {
+        branch_name: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+    },
     Jobs {
         id: String,
         #[command(subcommand)]
@@ -96,7 +99,24 @@ struct JobApiResponse {
 #[derive(Debug, Deserialize)]
 struct JobRecord {
     job_id: String,
+    name: String,
     cwd: String,
+    worktree_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionsApiResponse {
+    sessions: Vec<SessionRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionRecord {
+    job_id: String,
+    name: String,
+    status: String,
+    needs_attention: i64,
+    cwd: String,
+    worktree_name: Option<String>,
     worktree_path: Option<String>,
 }
 
@@ -113,6 +133,19 @@ struct AttachRecord {
 }
 
 #[derive(Debug, Deserialize)]
+struct BranchesApiResponse {
+    branches: Vec<BranchRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BranchRecord {
+    name: String,
+    local_name: String,
+    local: bool,
+    remote_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProjectsApiResponse {
     projects: Vec<ProjectSummary>,
 }
@@ -125,14 +158,27 @@ struct ProjectSummary {
 }
 
 #[derive(Debug, Deserialize)]
+struct DiscoverApiResponse {
+    project: ProjectSummary,
+}
+
+#[derive(Debug, Deserialize)]
 struct InfoApiResponse {
     providers: Option<ProviderInfo>,
+    commands: Option<CommandsInfo>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ProviderInfo {
     github_configured: bool,
     gitlab_configured: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommandsInfo {
+    bootstrap_configured: Option<bool>,
+    bootstrap_program: Option<String>,
+    bootstrap_args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -160,7 +206,13 @@ async fn main() -> anyhow::Result<()> {
     let a = Args::parse();
     let c = reqwest::Client::new();
 
-    match a.cmd {
+    if a.cmd.is_none() {
+        open_default_session_picker(&c, &a.base_url, a.token.as_deref(), a.state_dir.as_deref())
+            .await?;
+        return Ok(());
+    }
+
+    match a.cmd.expect("command checked") {
         Cmd::Setup { target } => match target {
             SetupCmd::Opencode { force, print } => setup_opencode_commands(force, print)?,
         },
@@ -169,14 +221,6 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Restart => {
             stop_daemon(&a.base_url, a.state_dir.as_deref()).await?;
             start_daemon(&c, &a.base_url, a.state_dir.as_deref()).await?;
-        }
-        Cmd::Tui { args } => {
-            launch_tui(
-                &a.base_url,
-                a.token.as_deref(),
-                a.state_dir.as_deref(),
-                &args,
-            )?;
         }
         Cmd::Doctor { project_id } => {
             run_doctor(
@@ -230,6 +274,25 @@ async fn main() -> anyhow::Result<()> {
             .json()
             .await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Cmd::Sessions => {
+            let auth = authorization_header(a.token.as_deref(), a.state_dir.as_deref())?;
+            let sessions = fetch_active_sessions(&c, &a.base_url, &auth).await?;
+            print_sessions(&sessions);
+        }
+        Cmd::Branch {
+            branch_name,
+            prompt,
+        } => {
+            create_or_attach_branch_session(
+                &c,
+                &a.base_url,
+                a.token.as_deref(),
+                a.state_dir.as_deref(),
+                branch_name.as_deref(),
+                prompt.as_deref(),
+            )
+            .await?;
         }
         Cmd::Jobs { id, action } => match action {
             Some(JobsCmd::Attach) => {
@@ -344,6 +407,397 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn open_default_session_picker(
+    client: &reqwest::Client,
+    base_url: &str,
+    token_arg: Option<&str>,
+    state_dir_arg: Option<&str>,
+) -> anyhow::Result<()> {
+    let auth = authorization_header(token_arg, state_dir_arg)?;
+    let sessions = fetch_active_sessions(client, base_url, &auth).await?;
+    if sessions.is_empty() {
+        println!("No active Shirei sessions. Create one with `shirei branch` or `shirei branch <branch-name>`.");
+        return Ok(());
+    }
+
+    let Some(session) = pick_session_with_fzf(&sessions)? else {
+        return Ok(());
+    };
+
+    open_job_in_tmux(
+        base_url,
+        token_arg,
+        state_dir_arg,
+        &session.job_id,
+        session.worktree_path.as_deref().unwrap_or(&session.cwd),
+        session.worktree_name.as_deref().unwrap_or(&session.job_id),
+    )
+}
+
+async fn fetch_active_sessions(
+    client: &reqwest::Client,
+    base_url: &str,
+    auth: &str,
+) -> anyhow::Result<Vec<SessionRecord>> {
+    let response: SessionsApiResponse = send_api_request(base_url, || {
+        client
+            .get(format!("{}/api/v0.1/sessions", base_url))
+            .header("Authorization", auth)
+    })
+    .await?
+    .error_for_status()?
+    .json()
+    .await
+    .context("failed to list active sessions")?;
+    Ok(response.sessions)
+}
+
+fn print_sessions(sessions: &[SessionRecord]) {
+    if sessions.is_empty() {
+        println!("No active Shirei sessions.");
+        return;
+    }
+
+    for session in sessions {
+        println!(
+            "{:<8} {:<18} {}",
+            session_badge(session),
+            session.name,
+            session.worktree_path.as_deref().unwrap_or(&session.cwd)
+        );
+    }
+}
+
+async fn create_or_attach_branch_session(
+    client: &reqwest::Client,
+    base_url: &str,
+    token_arg: Option<&str>,
+    state_dir_arg: Option<&str>,
+    branch_name: Option<&str>,
+    prompt: Option<&str>,
+) -> anyhow::Result<()> {
+    let auth = authorization_header(token_arg, state_dir_arg)?;
+    let discovered = discover_current_project(client, base_url, &auth).await?;
+    let project_id = discovered.project.project_id.clone();
+    let selected_branch = match branch_name.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(branch_name) => branch_name.to_string(),
+        None => {
+            let branches = fetch_project_branches(client, base_url, &auth, &project_id).await?;
+            if branches.is_empty() {
+                println!("No local or remote branches found. Create one with `shirei branch <branch-name>`.");
+                return Ok(());
+            }
+
+            let Some(branch) = pick_branch_with_fzf(&branches)? else {
+                return Ok(());
+            };
+            branch.name
+        }
+    };
+
+    let created: JobApiResponse = send_api_request(base_url, || {
+        client
+            .post(format!(
+                "{}/api/v0.1/projects/{}/branches",
+                base_url, project_id
+            ))
+            .header("Authorization", auth.clone())
+            .json(&serde_json::json!({
+                "branch_name": selected_branch.clone(),
+                "prompt": prompt,
+            }))
+    })
+    .await?
+    .error_for_status()?
+    .json()
+    .await
+    .with_context(|| format!("failed creating branch session for {}", selected_branch))?;
+
+    if let Some(prompt) = prompt.filter(|value| !value.trim().is_empty()) {
+        send_job_prompt(client, base_url, &auth, &created.job.job_id, prompt).await?;
+    }
+
+    let target_path = resolve_job_target_path(&created.job)?;
+    open_job_in_tmux(
+        base_url,
+        token_arg,
+        state_dir_arg,
+        &created.job.job_id,
+        &target_path.display().to_string(),
+        &created.job.name,
+    )
+}
+
+async fn fetch_project_branches(
+    client: &reqwest::Client,
+    base_url: &str,
+    auth: &str,
+    project_id: &str,
+) -> anyhow::Result<Vec<BranchRecord>> {
+    let response: BranchesApiResponse = send_api_request(base_url, || {
+        client
+            .get(format!(
+                "{}/api/v0.1/projects/{}/branches",
+                base_url, project_id
+            ))
+            .header("Authorization", auth)
+    })
+    .await?
+    .error_for_status()?
+    .json()
+    .await
+    .with_context(|| format!("failed listing branches for project {project_id}"))?;
+    Ok(response.branches)
+}
+
+async fn send_job_prompt(
+    client: &reqwest::Client,
+    base_url: &str,
+    auth: &str,
+    job_id: &str,
+    prompt: &str,
+) -> anyhow::Result<()> {
+    send_api_request(base_url, || {
+        client
+            .post(format!("{}/api/v0.1/jobs/{}/prompt", base_url, job_id))
+            .header("Authorization", auth)
+            .json(&serde_json::json!({"prompt": prompt}))
+    })
+    .await?
+    .error_for_status()
+    .with_context(|| format!("failed sending initial prompt to {job_id}"))?;
+    Ok(())
+}
+
+async fn discover_current_project(
+    client: &reqwest::Client,
+    base_url: &str,
+    auth: &str,
+) -> anyhow::Result<DiscoverApiResponse> {
+    let cwd = std::env::current_dir().context("failed resolving current directory")?;
+    let cwd_str = cwd.display().to_string();
+    send_api_request(base_url, || {
+        client
+            .post(format!("{}/api/v0.1/projects/discover", base_url))
+            .header("Authorization", auth)
+            .json(&serde_json::json!({"root_path": cwd_str.clone()}))
+    })
+    .await?
+    .error_for_status()?
+    .json()
+    .await
+    .context("failed to discover project for current directory")
+}
+
+fn pick_session_with_fzf(sessions: &[SessionRecord]) -> anyhow::Result<Option<SessionRecord>> {
+    let mut child = std::process::Command::new("fzf")
+        .args([
+            "--prompt",
+            "shirei> ",
+            "--delimiter",
+            "\t",
+            "--with-nth",
+            "2..",
+            "--height",
+            "80%",
+            "--layout",
+            "reverse",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("failed to launch fzf; install fzf to use the default Shirei picker")?;
+
+    {
+        let stdin = child.stdin.as_mut().context("failed to open fzf stdin")?;
+        for session in sessions {
+            writeln!(
+                stdin,
+                "{}\t{}\t{}\t{}\t{}",
+                session.job_id,
+                session_badge(session),
+                session.name,
+                session.worktree_path.as_deref().unwrap_or(&session.cwd),
+                session.status
+            )?;
+        }
+    }
+
+    let output = child.wait_with_output().context("fzf did not complete")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let selected = String::from_utf8(output.stdout).context("fzf returned invalid utf-8")?;
+    let Some(job_id) = selected
+        .split('\t')
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(sessions.iter().find(|s| s.job_id == job_id).cloned())
+}
+
+fn pick_branch_with_fzf(branches: &[BranchRecord]) -> anyhow::Result<Option<BranchRecord>> {
+    let mut child = std::process::Command::new("fzf")
+        .args([
+            "--prompt",
+            "branch> ",
+            "--delimiter",
+            "\t",
+            "--with-nth",
+            "2..",
+            "--height",
+            "80%",
+            "--layout",
+            "reverse",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("failed to launch fzf; install fzf to select a Shirei branch")?;
+
+    {
+        let stdin = child.stdin.as_mut().context("failed to open fzf stdin")?;
+        for branch in branches {
+            writeln!(
+                stdin,
+                "{}\t{}\t{}\t{}",
+                branch.name,
+                branch_kind(branch),
+                branch.local_name,
+                branch.remote_name.as_deref().unwrap_or("-")
+            )?;
+        }
+    }
+
+    let output = child.wait_with_output().context("fzf did not complete")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let selected = String::from_utf8(output.stdout).context("fzf returned invalid utf-8")?;
+    let Some(branch_name) = selected
+        .split('\t')
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(branches
+        .iter()
+        .find(|branch| branch.name == branch_name)
+        .cloned())
+}
+
+fn session_badge(session: &SessionRecord) -> &'static str {
+    match session.status.as_str() {
+        "AWAITING_REVIEW" | "DONE_UNREAD" => "REVIEW",
+        _ if session.needs_attention > 0 => "INPUT",
+        "RUNNING" => "RUNNING",
+        "ERROR" => "ERROR",
+        _ => "OPEN",
+    }
+}
+
+fn branch_kind(branch: &BranchRecord) -> &'static str {
+    match (branch.local, branch.remote_name.is_some()) {
+        (true, true) => "LOCAL+REMOTE",
+        (true, false) => "LOCAL",
+        (false, _) => "REMOTE",
+    }
+}
+
+fn open_job_in_tmux(
+    base_url: &str,
+    token: Option<&str>,
+    state_dir: Option<&str>,
+    job_id: &str,
+    cwd: &str,
+    name_hint: &str,
+) -> anyhow::Result<()> {
+    let session_name = tmux_session_name(name_hint, job_id);
+    let current_exe = std::env::current_exe().context("failed resolving current shirei binary")?;
+
+    let has_status = std::process::Command::new("tmux")
+        .args(["has-session", "-t", &session_name])
+        .status();
+    let has_session = matches!(has_status, Ok(status) if status.success());
+
+    if !has_session {
+        let mut cmd = std::process::Command::new("tmux");
+        cmd.arg("new-session")
+            .arg("-d")
+            .arg("-s")
+            .arg(&session_name)
+            .arg("-c")
+            .arg(cwd)
+            .arg(current_exe);
+        cmd.arg("--base-url").arg(base_url);
+        if let Some(token) = token {
+            cmd.arg("--token").arg(token);
+        } else if let Ok(token) = read_default_token(state_dir) {
+            cmd.arg("--token").arg(token);
+        }
+        if let Some(dir) = state_dir {
+            cmd.arg("--state-dir").arg(dir);
+        }
+        cmd.args(["jobs", job_id, "attach"]);
+
+        let status = cmd
+            .status()
+            .context("failed to create tmux session; install tmux to open Shirei sessions")?;
+        if !status.success() {
+            return Err(anyhow!(
+                "tmux new-session exited with status {}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+    }
+
+    let attach_action = if std::env::var_os("TMUX").is_some() {
+        "switch-client"
+    } else {
+        "attach-session"
+    };
+    let status = std::process::Command::new("tmux")
+        .args([attach_action, "-t", &session_name])
+        .status()
+        .context("failed to attach to tmux session")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "tmux {} exited with status {}",
+            attach_action,
+            status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(())
+}
+
+fn tmux_session_name(name_hint: &str, job_id: &str) -> String {
+    let mut cleaned = name_hint
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    cleaned.truncate(28);
+    cleaned = cleaned.trim_matches('-').to_string();
+    let cleaned = if cleaned.is_empty() {
+        "session"
+    } else {
+        &cleaned
+    };
+    let suffix = job_id.trim_start_matches("job_");
+    let suffix = &suffix[..suffix.len().min(8)];
+    format!("shirei-{cleaned}-{suffix}")
+}
+
 async fn send_api_request<F>(base_url: &str, request: F) -> anyhow::Result<reqwest::Response>
 where
     F: FnMut() -> reqwest::RequestBuilder,
@@ -383,7 +837,7 @@ fn start_daemon_in_background() -> anyhow::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to spawn shirei-daemon")?;
+        .context("failed to spawn shirei-daemon; install it or set SHIREI_DAEMON_BIN")?;
     Ok(())
 }
 
@@ -487,9 +941,23 @@ async fn run_doctor(
                 Ok(resp) if resp.status().is_success() => {
                     let info = resp.json::<InfoApiResponse>().await.ok();
                     let (github_cfg, gitlab_cfg) = info
-                        .and_then(|i| i.providers)
+                        .as_ref()
+                        .and_then(|i| i.providers.as_ref())
                         .map(|p| (p.github_configured, p.gitlab_configured))
                         .unwrap_or((false, false));
+                    let (bootstrap_cfg, bootstrap_cmd) = info
+                        .as_ref()
+                        .and_then(|i| i.commands.as_ref())
+                        .map(|commands| {
+                            let configured = commands.bootstrap_configured.unwrap_or(false);
+                            let rendered = commands.bootstrap_program.as_ref().map(|program| {
+                                let mut parts = vec![program.clone()];
+                                parts.extend(commands.bootstrap_args.clone().unwrap_or_default());
+                                parts.join(" ")
+                            });
+                            (configured, rendered)
+                        })
+                        .unwrap_or((false, None));
                     record(
                         if github_cfg { "OK" } else { "WARN" },
                         "provider.github",
@@ -506,6 +974,15 @@ async fn run_doctor(
                             "SHIREI_GITLAB_HOST + SHIREI_GITLAB_TOKEN configured".to_string()
                         } else {
                             "missing SHIREI_GITLAB_HOST/SHIREI_GITLAB_TOKEN".to_string()
+                        },
+                    );
+                    record(
+                        "OK",
+                        "commands.bootstrap",
+                        match (bootstrap_cfg, bootstrap_cmd) {
+                            (true, Some(cmd)) => format!("configured in daemon: {cmd}"),
+                            (true, None) => "configured in daemon".to_string(),
+                            (false, _) => "disabled (commands.bootstrap not set)".to_string(),
                         },
                     );
 
@@ -800,10 +1277,6 @@ fn resolve_daemon_binary() -> String {
     std::env::var("SHIREI_DAEMON_BIN").unwrap_or_else(|_| "shirei-daemon".to_string())
 }
 
-fn resolve_tui_binary() -> String {
-    std::env::var("SHIREI_TUI_BIN").unwrap_or_else(|_| "shirei-tui".to_string())
-}
-
 async fn daemon_healthy(client: &reqwest::Client, base_url: &str) -> bool {
     match client
         .get(format!("{base_url}/api/v0.1/health"))
@@ -861,7 +1334,9 @@ async fn start_daemon(
 
     let child = cmd
         .spawn()
-        .with_context(|| format!("failed to start daemon binary {daemon_bin}"))?;
+        .with_context(|| {
+            format!("failed to start daemon binary {daemon_bin}; install shirei-daemon or set SHIREI_DAEMON_BIN")
+        })?;
     let pid = child.id();
     write_daemon_pid(&pid_path, pid)?;
 
@@ -909,42 +1384,6 @@ async fn stop_daemon(base_url: &str, state_dir_arg: Option<&str>) -> anyhow::Res
     }
     let _ = std::fs::remove_file(&pid_path);
     println!("Stopped Shirei daemon (pid {pid})");
-    Ok(())
-}
-
-fn launch_tui(
-    base_url: &str,
-    token: Option<&str>,
-    state_dir: Option<&str>,
-    pass_through_args: &[String],
-) -> anyhow::Result<()> {
-    let mut cmd = std::process::Command::new(resolve_tui_binary());
-    cmd.arg("--base-url").arg(base_url);
-
-    if let Some(token) = token {
-        cmd.arg("--token").arg(token);
-    } else if let Ok(token) = read_default_token(state_dir) {
-        cmd.arg("--token").arg(token);
-    }
-
-    if let Some(dir) = state_dir {
-        cmd.arg("--state-dir").arg(dir);
-    }
-
-    cmd.args(pass_through_args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let status = cmd
-        .status()
-        .context("failed to launch shirei-tui binary; install or set SHIREI_TUI_BIN")?;
-    if !status.success() {
-        return Err(anyhow!(
-            "shirei-tui exited with status {}",
-            status.code().unwrap_or(-1)
-        ));
-    }
     Ok(())
 }
 
@@ -1022,7 +1461,7 @@ compatibility: opencode
   - `shirei --token "$TOKEN" jobs <job-id> edit`
   - `shirei --token "$TOKEN" logs <job-id> --tail-lines 200`
 - Review loop:
-  - Use TUI keys `y` (approve) and `c` (request changes)
+  - Use `shirei` to open the active-session picker, then attach in tmux
   - In PR/MR comments: `/shirei approve` or `/shirei request-changes <feedback>`
 
 ## When to use
@@ -1357,8 +1796,8 @@ fn build_editor_invocation(
 mod tests {
     use super::{
         build_editor_invocation, resolve_bind_from_base_url, resolve_editor_command,
-        resolve_job_target_path, send_api_request_with, token_candidates, wait_for_daemon_ready,
-        Args, CliConfig, Cmd, EditorConfig, JobRecord, JobsCmd, SetupCmd,
+        resolve_job_target_path, send_api_request_with, tmux_session_name, token_candidates,
+        wait_for_daemon_ready, Args, CliConfig, Cmd, EditorConfig, JobRecord, JobsCmd, SetupCmd,
     };
     use clap::Parser;
     use std::net::SocketAddr;
@@ -1417,7 +1856,7 @@ mod tests {
     fn parses_jobs_attach_subcommand() {
         let args = Args::parse_from(["shirei", "jobs", "job_123", "attach"]);
         match args.cmd {
-            Cmd::Jobs { id, action } => {
+            Some(Cmd::Jobs { id, action }) => {
                 assert_eq!(id, "job_123");
                 assert!(matches!(action, Some(JobsCmd::Attach)));
             }
@@ -1429,28 +1868,53 @@ mod tests {
     fn parses_lifecycle_commands() {
         assert!(matches!(
             Args::parse_from(["shirei", "start"]).cmd,
-            Cmd::Start
+            Some(Cmd::Start)
         ));
         assert!(matches!(
             Args::parse_from(["shirei", "stop"]).cmd,
-            Cmd::Stop
+            Some(Cmd::Stop)
         ));
         assert!(matches!(
             Args::parse_from(["shirei", "restart"]).cmd,
-            Cmd::Restart
+            Some(Cmd::Restart)
         ));
         assert!(matches!(
             Args::parse_from(["shirei", "doctor"]).cmd,
-            Cmd::Doctor { .. }
+            Some(Cmd::Doctor { .. })
         ));
     }
 
     #[test]
-    fn parses_tui_passthrough_args() {
-        let args = Args::parse_from(["shirei", "tui", "--", "--discover-path", "/tmp/repo"]);
+    fn allows_running_without_subcommand() {
+        let args = Args::parse_from(["shirei"]);
+        assert!(args.cmd.is_none());
+    }
+
+    #[test]
+    fn parses_branch_command() {
+        let args = Args::parse_from(["shirei", "branch", "feature/demo", "--prompt", "hello"]);
         match args.cmd {
-            Cmd::Tui { args } => {
-                assert_eq!(args, vec!["--discover-path", "/tmp/repo"]);
+            Some(Cmd::Branch {
+                branch_name,
+                prompt,
+            }) => {
+                assert_eq!(branch_name.as_deref(), Some("feature/demo"));
+                assert_eq!(prompt.as_deref(), Some("hello"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branch_command_supports_picker_mode() {
+        let args = Args::parse_from(["shirei", "branch"]);
+        match args.cmd {
+            Some(Cmd::Branch {
+                branch_name,
+                prompt,
+            }) => {
+                assert!(branch_name.is_none());
+                assert!(prompt.is_none());
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1460,7 +1924,7 @@ mod tests {
     fn parses_setup_opencode_command() {
         let args = Args::parse_from(["shirei", "setup", "opencode", "--force"]);
         match args.cmd {
-            Cmd::Setup { target } => match target {
+            Some(Cmd::Setup { target }) => match target {
                 SetupCmd::Opencode { force, print } => {
                     assert!(force);
                     assert!(!print);
@@ -1495,6 +1959,7 @@ mod tests {
     fn missing_worktree_path_returns_friendly_error() {
         let job = JobRecord {
             job_id: "job_123".to_string(),
+            name: "demo".to_string(),
             cwd: "/definitely/missing".to_string(),
             worktree_path: Some("/definitely/missing".to_string()),
         };
@@ -1593,5 +2058,11 @@ mod tests {
     fn resolve_bind_from_base_url_supports_explicit_port() {
         let bind = resolve_bind_from_base_url("http://127.0.0.1:9393").expect("bind");
         assert_eq!(bind, "127.0.0.1:9393");
+    }
+
+    #[test]
+    fn tmux_session_name_is_stable_and_short() {
+        let name = tmux_session_name("feature/add picker", "job_1234567890");
+        assert_eq!(name, "shirei-feature-add-picker-12345678");
     }
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["shirei-daemon", "shirei-cli", "shirei-tui"]
+members = ["shirei-daemon", "shirei-cli"]
 
 [workspace.package]
 edition = "2021"

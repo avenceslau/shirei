@@ -54,6 +54,8 @@ struct Args {
     discover_path: Option<String>,
     #[arg(long, default_value_t = 2000)]
     refresh_ms: u64,
+    #[arg(long)]
+    focus_job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -397,6 +399,23 @@ impl ApiClient {
         .error_for_status()?;
         Ok(())
     }
+
+    async fn send_prompt(&self, job_id: &str, prompt: &str) -> Result<String> {
+        let v = self
+            .send_with_bootstrap(|| {
+                self.client
+                    .post(format!("{}/api/v0.1/jobs/{job_id}/prompt", self.base_url))
+                    .json(&serde_json::json!({"prompt": prompt}))
+            })
+            .await?
+            .error_for_status()?
+            .json::<serde_json::Value>()
+            .await?;
+        Ok(v.get("session_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string())
+    }
 }
 
 struct App {
@@ -415,6 +434,9 @@ struct App {
     project_picker_mode: bool,
     project_picker_query: String,
     project_picker_index: usize,
+    prompt_mode: bool,
+    prompt_buffer: String,
+    startup_focus_job_id: Option<String>,
     log_scroll: usize,
     status: String,
 }
@@ -442,6 +464,12 @@ impl App {
             }
         }
         self.jobs = all_jobs;
+        if let Some(focus_job_id) = self.startup_focus_job_id.as_ref() {
+            if self.jobs.iter().any(|j| j.job_id == *focus_job_id) {
+                self.selected_job_id = Some(focus_job_id.clone());
+                self.startup_focus_job_id = None;
+            }
+        }
         self.ensure_selected_job_visible();
         self.status = format!(
             "Loaded {} sessions across {} projects",
@@ -492,6 +520,53 @@ impl App {
         if cancelled {
             self.status = "New session cancelled".to_string();
         }
+    }
+
+    fn open_prompt_input(&mut self) {
+        if self.selected_job().is_none() {
+            self.status = "No session selected".to_string();
+            return;
+        }
+        self.prompt_mode = true;
+        self.prompt_buffer.clear();
+        self.status = "Compose prompt for selected session (Enter to send)".to_string();
+    }
+
+    fn close_prompt_input(&mut self, cancelled: bool) {
+        self.prompt_mode = false;
+        self.prompt_buffer.clear();
+        if cancelled {
+            self.status = "Prompt cancelled".to_string();
+        }
+    }
+
+    async fn submit_prompt_input(&mut self) {
+        let Some(job_id) = self.selected_job().map(|j| j.job_id.clone()) else {
+            self.close_prompt_input(true);
+            return;
+        };
+        let prompt = self.prompt_buffer.trim().to_string();
+        if prompt.is_empty() {
+            self.status = "Prompt cannot be empty".to_string();
+            return;
+        }
+
+        match self.api.send_prompt(&job_id, &prompt).await {
+            Ok(session_id) if session_id.is_empty() => {
+                self.status = format!("Prompt sent to {job_id}");
+            }
+            Ok(session_id) => {
+                self.status = format!("Prompt sent to {job_id} (session {session_id})");
+            }
+            Err(e) => {
+                self.status = format!("Prompt send failed: {e}");
+                return;
+            }
+        }
+        self.close_prompt_input(false);
+        self.refresh_jobs().await;
+        self.refresh_logs().await;
+        self.refresh_inputs().await;
     }
 
     async fn spawn_job_for_project(&mut self, project_id: &str) {
@@ -1207,6 +1282,9 @@ async fn main() -> Result<()> {
         project_picker_mode: false,
         project_picker_query: String::new(),
         project_picker_index: 0,
+        prompt_mode: false,
+        prompt_buffer: String::new(),
+        startup_focus_job_id: args.focus_job_id,
         log_scroll: 0,
         status: "?: help, /: search, v: filter, q: quit".to_string(),
     };
@@ -1272,7 +1350,28 @@ async fn main() -> Result<()> {
                 .constraints([Constraint::Length(46), Constraint::Min(24)])
                 .split(chunks[2]);
 
-            let job_items: Vec<ListItem> = job_visible
+            let jobs_viewport_height = body[0].height.saturating_sub(2) as usize;
+            let selected_visible_row = app.selected_job_id.as_ref().and_then(|selected_id| {
+                job_visible
+                    .iter()
+                    .position(|idx| app.jobs[*idx].job_id == *selected_id)
+            });
+            let (job_list_start, job_list_end) = list_window_bounds(
+                job_visible.len(),
+                selected_visible_row,
+                jobs_viewport_height,
+                2,
+            );
+            let jobs_has_up = job_list_start > 0;
+            let jobs_has_down = job_list_end < job_visible.len();
+            let jobs_title = match (jobs_has_up, jobs_has_down) {
+                (true, true) => "Sessions ↑ more ↓ more",
+                (true, false) => "Sessions ↑ more",
+                (false, true) => "Sessions ↓ more",
+                (false, false) => "Sessions",
+            };
+
+            let job_items: Vec<ListItem> = job_visible[job_list_start..job_list_end]
                 .iter()
                 .map(|idx| {
                     let j = &app.jobs[*idx];
@@ -1305,7 +1404,7 @@ async fn main() -> Result<()> {
             f.render_widget(
                 List::new(job_items).block(
                     Block::default()
-                        .title("Sessions")
+                        .title(jobs_title)
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(Color::Cyan)),
                 ),
@@ -1332,7 +1431,7 @@ async fn main() -> Result<()> {
             f.render_widget(logs, body[1]);
 
             let footer = Paragraph::new(format!(
-                "{} | keys: ? help, q quit, / search, v filter, r refresh, n new, t attach, e edit, y approve, c changes",
+                "{} | keys: ? help, q quit, / search, v filter, r refresh, n new, p prompt, t attach, e edit, y approve, c changes",
                 app.status
             ))
             .style(
@@ -1370,18 +1469,38 @@ async fn main() -> Result<()> {
                 f.render_widget(picker_search, sections[0]);
 
                 let visible = app.filtered_project_indices();
+                let picker_viewport_height = sections[1].height.saturating_sub(2) as usize;
+                let (picker_start, picker_end) = list_window_bounds(
+                    visible.len(),
+                    Some(app.project_picker_index),
+                    picker_viewport_height,
+                    2,
+                );
+                let picker_has_up = picker_start > 0;
+                let picker_has_down = picker_end < visible.len();
+                let picker_title = match (picker_has_up, picker_has_down) {
+                    (true, true) => "Projects ↑ more ↓ more",
+                    (true, false) => "Projects ↑ more",
+                    (false, true) => "Projects ↓ more",
+                    (false, false) => "Projects",
+                };
                 let picker_items = if visible.is_empty() {
                     vec![ListItem::new(Line::from(Span::styled(
                         "No matching projects",
                         Style::default().fg(Color::DarkGray),
                     )))]
                 } else {
-                    visible
+                    visible[picker_start..picker_end]
                         .iter()
                         .enumerate()
                         .map(|(row, idx)| {
                             let p = &app.projects[*idx];
-                            let marker = if row == app.project_picker_index { ">" } else { " " };
+                            let absolute_row = picker_start + row;
+                            let marker = if absolute_row == app.project_picker_index {
+                                ">"
+                            } else {
+                                " "
+                            };
                             ListItem::new(Line::from(vec![
                                 Span::styled(format!("{} ", marker), Style::default().fg(Color::Cyan)),
                                 Span::styled(
@@ -1398,7 +1517,7 @@ async fn main() -> Result<()> {
                 f.render_widget(
                     List::new(picker_items).block(
                         Block::default()
-                            .title("Projects")
+                            .title(picker_title)
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(Color::Cyan)),
                     ),
@@ -1410,6 +1529,24 @@ async fn main() -> Result<()> {
                         .style(Style::default().fg(Color::Gray)),
                     sections[2],
                 );
+            }
+
+            if app.prompt_mode {
+                let area = centered_rect(72, 22, f.area());
+                f.render_widget(Clear, area);
+                let prompt = Paragraph::new(if app.prompt_buffer.is_empty() {
+                    "(type prompt to send to selected session)".to_string()
+                } else {
+                    app.prompt_buffer.clone()
+                })
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title("Send Prompt (Enter send | Esc cancel)")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan)),
+                );
+                f.render_widget(prompt, area);
             }
 
             if app.help_mode {
@@ -1501,6 +1638,24 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                if app.prompt_mode {
+                    match k.code {
+                        KeyCode::Esc => app.close_prompt_input(true),
+                        KeyCode::Enter => {
+                            app.submit_prompt_input().await;
+                            last_refresh = Instant::now();
+                        }
+                        KeyCode::Backspace => {
+                            app.prompt_buffer.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            app.prompt_buffer.push(c);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match k.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('?') => {
@@ -1545,6 +1700,9 @@ async fn main() -> Result<()> {
                         } else {
                             app.open_project_picker();
                         }
+                    }
+                    KeyCode::Char('p') => {
+                        app.open_prompt_input();
                     }
                     KeyCode::Char('a') => {
                         if let Some(job_id) = app.selected_job().map(|j| j.job_id.clone()) {
@@ -1708,6 +1866,7 @@ fn action_help_lines() -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from("n  create new session (fuzzy-pick project)"),
+        Line::from("p  send prompt to selected session"),
         Line::from("t  attach OpenCode interactively (use /q there to detach)"),
         Line::from("e  open editor interactively in selected session"),
         Line::from("T  attach OpenCode in background"),
@@ -1773,6 +1932,43 @@ fn fuzzy_match(query: &str, haystack: &str) -> bool {
     false
 }
 
+fn list_window_bounds(
+    total_items: usize,
+    selected_index: Option<usize>,
+    viewport_height: usize,
+    margin: usize,
+) -> (usize, usize) {
+    if total_items == 0 {
+        return (0, 0);
+    }
+    if viewport_height == 0 || total_items <= viewport_height {
+        return (0, total_items);
+    }
+
+    let selected = selected_index
+        .unwrap_or(0)
+        .min(total_items.saturating_sub(1));
+    let mut start = 0_usize;
+    let mut end = viewport_height;
+
+    if selected + margin >= end {
+        start = (selected + margin + 1).saturating_sub(viewport_height);
+        end = start + viewport_height;
+    }
+
+    if selected < start + margin {
+        start = selected.saturating_sub(margin);
+        end = start + viewport_height;
+    }
+
+    if end > total_items {
+        end = total_items;
+        start = end.saturating_sub(viewport_height);
+    }
+
+    (start, end)
+}
+
 fn token_candidates(state_dir: Option<&str>) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     if let Some(dir) = state_dir {
@@ -1811,8 +2007,8 @@ fn read_default_token(state_dir: Option<&str>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_log_line, fuzzy_match, is_awaiting_review, is_waiting_input, token_candidates,
-        JobRow, LogKind,
+        classify_log_line, fuzzy_match, is_awaiting_review, is_waiting_input, list_window_bounds,
+        token_candidates, JobRow, LogKind,
     };
 
     #[test]
@@ -1896,5 +2092,14 @@ mod tests {
 
         let c = classify_log_line("[stdout] {\"type\":\"system\",\"content\":\"boot\"}");
         assert_eq!(c.kind, LogKind::System);
+    }
+
+    #[test]
+    fn list_window_keeps_selection_in_view() {
+        let (start, end) = list_window_bounds(30, Some(12), 8, 2);
+        assert_eq!((start, end), (7, 15));
+
+        let (start, end) = list_window_bounds(30, Some(29), 8, 2);
+        assert_eq!((start, end), (22, 30));
     }
 }

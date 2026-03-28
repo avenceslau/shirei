@@ -37,8 +37,26 @@ pub struct JobRow {
     pub attach_host: Option<String>,
     pub attach_port: Option<i64>,
     pub attach_url: Option<String>,
+    pub session_id: Option<String>,
     pub ended_at: Option<String>,
     pub exit_code: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct ActiveSessionRow {
+    pub job_id: String,
+    pub project_id: String,
+    pub name: String,
+    pub status: String,
+    pub needs_attention: i64,
+    pub runner: String,
+    pub cwd: String,
+    pub worktree_name: Option<String>,
+    pub worktree_path: Option<String>,
+    pub session_id: Option<String>,
+    pub ended_at: Option<String>,
+    pub exit_code: Option<i64>,
+    pub project_root: String,
 }
 
 pub async fn upsert_project(
@@ -140,7 +158,7 @@ pub async fn get_job(pool: &SqlitePool, job_id: &str) -> Result<JobRow> {
                origin_type, origin_repo_key, origin_pr_number, origin_command_id,
                worktree_name, worktree_path,
                attach_pid, attach_host, attach_port, attach_url,
-               ended_at, exit_code
+               session_id, ended_at, exit_code
         FROM jobs WHERE job_id=?1
         "#,
     )
@@ -157,11 +175,61 @@ pub async fn list_jobs(pool: &SqlitePool, project_id: &str) -> Result<Vec<JobRow
                origin_type, origin_repo_key, origin_pr_number, origin_command_id,
                worktree_name, worktree_path,
                attach_pid, attach_host, attach_port, attach_url,
-               ended_at, exit_code
+               session_id, ended_at, exit_code
         FROM jobs WHERE project_id=?1 ORDER BY updated_at DESC
         "#,
     )
     .bind(project_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn latest_job_by_worktree_name(
+    pool: &SqlitePool,
+    project_id: &str,
+    worktree_name: &str,
+) -> Result<Option<JobRow>> {
+    Ok(sqlx::query_as::<_, JobRow>(
+        r#"
+        SELECT job_id, project_id, name, status, needs_attention, runner, cmd, argv_json, cwd,
+               pid, log_path, prompt, acknowledged_at,
+               origin_type, origin_repo_key, origin_pr_number, origin_command_id,
+               worktree_name, worktree_path,
+               attach_pid, attach_host, attach_port, attach_url,
+               session_id, ended_at, exit_code
+        FROM jobs
+        WHERE project_id=?1 AND worktree_name=?2
+        ORDER BY updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(project_id)
+    .bind(worktree_name)
+    .fetch_optional(pool)
+    .await?)
+}
+
+pub async fn list_active_sessions(pool: &SqlitePool) -> Result<Vec<ActiveSessionRow>> {
+    Ok(sqlx::query_as::<_, ActiveSessionRow>(
+        r#"
+        SELECT j.job_id, j.project_id, j.name, j.status, j.needs_attention, j.runner,
+               j.cwd, j.worktree_name, j.worktree_path, j.session_id,
+               j.ended_at, j.exit_code,
+               p.root_path AS project_root
+        FROM jobs j
+        INNER JOIN projects p ON p.project_id = j.project_id
+        WHERE (j.worktree_path IS NOT NULL OR j.cwd != '')
+          AND j.status IN ('RUNNING', 'AWAITING_REVIEW', 'DONE_UNREAD', 'ERROR')
+        ORDER BY j.needs_attention DESC,
+                 CASE
+                   WHEN j.status = 'AWAITING_REVIEW' THEN 0
+                   WHEN j.status = 'RUNNING' THEN 1
+                   WHEN j.status = 'DONE_UNREAD' THEN 2
+                   ELSE 3
+                 END,
+                 j.updated_at DESC
+        "#,
+    )
     .fetch_all(pool)
     .await?)
 }
@@ -176,10 +244,11 @@ pub async fn job_status(pool: &SqlitePool, job_id: &str) -> Result<Option<String
 }
 
 pub async fn list_running_jobs(pool: &SqlitePool) -> Result<Vec<(String, Option<i64>)>> {
-    let rows =
-        sqlx::query("SELECT job_id, pid FROM jobs WHERE status='RUNNING' ORDER BY updated_at ASC")
-            .fetch_all(pool)
-            .await?;
+    let rows = sqlx::query(
+        "SELECT job_id, pid FROM jobs WHERE status='RUNNING' AND runner != 'interactive' ORDER BY updated_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -189,6 +258,17 @@ pub async fn list_running_jobs(pool: &SqlitePool) -> Result<Vec<(String, Option<
             )
         })
         .collect())
+}
+
+pub async fn set_job_session_id(pool: &SqlitePool, job_id: &str, session_id: &str) -> Result<()> {
+    let now = now_rfc3339();
+    sqlx::query("UPDATE jobs SET session_id=?1, updated_at=?2 WHERE job_id=?3")
+        .bind(session_id)
+        .bind(&now)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn set_job_prompt(pool: &SqlitePool, job_id: &str, prompt: &str) -> Result<()> {
@@ -364,7 +444,7 @@ pub async fn latest_pr_job(
                origin_type, origin_repo_key, origin_pr_number, origin_command_id,
                worktree_name, worktree_path,
                attach_pid, attach_host, attach_port, attach_url,
-               ended_at, exit_code
+               session_id, ended_at, exit_code
         FROM jobs
         WHERE origin_repo_key=?1 AND origin_pr_number=?2
         ORDER BY updated_at DESC
