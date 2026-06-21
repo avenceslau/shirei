@@ -1,39 +1,41 @@
 # AGENTS
 
-This repository uses Shirei sessions to execute implementation tasks in a trackable way.
+shirei is a single-crate Rust CLI that drives `tmux`, `git`, and `fzf`.
+No daemon, no database, no network. State is one JSON file under
+`~/.local/share/shirei/`.
 
-## Default Agent Loop
+## Layout
 
-1. Confirm daemon health.
-2. Ensure repo is discovered as a project.
-3. Spawn a named job with a precise prompt.
-4. Poll jobs and inspect logs.
-5. Validate with `cargo fmt` and `cargo test`.
-6. Acknowledge completed jobs; kill and retry stalled jobs.
+- `src/main.rs` — clap dispatch + the verbs (`pick`, `branch`, `recent`,
+  `sessions`, `worktrees [prune]`)
+- `src/picker.rs` — builds the sectioned source list, runs fzf, returns
+  the chosen row index
+- `src/tmux.rs` — `list-sessions`, `has-session`, `new-session -d`,
+  `switch-client` / `attach-session`, session-name sanitization
+- `src/git.rs` — `repo_root`, `list_branches`, `create_worktree`
+  (shells out to `git`)
+- `src/state.rs` — JSON state load/save, MRU touch, worktree dedup,
+  dead-worktree prune
+- `src/config.rs` — TOML config load + tilde expansion
 
-## Commands
+## Conventions
+
+- All external IO goes through `std::process::Command`; no async, no
+  reqwest, no sqlite.
+- Tmux session names go through `tmux::sanitize_name` (strips `.`, `:`,
+  `/`, etc.).
+- The picker source order is the single source of truth for ordering;
+  do not duplicate it elsewhere.
+- Don't add daemon-style features. If you reach for tokio or axum here,
+  stop and reconsider.
+
+## Tests
 
 ```bash
-TOKEN="$(cat ~/.local/share/shirei/token)"
-shirei --token "$TOKEN" health
-shirei --token "$TOKEN" project-discover .
-PROJECT_ID="$(shirei --token "$TOKEN" projects | jq -r '.projects[0].project_id')"
-shirei --token "$TOKEN" spawn "$PROJECT_ID" "task-name" "task prompt"
-shirei --token "$TOKEN" jobs "$PROJECT_ID"
-shirei --token "$TOKEN" jobs <job-id> attach
-shirei --token "$TOKEN" logs <job-id> --tail-lines 300
+cargo fmt
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
-## Prompt Quality Rules
-
-- Be explicit about scope and files.
-- Include acceptance criteria and test commands.
-- Prefer minimal, production-safe changes.
-- Ask for a final change summary with paths.
-
-## Session States (for TUI/ops)
-
-- `RUNNING`: active execution
-- waiting input: running but attention needed
-- awaiting review: finished/error and attention needed
-- completed/merged sessions should be hidden from actionable lists
+`cargo test` only covers `sanitize_name`. Interactive flows (picker,
+branch picker) are smoke-tested by hand via `prefix + f` in tmux.

@@ -1,152 +1,90 @@
-# Shirei
+# shirei
 
-Local daemon + CLI to supervise OpenCode sessions in isolated git worktrees.
+A tmux session manager with worktree-aware dir tracking. Replaces a
+hand-rolled `tmux-sessionizer` script with:
 
-## Quick start
+- live tmux sessions surfaced at the top of the picker, MRU-sorted
+- a persisted history of recently-opened dirs
+- one-shot worktree creation that registers the worktree in the picker
+- fzf as the picker UI
 
-Install bundled binaries from crates.io:
+Requires `tmux`, `git`, and `fzf` on the PATH.
 
-```bash
-cargo install shirei
-```
-
-This installs `shirei` and `shirei-daemon`.
-
-The CLI-first flow expects `fzf` and `tmux` to be available on your machine.
-
-Run `shirei` with no subcommand to open the CLI session picker:
-
-- loads active Shirei sessions into `fzf`,
-- shows which sessions need `INPUT` or `REVIEW`,
-- opens the selected session inside `tmux` and attaches OpenCode there.
+## Install
 
 ```bash
-# required for GitHub provider (unless using mock):
-export SHIREI_GITHUB_TOKEN=...
-# optional: for GitLab
-export SHIREI_GITLAB_TOKEN=...
-export SHIREI_GITLAB_HOST=gitlab.com
-
-cargo run -p shirei-daemon
+git clone https://github.com/avenceslau/shirei
+cd shirei
+cargo install --path .
 ```
 
-In another terminal:
+This installs a single `shirei` binary into `~/.cargo/bin`.
 
-```bash
-TOKEN=$(cat ~/.local/share/shirei/token)
-cargo run -p shirei -- --token "$TOKEN" health
-cargo run -p shirei -- --token "$TOKEN" doctor
-cargo run -p shirei -- --token "$TOKEN" doctor --project-id <project-id>
-cargo run -p shirei -- --token "$TOKEN" project-discover .
+## tmux integration
 
-# list active sessions
-cargo run -p shirei -- --token "$TOKEN" sessions
-# attach opencode to an existing job session
-cargo run -p shirei -- --token "$TOKEN" jobs <job-id> attach
-# create a fresh branch worktree or attach an existing branch
-cargo run -p shirei -- --token "$TOKEN" branch feature/my-change
-# open an fzf branch picker (includes local + remote branches)
-cargo run -p shirei -- --token "$TOKEN" branch
-
-# inspect or stop persistent attach backend
-cargo run -p shirei -- --token "$TOKEN" jobs <job-id> attach-status
-cargo run -p shirei -- --token "$TOKEN" jobs <job-id> attach-stop
-
-# install global OpenCode slash commands
-cargo run -p shirei -- setup opencode
+```tmux
+bind-key -r f run-shell "tmux neww shirei"
 ```
 
-`doctor` checks daemon reachability, token presence, provider readiness (`SHIREI_GITHUB_TOKEN` / GitLab vars), and project remote suitability for auto PR/watch.
+`prefix + f` opens the picker in a new tmux window.
 
-## CLI config
+## Commands
 
-Optional config path: `~/.config/shirei/config.toml` (or override with `SHIREI_CONFIG`).
+- `shirei` — open the picker (same as `shirei pick`)
+- `shirei branch [<name>] [-b/--base <ref>]` — create or attach a git
+  worktree for `<name>`, register it, and open a tmux session inside it.
+  With no argument, opens an fzf picker over local + remote branches. When
+  `<name>` is a new branch, `--base` sets its start-point; if omitted, an
+  fzf picker prompts for the base branch.
+- `shirei recent` — print recent dirs
+- `shirei sessions` — print live tmux sessions
+- `shirei worktrees` — list tracked worktrees
+- `shirei worktrees scan` — walk configured roots and known repos and
+  rebuild the worktree registry from `git worktree list`. Run this to
+  pick up worktrees created outside shirei.
+- `shirei worktrees prune` — drop tracked worktrees whose path no longer exists
 
-```toml
-[editor]
-command = "code --reuse-window {path}"
-```
+## Picker order
 
-`{path}` is replaced with the job worktree path (or job cwd when no worktree is attached).
+From top to bottom:
 
-## Polling-first PR/MR watching
+1. `TMUX` — live tmux sessions, sorted by `session_activity` descending.
+   Selecting one runs `switch-client` (inside tmux) or `attach-session`.
+2. `RECENT` — directories opened recently via shirei, MRU-sorted, capped
+   to `recent_cap` entries.
+3. `WORKTREE` — worktrees shirei has created.
+4. `ROOT` — directories discovered under configured roots (default
+   `~/projects/*`, `~`, `~/.config`).
 
-Create a watch:
-
-- GitHub: `github:owner/repo`
-- GitLab: `gitlab:group/subgroup/project`
-
-```bash
-cargo run -p shirei -- --token "$TOKEN" watch-start github:owner/repo 123 --retention-days 7
-```
-
-Commands recognized in PR/MR comments:
-
-- `/shirei fix <description>`
-- `/shirei stop`
-- `/shirei respond`
-- `/shirei approve`
-- `/shirei request-changes <feedback>`
-
-Manual jobs now enter a review loop when the agent run exits: Shirei marks them `AWAITING_REVIEW`, auto-creates a draft PR/MR when it can (and attaches a watch), and waits for `/shirei approve` or `/shirei request-changes ...`.
-
-When a background session finishes or starts waiting for user input, the daemon sends a desktop notification.
-
-Open a job branch/worktree in your configured editor:
-
-```bash
-shirei --token "$TOKEN" jobs <job-id> edit
-```
-
-## Session flow
-
-- `shirei` opens an `fzf` picker for active sessions.
-- `shirei branch` opens an `fzf` picker of local and remote branches, creates or reuses the matching worktree, and opens OpenCode in tmux.
-- `shirei branch <branch-name>` attaches that existing local/remote branch when it exists, or creates a new branch worktree when it does not.
-- Session rows are badged as `RUNNING`, `INPUT`, `REVIEW`, or `ERROR`.
-- `shirei jobs <job-id> attach` still attaches directly when you already know the session id.
-
-## OpenCode setup
-
-Install global OpenCode command files:
-
-```bash
-shirei setup opencode
-```
-
-This writes files to `~/.config/opencode/commands` for:
-
-- `/shirei-attach` (runs `shirei jobs <job-id> attach`)
-- `/shirei-edit` (runs `shirei jobs <job-id> edit`)
-
-It also installs a global skill at `~/.config/opencode/skills/shirei-workflow/SKILL.md` so OpenCode agents can load Shirei-specific operational guidance.
-
-`shirei setup opencode` also installs a primary OpenCode agent at `~/.config/opencode/agent/shirei.md`.
-Shirei job sessions run `opencode` with `--agent shirei` by default.
+A path covered by an earlier section is hidden from later sections. If a
+tmux session already exists whose name matches the basename of a dir, the
+dir row is hidden in favour of the session row.
 
 ## Configuration
 
-Shirei daemon loads config from `~/.local/share/shirei/config.json` by default (or from
-`$SHIREI_STATE_DIR/config.json` when `SHIREI_STATE_DIR` is set).
+Optional config file at `~/.config/shirei/config.toml`:
 
-Current schema:
-
-```json
-{
-  "commands": {
-    "opencode": ["opencode"],
-    "bootstrap": ["bash", "-lc", "pnpm install"]
-  }
-}
+```toml
+roots = ["~/projects/*", "~", "~/.config"]
+recent_cap = 20
+worktree_root = "~/.local/share/shirei/worktrees"
+worktree_exclude_prefixes = ["~/Library/Caches"]
 ```
 
-- `commands.opencode` may be a string (`"opencode"`) or an argv array.
-- If omitted, default is `opencode`.
-- `commands.bootstrap` is optional and runs inside new branch worktrees before tmux/OpenCode opens.
-- `commands.bootstrap` may also be a string or argv array; use an argv array like `["bash", "-lc", "pnpm install"]` for shell pipelines.
-- `commands.bootstrap` supports `{path}` placeholders, although it already runs with the worktree as its current directory.
-- `SHIREI_OPENCODE_CMD` still works and overrides config for compatibility.
+`worktree_exclude_prefixes` filters paths discovered by `shirei worktrees scan`
+(default excludes tenet's cache worktrees on macOS).
 
-## Testing (mock opencode)
+Set `SHIREI_CONFIG` to override the config path. Set `SHIREI_STATE_DIR` to
+override the state dir (defaults to `$XDG_DATA_HOME/shirei` or
+`~/.local/share/shirei`). Config defaults to `$XDG_CONFIG_HOME/shirei/config.toml`
+or `~/.config/shirei/config.toml`.
 
-Tests may set `SHIREI_OPENCODE_CMD` or write `config.json` in the temp state dir.
+## State
+
+State lives in `~/.local/share/shirei/state.json` and persists:
+
+- `recent` — recent dirs (path + last-used timestamp)
+- `worktrees` — worktrees created by `shirei branch`
+
+Worktrees are created under `worktree_root` at
+`<worktree_root>/<repo-slug>/<branch-slug>`.

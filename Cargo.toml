@@ -1,7 +1,21 @@
-[workspace]
-resolver = "2"
-members = ["shirei-daemon", "shirei-cli"]
-
-[workspace.package]
+[package]
+name = "shirei"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.93"
+description = "tmux session manager with worktree-aware dir tracking"
+license = "MIT"
+repository = "https://github.com/avenceslau/shirei"
+
+[[bin]]
+name = "shirei"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "5"
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
