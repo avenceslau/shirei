@@ -1,5 +1,0 @@
-ALTER TABLE jobs ADD COLUMN attach_pid INTEGER;
-ALTER TABLE jobs ADD COLUMN attach_host TEXT;
-ALTER TABLE jobs ADD COLUMN attach_port INTEGER;
-ALTER TABLE jobs ADD COLUMN attach_url TEXT;
-ALTER TABLE jobs ADD COLUMN attach_started_at TEXT;
