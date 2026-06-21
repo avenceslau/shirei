@@ -13,6 +13,8 @@ pub struct Config {
     pub worktree_root: String,
     #[serde(default = "default_worktree_exclude_prefixes")]
     pub worktree_exclude_prefixes: Vec<String>,
+    #[serde(default = "default_run_install_on_create")]
+    pub run_install_on_create: bool,
 }
 
 impl Default for Config {
@@ -22,6 +24,7 @@ impl Default for Config {
             recent_cap: default_recent_cap(),
             worktree_root: default_worktree_root(),
             worktree_exclude_prefixes: default_worktree_exclude_prefixes(),
+            run_install_on_create: default_run_install_on_create(),
         }
     }
 }
@@ -40,6 +43,10 @@ fn default_worktree_root() -> String {
 
 fn default_worktree_exclude_prefixes() -> Vec<String> {
     vec!["~/Library/Caches".into()]
+}
+
+fn default_run_install_on_create() -> bool {
+    true
 }
 
 pub fn config_path() -> Result<PathBuf> {

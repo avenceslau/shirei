@@ -1,5 +1,6 @@
 mod config;
 mod git;
+mod install;
 mod picker;
 mod state;
 mod tmux;
@@ -93,7 +94,7 @@ fn apply_selection(row: &Row, cfg: &Config, state: &mut State) -> Result<()> {
             tmux::switch_or_attach(name)?;
         }
         Target::OpenDir { path, name_hint } => {
-            open_in_tmux(path, name_hint)?;
+            open_in_tmux(path, name_hint, None)?;
             state.touch_recent(path, cfg.recent_cap);
             state::save(state)?;
         }
@@ -101,10 +102,13 @@ fn apply_selection(row: &Row, cfg: &Config, state: &mut State) -> Result<()> {
     Ok(())
 }
 
-fn open_in_tmux(path: &Path, name_hint: &str) -> Result<()> {
+fn open_in_tmux(path: &Path, name_hint: &str, install_cmd: Option<&str>) -> Result<()> {
     let session = tmux::sanitize_name(name_hint);
     if !tmux::has_session(&session) {
         tmux::new_detached(&session, path)?;
+        if let Some(cmd) = install_cmd {
+            tmux::run_in_new_window(&session, "install", path, cmd)?;
+        }
     }
     tmux::switch_or_attach(&session)
 }
@@ -173,7 +177,14 @@ fn run_branch(name: Option<&str>, base: Option<&str>) -> Result<()> {
     let worktree_root = expand_tilde(&cfg.worktree_root);
     let target = worktree_root.join(&repo_slug).join(&branch_slug);
 
-    git::create_worktree(&repo, &selected, &target, start_point.as_deref())?;
+    let outcome = git::create_worktree(&repo, &selected, &target, start_point.as_deref())?;
+
+    let install_cmd =
+        if cfg.run_install_on_create && matches!(outcome, git::WorktreeOutcome::Created) {
+            install::detect(&target)
+        } else {
+            None
+        };
 
     let now = OffsetDateTime::now_utc();
     state.add_worktree(Worktree {
@@ -186,7 +197,7 @@ fn run_branch(name: Option<&str>, base: Option<&str>) -> Result<()> {
     state::save(&state)?;
 
     let name_hint = format!("{repo_slug}-{branch_slug}");
-    open_in_tmux(&target, &name_hint)
+    open_in_tmux(&target, &name_hint, install_cmd.as_deref())
 }
 
 fn pick_branch(prompt: &str, branches: &[git::Branch]) -> Result<Option<git::Branch>> {

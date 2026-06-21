@@ -113,6 +113,28 @@ pub fn new_detached(name: &str, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Run a command in a new detached window of an existing session.
+///
+/// The window stays open after the command exits (via `exec $SHELL`) so its
+/// output and exit status remain inspectable.
+pub fn run_in_new_window(session: &str, window_name: &str, cwd: &Path, cmd: &str) -> Result<()> {
+    let wrapped =
+        format!("{cmd}; printf '\\n[shirei] install exited %s\\n' \"$?\"; exec \"$SHELL\"");
+    let status = Command::new("tmux")
+        .args(["new-window", "-d", "-t", session, "-n", window_name, "-c"])
+        .arg(cwd)
+        .args(["sh", "-lc", &wrapped])
+        .status()
+        .context("failed to spawn tmux new-window")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "tmux new-window exited with status {}",
+            status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(())
+}
+
 pub fn switch_or_attach(name: &str) -> Result<()> {
     let action = if std::env::var_os("TMUX").is_some() {
         "switch-client"

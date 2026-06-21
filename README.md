@@ -35,7 +35,9 @@ bind-key -r f run-shell "tmux neww shirei"
   worktree for `<name>`, register it, and open a tmux session inside it.
   With no argument, opens an fzf picker over local + remote branches. When
   `<name>` is a new branch, `--base` sets its start-point; if omitted, an
-  fzf picker prompts for the base branch.
+  fzf picker prompts for the base branch. When a worktree is newly created,
+  shirei runs a project install command in a background `install` tmux
+  window (see below).
 - `shirei recent` — print recent dirs
 - `shirei sessions` — print live tmux sessions
 - `shirei worktrees` — list tracked worktrees
@@ -69,10 +71,24 @@ roots = ["~/projects/*", "~", "~/.config"]
 recent_cap = 20
 worktree_root = "~/.local/share/shirei/worktrees"
 worktree_exclude_prefixes = ["~/Library/Caches"]
+run_install_on_create = true
 ```
 
 `worktree_exclude_prefixes` filters paths discovered by `shirei worktrees scan`
 (default excludes tenet's cache worktrees on macOS).
+
+`run_install_on_create` (default `true`) runs a project install command when a
+worktree is freshly created. shirei detects the project type at the worktree
+root and runs the first match, in priority order:
+
+1. `Makefile` with an `install:` target → `make install`
+2. `package.json` → `<pm> install`, where `<pm>` is chosen from the lockfile
+   (`bun.lockb`/`bun.lock` → `bun`, `pnpm-lock.yaml` → `pnpm`,
+   `yarn.lock` → `yarn`, `package-lock.json` → `npm`, otherwise `npm`)
+3. `Cargo.toml` → `cargo build`
+
+The command runs in a detached `install` tmux window so the session opens
+immediately; switch to that window to watch progress or read the exit status.
 
 Set `SHIREI_CONFIG` to override the config path. Set `SHIREI_STATE_DIR` to
 override the state dir (defaults to `$XDG_DATA_HOME/shirei` or
