@@ -1,23 +1,23 @@
 # shirei
 
-`shirei` is a small tmux session switcher for people who jump between many
-projects and git worktrees.
+`shirei` is a small terminal session switcher for people who jump between many
+projects and git worktrees. It supports tmux sessions and Herdr workspaces.
 
 It gives you one `fzf` picker for:
 
-- live tmux sessions
+- live sessions from the configured backend
 - recently opened directories
 - git worktrees created or discovered by shirei
 - project roots under your configured search paths
 
-Selecting a row switches to the existing tmux session when one exists, or starts
-a new session in that directory.
+Selecting a row switches to the existing session when one exists, or starts a
+new session in that directory.
 
 ## Requirements
 
 `shirei` shells out to existing tools. Install these first:
 
-- `tmux`
+- `tmux` or `herdr`
 - `git`
 - `fzf`
 
@@ -48,6 +48,10 @@ bind-key -r f run-shell "tmux neww shirei"
 ```
 
 Then press `prefix + f` to open the picker in a new tmux window.
+
+With Herdr, set `backend = "herdr"` and run `shirei` from a Herdr pane or a
+normal shell. Shirei maps projects to Herdr workspaces. From a normal shell it
+starts the Herdr server when needed and attaches after selecting a workspace.
 
 ## Common Workflows
 
@@ -93,10 +97,11 @@ shirei worktrees prune
 | --- | --- |
 | `shirei` | Open the picker. Same as `shirei pick`. |
 | `shirei pick` | Open the picker explicitly. |
-| `shirei branch [name]` | Create or attach to a git worktree, register it, and open a tmux session there. |
+| `shirei branch [name]` | Create or attach to a git worktree, register it, and open a session there. |
 | `shirei branch [name] --base <ref>` | Use `<ref>` as the start point for a new branch. |
 | `shirei recent` | Print recent directories. |
-| `shirei sessions` | Print live tmux sessions. |
+| `shirei sessions` | Print live sessions from the configured backend. |
+| `shirei kill` | Select backend sessions or workspaces to close. |
 | `shirei worktrees` | List tracked worktrees. |
 | `shirei worktrees scan` | Rebuild tracked worktrees from `git worktree list`. |
 | `shirei worktrees prune` | Drop tracked worktrees whose paths no longer exist. |
@@ -105,12 +110,12 @@ shirei worktrees prune
 
 Rows are grouped in this order:
 
-1. `TMUX`: live tmux sessions, sorted by recent activity.
+1. `SESSION`: live tmux sessions or Herdr workspaces. Tmux sessions are sorted by recent activity; Herdr preserves workspace order.
 2. `RECENT`: directories opened recently through shirei.
 3. `WORKTREE`: tracked git worktrees.
 4. `ROOT`: directories discovered under configured roots.
 
-Earlier groups win. If a live tmux session already represents a directory, that
+Earlier groups win. If a live session already represents a directory, that
 directory is hidden from later groups so you do not see duplicate entries.
 
 ## Configuration
@@ -124,6 +129,7 @@ Configuration is optional. By default, shirei reads:
 Example:
 
 ```toml
+backend = "tmux"
 roots = ["~/projects/*", "~", "~/.config"]
 recent_cap = 20
 worktree_root = "~/.local/share/shirei/worktrees"
@@ -135,6 +141,7 @@ Settings:
 
 | Setting | Description |
 | --- | --- |
+| `backend` | Session backend: `"tmux"` (default) or `"herdr"`. |
 | `roots` | Directory globs shown in the `ROOT` picker section. |
 | `recent_cap` | Maximum number of recent directories to keep. |
 | `worktree_root` | Parent directory for worktrees created by `shirei branch`. |
@@ -151,7 +158,8 @@ Override paths with environment variables:
 ## Worktree Setup Commands
 
 When `run_install_on_create` is `true`, a new worktree gets a detached tmux
-window named `install`. shirei runs the first matching command:
+window or an unfocused Herdr tab named `install`. shirei runs the first matching
+command:
 
 1. `Makefile` with an `install:` target: `make install`
 2. `package.json`: package-manager-specific `install`

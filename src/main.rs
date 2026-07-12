@@ -1,7 +1,9 @@
 mod config;
 mod git;
+mod herdr;
 mod install;
 mod picker;
+mod session;
 mod state;
 mod tmux;
 
@@ -12,13 +14,14 @@ use time::OffsetDateTime;
 
 use crate::config::{expand_tilde, Config};
 use crate::picker::{Row, Target};
+use crate::session::Backend;
 use crate::state::{State, Worktree};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "shirei",
     version,
-    about = "tmux session manager with worktree-aware dir tracking"
+    about = "terminal session manager with worktree-aware dir tracking"
 )]
 struct Args {
     #[command(subcommand)]
@@ -29,7 +32,7 @@ struct Args {
 enum Cmd {
     /// Open the picker (default when no subcommand is given).
     Pick,
-    /// Create or attach a git worktree for a branch and open it in tmux.
+    /// Create or attach a git worktree for a branch and open a session.
     Branch {
         /// Branch name. If omitted, opens an fzf picker over local + remote branches.
         name: Option<String>,
@@ -39,9 +42,9 @@ enum Cmd {
     },
     /// Print recent directories.
     Recent,
-    /// Print live tmux sessions known to the server.
+    /// Print live sessions known to the configured backend.
     Sessions,
-    /// Select tmux sessions to close.
+    /// Select sessions to close.
     Kill,
     /// Manage tracked worktrees.
     Worktrees {
@@ -76,8 +79,9 @@ fn main() -> Result<()> {
 
 fn run_picker() -> Result<()> {
     let cfg = config::load()?;
+    let backend = Backend::from(cfg.backend);
     let mut state = state::load()?;
-    let rows = picker::build_rows(&state, &cfg)?;
+    let rows = picker::build_rows(&state, &cfg, backend)?;
     if rows.is_empty() {
         eprintln!("Nothing to show. Try `shirei branch <name>` to create a worktree session.");
         return Ok(());
@@ -85,16 +89,16 @@ fn run_picker() -> Result<()> {
     let Some(idx) = picker::pick(&rows)? else {
         return Ok(());
     };
-    apply_selection(&rows[idx], &cfg, &mut state)
+    apply_selection(&rows[idx], &cfg, backend, &mut state)
 }
 
-fn apply_selection(row: &Row, cfg: &Config, state: &mut State) -> Result<()> {
+fn apply_selection(row: &Row, cfg: &Config, backend: Backend, state: &mut State) -> Result<()> {
     match &row.target {
-        Target::AttachSession(name) => {
-            tmux::switch_or_attach(name)?;
+        Target::ActivateSession(id) => {
+            backend.activate(id)?;
         }
         Target::OpenDir { path, name_hint } => {
-            open_in_tmux(path, name_hint, None)?;
+            open_session(backend, path, name_hint, None)?;
             state.touch_recent(path, cfg.recent_cap);
             state::save(state)?;
         }
@@ -102,19 +106,35 @@ fn apply_selection(row: &Row, cfg: &Config, state: &mut State) -> Result<()> {
     Ok(())
 }
 
-fn open_in_tmux(path: &Path, name_hint: &str, install_cmd: Option<&str>) -> Result<()> {
-    let session = tmux::sanitize_name(name_hint);
-    if !tmux::has_session(&session) {
-        tmux::new_detached(&session, path)?;
-        if let Some(cmd) = install_cmd {
-            tmux::run_in_new_window(&session, "install", path, cmd)?;
+fn open_session(
+    backend: Backend,
+    path: &Path,
+    name_hint: &str,
+    install_cmd: Option<&str>,
+) -> Result<()> {
+    let name = session::sanitize_name(name_hint);
+    let existing = backend.list()?.into_iter().find(|session| {
+        if backend.names_are_unique() {
+            session.name == name
+        } else {
+            Path::new(&session.path) == path
         }
-    }
-    tmux::switch_or_attach(&session)
+    });
+    let id = if let Some(session) = existing {
+        session.id
+    } else {
+        let id = backend.create(&name, path)?;
+        if let Some(cmd) = install_cmd {
+            backend.run_setup(&id, path, cmd)?;
+        }
+        id
+    };
+    backend.activate(&id)
 }
 
 fn run_branch(name: Option<&str>, base: Option<&str>) -> Result<()> {
     let cfg = config::load()?;
+    let backend = Backend::from(cfg.backend);
     let mut state = state::load()?;
 
     let cwd = std::env::current_dir().context("could not read cwd")?;
@@ -167,13 +187,13 @@ fn run_branch(name: Option<&str>, base: Option<&str>) -> Result<()> {
         None
     };
 
-    let repo_slug = tmux::sanitize_name(
+    let repo_slug = session::sanitize_name(
         &repo
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "repo".to_string()),
     );
-    let branch_slug = tmux::sanitize_name(&selected.local_name);
+    let branch_slug = session::sanitize_name(&selected.local_name);
     let worktree_root = expand_tilde(&cfg.worktree_root);
     let target = worktree_root.join(&repo_slug).join(&branch_slug);
 
@@ -197,7 +217,7 @@ fn run_branch(name: Option<&str>, base: Option<&str>) -> Result<()> {
     state::save(&state)?;
 
     let name_hint = format!("{repo_slug}-{branch_slug}");
-    open_in_tmux(&target, &name_hint, install_cmd.as_deref())
+    open_session(backend, &target, &name_hint, install_cmd.as_deref())
 }
 
 fn pick_branch(prompt: &str, branches: &[git::Branch]) -> Result<Option<git::Branch>> {
@@ -262,16 +282,21 @@ fn run_recent() -> Result<()> {
 }
 
 fn run_sessions() -> Result<()> {
-    let sessions = tmux::list_sessions()?;
+    let cfg = config::load()?;
+    let backend = Backend::from(cfg.backend);
+    let sessions = backend.list()?;
     if sessions.is_empty() {
-        println!("(no tmux sessions)");
+        println!("(no {} sessions)", backend.name());
         return Ok(());
     }
     for s in sessions {
         let attached = if s.attached { "*" } else { " " };
         println!(
-            "{attached} {:<24} windows={:<3} {}",
-            s.name, s.windows, s.path
+            "{attached} {:<24} {}={:<3} {}",
+            s.name,
+            backend.unit_name(),
+            s.units,
+            s.path
         );
     }
     Ok(())
@@ -281,17 +306,23 @@ fn run_kill() -> Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let current = tmux::current_session_name()?;
-    let sessions: Vec<_> = tmux::list_sessions()?
+    let cfg = config::load()?;
+    let backend = Backend::from(cfg.backend);
+    let current = backend.current_id()?;
+    let sessions: Vec<_> = backend
+        .list()?
         .into_iter()
-        .filter(|s| current.as_deref() != Some(s.name.as_str()))
+        .filter(|s| current.as_deref() != Some(s.id.as_str()))
         .collect();
 
     if sessions.is_empty() {
         if current.is_some() {
-            println!("(no tmux sessions to kill; current session is excluded)");
+            println!(
+                "(no {} sessions to kill; current session is excluded)",
+                backend.name()
+            );
         } else {
-            println!("(no tmux sessions)");
+            println!("(no {} sessions)", backend.name());
         }
         return Ok(());
     }
@@ -326,8 +357,11 @@ fn run_kill() -> Result<()> {
             let attached = if s.attached { "ATTACHED" } else { "" };
             writeln!(
                 stdin,
-                "{idx}\t{attached:<8} windows={:<3} {}  \x1b[90m{}\x1b[0m",
-                s.windows, s.name, s.path
+                "{idx}\t{attached:<8} {}={:<3} {}  \x1b[90m{}\x1b[0m",
+                backend.unit_name(),
+                s.units,
+                s.name,
+                s.path
             )?;
         }
     }
@@ -349,14 +383,14 @@ fn run_kill() -> Result<()> {
         let session = sessions
             .get(idx)
             .ok_or_else(|| anyhow!("fzf returned out-of-range row id: {idx}"))?;
-        selected.push(session.name.clone());
+        selected.push(session.id.clone());
     }
     if selected.is_empty() {
         return Ok(());
     }
 
-    for name in &selected {
-        tmux::kill_session(name)?;
+    for id in &selected {
+        backend.kill(id)?;
     }
     println!("killed {} session(s)", selected.len());
     Ok(())
