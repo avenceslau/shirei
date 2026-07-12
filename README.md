@@ -49,9 +49,28 @@ bind-key -r f run-shell "tmux neww shirei"
 
 Then press `prefix + f` to open the picker in a new tmux window.
 
+## Herdr Binding
+
 With Herdr, set `backend = "herdr"` and run `shirei` from a Herdr pane or a
 normal shell. Shirei maps projects to Herdr workspaces. From a normal shell it
 starts the Herdr server when needed and attaches after selecting a workspace.
+
+Add a command binding to `~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+f"
+type = "pane"
+command = "shirei"
+```
+
+Then press your Herdr prefix followed by `f`. To use `Ctrl-a` as the prefix,
+add this above the command binding:
+
+```toml
+[keys]
+prefix = "ctrl+a"
+```
 
 ## Common Workflows
 
