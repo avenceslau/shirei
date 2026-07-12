@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct TmuxSession {
@@ -51,16 +51,6 @@ pub fn list_sessions() -> Result<Vec<TmuxSession>> {
     }
     sessions.sort_by(|a, b| b.activity.cmp(&a.activity));
     Ok(sessions)
-}
-
-pub fn has_session(name: &str) -> bool {
-    Command::new("tmux")
-        .args(["has-session", "-t", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 pub fn current_session_name() -> Result<Option<String>> {

@@ -3,7 +3,7 @@ name = "shirei"
 version = "0.2.1"
 edition = "2021"
 rust-version = "1.93"
-description = "tmux session manager with worktree-aware dir tracking"
+description = "terminal session manager with worktree-aware dir tracking"
 license = "MIT"
 repository = "https://github.com/avenceslau/shirei"
 

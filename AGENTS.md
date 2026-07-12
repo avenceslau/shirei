@@ -1,6 +1,6 @@
 # AGENTS
 
-shirei is a single-crate Rust CLI that drives `tmux`, `git`, and `fzf`.
+shirei is a single-crate Rust CLI that drives `tmux` or `herdr`, plus `git` and `fzf`.
 No daemon, no database, no network. State is one JSON file under
 `~/.local/share/shirei/`.
 
@@ -10,8 +10,10 @@ No daemon, no database, no network. State is one JSON file under
   `sessions`, `worktrees [prune]`)
 - `src/picker.rs` — builds the sectioned source list, runs fzf, returns
   the chosen row index
-- `src/tmux.rs` — `list-sessions`, `has-session`, `new-session -d`,
+- `src/tmux.rs` — `list-sessions`, `new-session -d`,
   `switch-client` / `attach-session`, session-name sanitization
+- `src/herdr.rs` — workspace listing, creation, focus, close, and setup tabs
+- `src/session.rs` — backend-neutral session model and tmux/Herdr dispatch
 - `src/git.rs` — `repo_root`, `list_branches`, `create_worktree`
   (shells out to `git`)
 - `src/state.rs` — JSON state load/save, MRU touch, worktree dedup,

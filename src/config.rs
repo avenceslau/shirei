@@ -3,8 +3,18 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendKind {
+    #[default]
+    Tmux,
+    Herdr,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub backend: BackendKind,
     #[serde(default = "default_roots")]
     pub roots: Vec<String>,
     #[serde(default = "default_recent_cap")]
@@ -20,6 +30,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            backend: BackendKind::default(),
             roots: default_roots(),
             recent_cap: default_recent_cap(),
             worktree_root: default_worktree_root(),
@@ -83,4 +94,21 @@ pub fn expand_tilde(input: &str) -> PathBuf {
         }
     }
     PathBuf::from(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_defaults_to_tmux() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(matches!(config.backend, BackendKind::Tmux));
+    }
+
+    #[test]
+    fn backend_accepts_herdr() {
+        let config: Config = toml::from_str("backend = \"herdr\"").unwrap();
+        assert!(matches!(config.backend, BackendKind::Herdr));
+    }
 }

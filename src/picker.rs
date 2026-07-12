@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::config::{expand_tilde, Config};
+use crate::session::{self, Backend, Session};
 use crate::state::State;
-use crate::tmux::{self, TmuxSession};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
-    Tmux,
+    Session,
     Recent,
     Worktree,
     Root,
@@ -19,7 +19,7 @@ pub enum Section {
 impl Section {
     fn label(self) -> &'static str {
         match self {
-            Section::Tmux => "TMUX",
+            Section::Session => "SESSION",
             Section::Recent => "RECENT",
             Section::Worktree => "WORKTREE",
             Section::Root => "ROOT",
@@ -28,7 +28,7 @@ impl Section {
 
     fn ansi(self) -> &'static str {
         match self {
-            Section::Tmux => "\x1b[36m",
+            Section::Session => "\x1b[36m",
             Section::Recent => "\x1b[33m",
             Section::Worktree => "\x1b[32m",
             Section::Root => "\x1b[37m",
@@ -38,7 +38,7 @@ impl Section {
 
 #[derive(Debug, Clone)]
 pub enum Target {
-    AttachSession(String),
+    ActivateSession(String),
     OpenDir { path: PathBuf, name_hint: String },
 }
 
@@ -49,17 +49,17 @@ pub struct Row {
     pub target: Target,
 }
 
-pub fn build_rows(state: &State, cfg: &Config) -> Result<Vec<Row>> {
+pub fn build_rows(state: &State, cfg: &Config, backend: Backend) -> Result<Vec<Row>> {
     let mut rows: Vec<Row> = Vec::new();
     let mut seen_session_names: HashSet<String> = HashSet::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
 
-    for session in tmux::list_sessions().unwrap_or_default() {
-        let TmuxSession { name, path, .. } = &session;
+    for session in backend.list()? {
+        let Session { id, name, path, .. } = &session;
         rows.push(Row {
-            section: Section::Tmux,
+            section: Section::Session,
             display: format!("{name}  \x1b[90m{path}\x1b[0m"),
-            target: Target::AttachSession(name.clone()),
+            target: Target::ActivateSession(id.clone()),
         });
         seen_session_names.insert(name.clone());
         if !path.is_empty() {
@@ -74,6 +74,7 @@ pub fn build_rows(state: &State, cfg: &Config) -> Result<Vec<Row>> {
             &mut seen_paths,
             Section::Recent,
             &recent.path,
+            backend.names_are_unique(),
         ) {
             continue;
         }
@@ -86,6 +87,7 @@ pub fn build_rows(state: &State, cfg: &Config) -> Result<Vec<Row>> {
             &mut seen_paths,
             Section::Worktree,
             &wt.path,
+            backend.names_are_unique(),
         );
     }
 
@@ -119,6 +121,7 @@ pub fn build_rows(state: &State, cfg: &Config) -> Result<Vec<Row>> {
                 &mut seen_paths,
                 Section::Root,
                 &path,
+                backend.names_are_unique(),
             );
         }
     }
@@ -132,6 +135,7 @@ fn push_dir_row(
     seen_paths: &mut HashSet<PathBuf>,
     section: Section,
     path: &Path,
+    deduplicate_names: bool,
 ) -> bool {
     if !path.is_dir() {
         return false;
@@ -143,9 +147,8 @@ fn push_dir_row(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
-    let name_hint = tmux::sanitize_name(&basename);
-    if seen_session_names.contains(&name_hint) {
-        // a tmux session already covers this path; skip
+    let name_hint = session::sanitize_name(&basename);
+    if deduplicate_names && seen_session_names.contains(&name_hint) {
         return false;
     }
     rows.push(Row {
