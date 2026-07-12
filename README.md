@@ -1,16 +1,35 @@
 # shirei
 
-A tmux session manager with worktree-aware dir tracking. Replaces a
-hand-rolled `tmux-sessionizer` script with:
+`shirei` is a small tmux session switcher for people who jump between many
+projects and git worktrees.
 
-- live tmux sessions surfaced at the top of the picker, MRU-sorted
-- a persisted history of recently-opened dirs
-- one-shot worktree creation that registers the worktree in the picker
-- fzf as the picker UI
+It gives you one `fzf` picker for:
 
-Requires `tmux`, `git`, and `fzf` on the PATH.
+- live tmux sessions
+- recently opened directories
+- git worktrees created or discovered by shirei
+- project roots under your configured search paths
+
+Selecting a row switches to the existing tmux session when one exists, or starts
+a new session in that directory.
+
+## Requirements
+
+`shirei` shells out to existing tools. Install these first:
+
+- `tmux`
+- `git`
+- `fzf`
 
 ## Install
+
+From crates.io:
+
+```bash
+cargo install shirei
+```
+
+From source:
 
 ```bash
 git clone https://github.com/avenceslau/shirei
@@ -18,53 +37,91 @@ cd shirei
 cargo install --path .
 ```
 
-This installs a single `shirei` binary into `~/.cargo/bin`.
+Both install a single `shirei` binary into `~/.cargo/bin`.
 
-## tmux integration
+## tmux Binding
+
+Add a binding to your tmux config:
 
 ```tmux
 bind-key -r f run-shell "tmux neww shirei"
 ```
 
-`prefix + f` opens the picker in a new tmux window.
+Then press `prefix + f` to open the picker in a new tmux window.
+
+## Common Workflows
+
+Open the picker:
+
+```bash
+shirei
+```
+
+Create or attach to a worktree for a branch:
+
+```bash
+shirei branch feature/my-change
+```
+
+Pick a branch interactively:
+
+```bash
+shirei branch
+```
+
+Create a new branch from a specific base:
+
+```bash
+shirei branch feature/my-change --base main
+```
+
+Refresh shirei's worktree registry after creating worktrees outside shirei:
+
+```bash
+shirei worktrees scan
+```
+
+Remove stale tracked worktrees whose directories no longer exist:
+
+```bash
+shirei worktrees prune
+```
 
 ## Commands
 
-- `shirei` — open the picker (same as `shirei pick`)
-- `shirei branch [<name>] [-b/--base <ref>]` — create or attach a git
-  worktree for `<name>`, register it, and open a tmux session inside it.
-  With no argument, opens an fzf picker over local + remote branches. When
-  `<name>` is a new branch, `--base` sets its start-point; if omitted, an
-  fzf picker prompts for the base branch. When a worktree is newly created,
-  shirei runs a project install command in a background `install` tmux
-  window (see below).
-- `shirei recent` — print recent dirs
-- `shirei sessions` — print live tmux sessions
-- `shirei worktrees` — list tracked worktrees
-- `shirei worktrees scan` — walk configured roots and known repos and
-  rebuild the worktree registry from `git worktree list`. Run this to
-  pick up worktrees created outside shirei.
-- `shirei worktrees prune` — drop tracked worktrees whose path no longer exists
+| Command | Description |
+| --- | --- |
+| `shirei` | Open the picker. Same as `shirei pick`. |
+| `shirei pick` | Open the picker explicitly. |
+| `shirei branch [name]` | Create or attach to a git worktree, register it, and open a tmux session there. |
+| `shirei branch [name] --base <ref>` | Use `<ref>` as the start point for a new branch. |
+| `shirei recent` | Print recent directories. |
+| `shirei sessions` | Print live tmux sessions. |
+| `shirei worktrees` | List tracked worktrees. |
+| `shirei worktrees scan` | Rebuild tracked worktrees from `git worktree list`. |
+| `shirei worktrees prune` | Drop tracked worktrees whose paths no longer exist. |
 
-## Picker order
+## Picker Order
 
-From top to bottom:
+Rows are grouped in this order:
 
-1. `TMUX` — live tmux sessions, sorted by `session_activity` descending.
-   Selecting one runs `switch-client` (inside tmux) or `attach-session`.
-2. `RECENT` — directories opened recently via shirei, MRU-sorted, capped
-   to `recent_cap` entries.
-3. `WORKTREE` — worktrees shirei has created.
-4. `ROOT` — directories discovered under configured roots (default
-   `~/projects/*`, `~`, `~/.config`).
+1. `TMUX`: live tmux sessions, sorted by recent activity.
+2. `RECENT`: directories opened recently through shirei.
+3. `WORKTREE`: tracked git worktrees.
+4. `ROOT`: directories discovered under configured roots.
 
-A path covered by an earlier section is hidden from later sections. If a
-tmux session already exists whose name matches the basename of a dir, the
-dir row is hidden in favour of the session row.
+Earlier groups win. If a live tmux session already represents a directory, that
+directory is hidden from later groups so you do not see duplicate entries.
 
 ## Configuration
 
-Optional config file at `~/.config/shirei/config.toml`:
+Configuration is optional. By default, shirei reads:
+
+```text
+~/.config/shirei/config.toml
+```
+
+Example:
 
 ```toml
 roots = ["~/projects/*", "~", "~/.config"]
@@ -74,33 +131,57 @@ worktree_exclude_prefixes = ["~/Library/Caches"]
 run_install_on_create = true
 ```
 
-`worktree_exclude_prefixes` filters paths discovered by `shirei worktrees scan`
-(default excludes tenet's cache worktrees on macOS).
+Settings:
 
-`run_install_on_create` (default `true`) runs a project install command when a
-worktree is freshly created. shirei detects the project type at the worktree
-root and runs the first match, in priority order:
+| Setting | Description |
+| --- | --- |
+| `roots` | Directory globs shown in the `ROOT` picker section. |
+| `recent_cap` | Maximum number of recent directories to keep. |
+| `worktree_root` | Parent directory for worktrees created by `shirei branch`. |
+| `worktree_exclude_prefixes` | Paths ignored by `shirei worktrees scan`. |
+| `run_install_on_create` | Run a detected install/build command when a worktree is created. |
 
-1. `Makefile` with an `install:` target → `make install`
-2. `package.json` → `<pm> install`, where `<pm>` is chosen from the lockfile
-   (`bun.lockb`/`bun.lock` → `bun`, `pnpm-lock.yaml` → `pnpm`,
-   `yarn.lock` → `yarn`, `package-lock.json` → `npm`, otherwise `npm`)
-3. `Cargo.toml` → `cargo build`
+Override paths with environment variables:
 
-The command runs in a detached `install` tmux window so the session opens
-immediately; switch to that window to watch progress or read the exit status.
+| Variable | Description |
+| --- | --- |
+| `SHIREI_CONFIG` | Override the config file path. |
+| `SHIREI_STATE_DIR` | Override the state directory. |
 
-Set `SHIREI_CONFIG` to override the config path. Set `SHIREI_STATE_DIR` to
-override the state dir (defaults to `$XDG_DATA_HOME/shirei` or
-`~/.local/share/shirei`). Config defaults to `$XDG_CONFIG_HOME/shirei/config.toml`
-or `~/.config/shirei/config.toml`.
+## Worktree Setup Commands
+
+When `run_install_on_create` is `true`, a new worktree gets a detached tmux
+window named `install`. shirei runs the first matching command:
+
+1. `Makefile` with an `install:` target: `make install`
+2. `package.json`: package-manager-specific `install`
+3. `Cargo.toml`: `cargo build`
+
+For `package.json`, the package manager is selected from the lockfile:
+
+| Lockfile | Command |
+| --- | --- |
+| `bun.lockb` or `bun.lock` | `bun install` |
+| `pnpm-lock.yaml` | `pnpm install` |
+| `yarn.lock` | `yarn install` |
+| `package-lock.json` | `npm install` |
+| none | `npm install` |
 
 ## State
 
-State lives in `~/.local/share/shirei/state.json` and persists:
+State is stored as JSON under:
 
-- `recent` — recent dirs (path + last-used timestamp)
-- `worktrees` — worktrees created by `shirei branch`
+```text
+~/.local/share/shirei/state.json
+```
 
-Worktrees are created under `worktree_root` at
-`<worktree_root>/<repo-slug>/<branch-slug>`.
+It tracks:
+
+- recent directories
+- registered worktrees
+
+Worktrees created by shirei live under:
+
+```text
+<worktree_root>/<repo-slug>/<branch-slug>
+```
