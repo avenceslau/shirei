@@ -73,6 +73,28 @@ For Bash, source the generated script from your shell configuration:
 source <(shirei completions bash)
 ```
 
+## Pi Integration
+
+The repository includes a Pi extension and Shirei skill:
+
+```bash
+mkdir -p ~/.pi/agent/extensions ~/.agents/skills/shirei
+cp integrations/pi/shirei.ts ~/.pi/agent/extensions/shirei.ts
+cp integrations/pi/skills/shirei/SKILL.md ~/.agents/skills/shirei/SKILL.md
+```
+
+Run `/reload` in Pi, then use commands such as:
+
+```text
+/shirei branch feature/name
+/shirei branch feature/name --base main
+/shirei sessions
+/shirei worktrees unfinished
+```
+
+The extension renders command reports with `pi.appendEntry()`, so they do not
+enter LLM context. Interactive prune remains terminal-only.
+
 ## tmux Binding
 
 Add a binding to your tmux config:
