@@ -77,6 +77,7 @@ pub fn list_branches(repo: &Path) -> Result<Vec<Branch>> {
     Ok(branches)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeOutcome {
     Created,
     Existed,
@@ -298,6 +299,145 @@ pub fn delete_local_branch(repo: &Path, branch: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+pub fn check_branch_name(repo: &Path, branch: &str) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["check-ref-format", "--branch", branch])
+        .output()
+        .context("failed to run git check-ref-format")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "invalid branch name {branch}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+pub fn rev_parse_commit(repo: &Path, rev: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
+        .output()
+        .context("failed to run git rev-parse")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "unknown commit {rev}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub fn default_remote(repo: &Path) -> Result<Option<String>> {
+    let remotes = run_git_lines(repo, &["remote"])?;
+    if remotes.iter().any(|remote| remote == "origin") {
+        return Ok(Some("origin".to_string()));
+    }
+    Ok(remotes.into_iter().next())
+}
+
+pub fn push_branch(repo_or_worktree: &Path, remote: &str, branch: &str) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_or_worktree)
+        .args(["push", "-u", remote, branch])
+        .output()
+        .context("failed to run git push")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git push failed for {branch}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+pub fn worktree_is_clean(worktree: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain"])
+        .output()
+        .context("failed to run git status")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git status failed in {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output.stdout.is_empty())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitRebaseStatus {
+    Clean,
+    Conflict,
+    Failed(String),
+}
+
+pub fn rebase(worktree: &Path, new_base: &str) -> Result<GitRebaseStatus> {
+    run_rebase_command(worktree, &["rebase", new_base])
+}
+
+pub fn rebase_continue(worktree: &Path) -> Result<GitRebaseStatus> {
+    run_rebase_command(worktree, &["rebase", "--continue"])
+}
+
+pub fn rebase_abort(worktree: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rebase", "--abort"])
+        .output()
+        .context("failed to run git rebase --abort")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git rebase --abort failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+pub fn unmerged_files(worktree: &Path) -> Result<Vec<PathBuf>> {
+    Ok(
+        run_git_lines(worktree, &["diff", "--name-only", "--diff-filter=U"])?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+    )
+}
+
+fn run_rebase_command(worktree: &Path, args: &[&str]) -> Result<GitRebaseStatus> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .env("GIT_EDITOR", "true")
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(GitRebaseStatus::Clean);
+    }
+    if !unmerged_files(worktree)?.is_empty() {
+        return Ok(GitRebaseStatus::Conflict);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Ok(GitRebaseStatus::Failed(if stderr.is_empty() {
+        format!(
+            "git {} exited with status {}",
+            args.join(" "),
+            output.status.code().unwrap_or(-1)
+        )
+    } else {
+        stderr
+    }))
 }
 
 pub fn create_worktree(
