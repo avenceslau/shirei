@@ -114,9 +114,13 @@ Add a binding to your tmux config:
 
 ```tmux
 bind-key -r f run-shell "tmux neww shirei"
+bind-key -r n display-popup -E -w 80% -h 80% "shirei branch"
 ```
 
-Then press `prefix + f` to open the picker in a new tmux window.
+Press `prefix + f` to open the picker in a new tmux window. Press `prefix + n`
+to create or select a branch from a temporary popup; it closes after shirei
+switches to the worktree session. To create a branch, type its new name and
+press Enter, then select its base branch.
 
 ## Herdr Binding
 
@@ -131,10 +135,17 @@ Add a command binding to `~/.config/herdr/config.toml`:
 key = "prefix+f"
 type = "pane"
 command = "shirei"
+
+[[keys.command]]
+key = "prefix+n"
+type = "pane"
+command = "shirei branch"
 ```
 
-Then press your Herdr prefix followed by `f`. To use `Ctrl-a` as the prefix,
-add this above the command binding:
+Press your Herdr prefix followed by `f` to open the picker, or `n` to create or
+select a branch in a temporary pane. Type a new name and press Enter to create a
+branch, then select its base branch. To use `Ctrl-a` as the prefix, add this above
+the command bindings:
 
 ```toml
 [keys]

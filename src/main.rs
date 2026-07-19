@@ -301,7 +301,7 @@ fn open_branch_worktree(
                     repo.display()
                 ));
             }
-            let Some(b) = pick_branch("branch> ", &branches)? else {
+            let Some(b) = pick_branch("branch> ", &branches, true)? else {
                 return Err(anyhow!("branch selection cancelled"));
             };
             b
@@ -314,7 +314,7 @@ fn open_branch_worktree(
         match base {
             Some(b) => Some(b.to_string()),
             None if branches.is_empty() => None,
-            None if allow_interactive => match pick_branch("base> ", &branches)? {
+            None if allow_interactive => match pick_branch("base> ", &branches, false)? {
                 Some(b) => Some(b.display),
                 None => return Err(anyhow!("base selection cancelled")),
             },
@@ -765,7 +765,11 @@ fn resolve_repo(repo_arg: Option<&Path>) -> Result<PathBuf> {
     git::repo_root(&start)
 }
 
-fn pick_branch(prompt: &str, branches: &[git::Branch]) -> Result<Option<git::Branch>> {
+fn pick_branch(
+    prompt: &str,
+    branches: &[git::Branch],
+    allow_new: bool,
+) -> Result<Option<git::Branch>> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -782,6 +786,8 @@ fn pick_branch(prompt: &str, branches: &[git::Branch]) -> Result<Option<git::Bra
             "\t",
             "--with-nth",
             "2..",
+            "--bind",
+            "enter:accept-or-print-query",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -805,13 +811,21 @@ fn pick_branch(prompt: &str, branches: &[git::Branch]) -> Result<Option<git::Bra
         return Ok(None);
     }
     let stdout = String::from_utf8(output.stdout).context("fzf returned invalid utf-8")?;
-    let Some(first) = stdout.split('\t').next().map(str::trim) else {
-        return Ok(None);
-    };
-    let Ok(idx) = first.parse::<usize>() else {
-        return Ok(None);
-    };
-    Ok(branches.get(idx).cloned())
+    let selected = stdout.trim();
+    if let Some(first) = selected.split('\t').next() {
+        if let Ok(idx) = first.parse::<usize>() {
+            return Ok(branches.get(idx).cloned());
+        }
+    }
+    if allow_new && !selected.is_empty() {
+        return Ok(Some(git::Branch {
+            display: selected.to_string(),
+            local_name: selected.to_string(),
+            local: false,
+            remote: None,
+        }));
+    }
+    Ok(None)
 }
 
 fn run_recent() -> Result<()> {
