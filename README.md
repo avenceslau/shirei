@@ -21,6 +21,11 @@ new session in that directory.
 - `git`
 - `fzf`
 
+The unfinished-worktree report also uses the CLI for your repository host:
+
+- `gh` for GitHub pull requests
+- `glab` for GitLab merge requests
+
 ## Install
 
 From crates.io:
@@ -38,6 +43,57 @@ cargo install --path .
 ```
 
 Both install a single `shirei` binary into `~/.cargo/bin`.
+
+## Shell Completions
+
+Generate completions for Bash, Elvish, Fish, PowerShell, or Zsh:
+
+```bash
+shirei completions zsh
+```
+
+For Zsh, install the generated function somewhere in `fpath` before `compinit`:
+
+```zsh
+mkdir -p ~/.zfunc
+shirei completions zsh > ~/.zfunc/_shirei
+fpath=(~/.zfunc $fpath)
+```
+
+For Fish:
+
+```fish
+mkdir -p ~/.config/fish/completions
+shirei completions fish > ~/.config/fish/completions/shirei.fish
+```
+
+For Bash, source the generated script from your shell configuration:
+
+```bash
+source <(shirei completions bash)
+```
+
+## Pi Integration
+
+The repository includes a Pi extension and Shirei skill:
+
+```bash
+mkdir -p ~/.pi/agent/extensions ~/.agents/skills/shirei
+cp integrations/pi/shirei.ts ~/.pi/agent/extensions/shirei.ts
+cp integrations/pi/skills/shirei/SKILL.md ~/.agents/skills/shirei/SKILL.md
+```
+
+Run `/reload` in Pi, then use commands such as:
+
+```text
+/shirei branch feature/name
+/shirei branch feature/name --base main
+/shirei sessions
+/shirei worktrees unfinished
+```
+
+The extension renders command reports with `pi.appendEntry()`, so they do not
+enter LLM context. Interactive prune remains terminal-only.
 
 ## tmux Binding
 
@@ -104,10 +160,23 @@ Refresh shirei's worktree registry after creating worktrees outside shirei:
 shirei worktrees scan
 ```
 
-Remove stale tracked worktrees whose directories no longer exist:
+Interactively select tracked worktrees to delete:
 
 ```bash
 shirei worktrees prune
+```
+
+The picker shows dirty, merge, detached, missing, and current-directory state.
+After selection, shirei lists the paths and requires typing `delete`. Confirmed
+worktrees are permanently removed with their directories, Git worktree
+metadata, local branches, and Shirei recent/worktree entries. Remote branches
+are never deleted. Dirty and unmerged worktrees can be removed; the primary
+worktree is always refused.
+
+Find potentially unfinished worktrees that have no active or merged pull or merge request:
+
+```bash
+shirei worktrees unfinished
 ```
 
 ## Commands
@@ -121,9 +190,11 @@ shirei worktrees prune
 | `shirei recent` | Print recent directories. |
 | `shirei sessions` | Print live sessions from the configured backend. |
 | `shirei kill` | Select backend sessions or workspaces to close. |
+| `shirei completions <shell>` | Generate a shell completion script. |
 | `shirei worktrees` | List tracked worktrees. |
+| `shirei worktrees unfinished` | List dirty, unmerged, missing, or unclassified worktrees without an active or merged PR or MR. |
 | `shirei worktrees scan` | Rebuild tracked worktrees from `git worktree list`. |
-| `shirei worktrees prune` | Drop tracked worktrees whose paths no longer exist. |
+| `shirei worktrees prune` | Select and permanently delete worktree directories, metadata, local branches, and Shirei entries. |
 
 ## Picker Order
 
@@ -212,3 +283,21 @@ Worktrees created by shirei live under:
 ```text
 <worktree_root>/<repo-slug>/<branch-slug>
 ```
+
+## Unfinished Worktrees
+
+`shirei worktrees unfinished` checks tracked, live worktrees. A worktree is
+potentially unfinished when it has uncommitted files, its HEAD is not merged
+into a locally known remote default branch, its merge state cannot be
+established, its directory is missing, or Git inspection fails. Detached
+worktrees are reported unless their HEAD is clean and merged.
+
+For named branches, shirei asks `gh` and `glab` for active and merged reviews
+across the repository's configured remotes. Worktrees with an open or merged PR
+or MR are omitted; closed, unmerged reviews remain candidates. A worktree with
+local commits newer than its review remains in the report with `review=stale`.
+If no forge CLI can verify a remote, it remains with `review=unknown`
+rather than being treated as review-free. Pull requests targeting a fork's
+upstream repository are discoverable only when that target repository is a
+configured remote. Run `shirei worktrees scan` first to include worktrees
+created outside shirei.

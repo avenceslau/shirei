@@ -87,6 +87,21 @@ pub struct WorktreeRef {
     pub path: PathBuf,
     pub branch: Option<String>,
     pub is_main: bool,
+    pub prunable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeStatus {
+    Merged,
+    Unmerged,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorktreeStatus {
+    pub branch: Option<String>,
+    pub dirty: bool,
+    pub merge: MergeStatus,
 }
 
 pub fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeRef>> {
@@ -113,14 +128,13 @@ pub fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeRef>> {
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         if line.is_empty() {
             if let Some(path) = cur_path.take() {
-                if !cur_prunable {
-                    refs.push(WorktreeRef {
-                        path,
-                        branch: cur_branch.take(),
-                        is_main: first,
-                    });
-                    first = false;
-                }
+                refs.push(WorktreeRef {
+                    path,
+                    branch: cur_branch.take(),
+                    is_main: first,
+                    prunable: cur_prunable,
+                });
+                first = false;
             }
             cur_branch = None;
             cur_prunable = false;
@@ -140,15 +154,150 @@ pub fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeRef>> {
         }
     }
     if let Some(path) = cur_path.take() {
-        if !cur_prunable {
-            refs.push(WorktreeRef {
-                path,
-                branch: cur_branch,
-                is_main: first,
-            });
-        }
+        refs.push(WorktreeRef {
+            path,
+            branch: cur_branch,
+            is_main: first,
+            prunable: cur_prunable,
+        });
     }
     Ok(refs)
+}
+
+pub fn inspect_worktree(worktree: &Path) -> Result<WorktreeStatus> {
+    let status_output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .output()
+        .context("failed to run git status")?;
+    if !status_output.status.success() {
+        return Err(anyhow!(
+            "git status failed in {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&status_output.stderr).trim()
+        ));
+    }
+    let dirty = !status_output.stdout.is_empty();
+
+    let branch_output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .context("failed to run git symbolic-ref")?;
+    let branch = branch_output.status.success().then(|| {
+        String::from_utf8_lossy(&branch_output.stdout)
+            .trim()
+            .to_string()
+    });
+
+    let remotes = run_git_lines(worktree, &["remote"])?;
+    let mut default_refs = Vec::new();
+    for remote in remotes {
+        let remote_head = format!("refs/remotes/{remote}/HEAD");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["symbolic-ref", "--quiet", &remote_head])
+            .output()
+            .with_context(|| format!("failed to resolve {remote_head}"))?;
+        if output.status.success() {
+            let reference = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !reference.is_empty() {
+                default_refs.push(reference);
+            }
+        }
+    }
+
+    let merge = if default_refs.is_empty() {
+        MergeStatus::Unknown
+    } else {
+        let mut merged = false;
+        for reference in default_refs {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(worktree)
+                .args(["merge-base", "--is-ancestor", "HEAD", &reference])
+                .status()
+                .with_context(|| format!("failed to compare HEAD with {reference}"))?;
+            match status.code() {
+                Some(0) => {
+                    merged = true;
+                    break;
+                }
+                Some(1) => {}
+                _ => {
+                    return Err(anyhow!(
+                        "git merge-base failed while comparing HEAD with {reference}"
+                    ));
+                }
+            }
+        }
+        if merged {
+            MergeStatus::Merged
+        } else {
+            MergeStatus::Unmerged
+        }
+    };
+
+    Ok(WorktreeStatus {
+        branch,
+        dirty,
+        merge,
+    })
+}
+
+pub fn remove_worktree(repo: &Path, worktree: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "remove", "--force", "--force", "--"])
+        .arg(worktree)
+        .output()
+        .context("failed to run git worktree remove")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git worktree remove failed for {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+pub fn delete_local_branch(repo: &Path, branch: &str) -> Result<()> {
+    let reference = format!("refs/heads/{branch}");
+    let exists = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show-ref", "--verify", "--quiet", &reference])
+        .output()
+        .context("failed to check local branch")?;
+    match exists.status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(()),
+        _ => {
+            return Err(anyhow!(
+                "git show-ref failed for {branch}: {}",
+                String::from_utf8_lossy(&exists.stderr).trim()
+            ));
+        }
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["branch", "-D", "--", branch])
+        .output()
+        .context("failed to run git branch -D")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git branch -D failed for {branch}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 pub fn create_worktree(
@@ -230,4 +379,79 @@ fn run_git_lines(repo: &Path, args: &[&str]) -> Result<Vec<String>> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn git(path: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {} failed", args.join(" "));
+    }
+
+    #[test]
+    fn inspects_dirty_and_unmerged_worktrees() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let worktree = temp.path().join("feature");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "--initial-branch=main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test User"]);
+        fs::write(repo.join("README.md"), "main\n").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let repo_arg = repo.to_string_lossy().to_string();
+        git(&repo, &["remote", "add", "origin", &repo_arg]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        let worktree_arg = worktree.to_string_lossy().to_string();
+        git(
+            &repo,
+            &["worktree", "add", "-b", "feature/test", &worktree_arg],
+        );
+
+        let clean = inspect_worktree(&worktree).unwrap();
+        assert_eq!(clean.branch.as_deref(), Some("feature/test"));
+        assert!(!clean.dirty);
+        assert_eq!(clean.merge, MergeStatus::Merged);
+
+        fs::write(worktree.join("untracked.txt"), "work\n").unwrap();
+        let dirty = inspect_worktree(&worktree).unwrap();
+        assert!(dirty.dirty);
+        assert_eq!(dirty.merge, MergeStatus::Merged);
+
+        git(&worktree, &["add", "untracked.txt"]);
+        git(&worktree, &["commit", "-m", "feature"]);
+        let unmerged = inspect_worktree(&worktree).unwrap();
+        assert!(!unmerged.dirty);
+        assert_eq!(unmerged.merge, MergeStatus::Unmerged);
+
+        fs::write(worktree.join("dirty.txt"), "delete me\n").unwrap();
+        remove_worktree(&repo, &worktree).unwrap();
+        assert!(!worktree.exists());
+        delete_local_branch(&repo, "feature/test").unwrap();
+        let branch = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["show-ref", "--verify", "--quiet", "refs/heads/feature/test"])
+            .status()
+            .unwrap();
+        assert!(!branch.success());
+    }
 }

@@ -1,4 +1,5 @@
 mod config;
+mod forge;
 mod git;
 mod herdr;
 mod install;
@@ -8,7 +9,8 @@ mod state;
 mod tmux;
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use std::path::Path;
 use time::OffsetDateTime;
 
@@ -46,6 +48,11 @@ enum Cmd {
     Sessions,
     /// Select sessions to close.
     Kill,
+    /// Generate a shell completion script.
+    Completions {
+        /// Shell to generate completions for.
+        shell: Shell,
+    },
     /// Manage tracked worktrees.
     Worktrees {
         #[command(subcommand)]
@@ -55,7 +62,9 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum WorktreesCmd {
-    /// Drop worktree entries whose path no longer exists.
+    /// Print potentially unfinished worktrees without an active or merged PR or MR.
+    Unfinished,
+    /// Select tracked worktrees and permanently delete their directories and local branches.
     Prune,
     /// Walk configured roots and known repos, rebuild the worktree registry.
     Scan,
@@ -69,7 +78,13 @@ fn main() -> Result<()> {
         Cmd::Recent => run_recent(),
         Cmd::Sessions => run_sessions(),
         Cmd::Kill => run_kill(),
+        Cmd::Completions { shell } => {
+            let mut command = Args::command();
+            clap_complete::generate(shell, &mut command, "shirei", &mut std::io::stdout());
+            Ok(())
+        }
         Cmd::Worktrees { action } => match action {
+            Some(WorktreesCmd::Unfinished) => run_worktrees_unfinished(),
             Some(WorktreesCmd::Prune) => run_worktrees_prune(),
             Some(WorktreesCmd::Scan) => run_worktrees_scan(),
             None => run_worktrees_list(),
@@ -415,12 +430,323 @@ fn run_worktrees_list() -> Result<()> {
     Ok(())
 }
 
-fn run_worktrees_prune() -> Result<()> {
-    let mut state = state::load()?;
-    let dropped = state.prune_dead_worktrees();
-    state::save(&state)?;
-    println!("pruned {dropped} dead worktree entries");
+fn run_worktrees_unfinished() -> Result<()> {
+    let state = state::load()?;
+    let mut worktrees = state.worktrees;
+    worktrees.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let mut found = 0usize;
+    for worktree in worktrees {
+        if !worktree.path.is_dir() {
+            println!(
+                "{}\tbranch={}\treasons=missing\treview=unknown",
+                worktree.path.display(),
+                if worktree.branch.is_empty() {
+                    "-"
+                } else {
+                    &worktree.branch
+                }
+            );
+            found += 1;
+            continue;
+        }
+
+        let status = match git::inspect_worktree(&worktree.path) {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!("warn: {} -> {error}", worktree.path.display());
+                println!(
+                    "{}\tbranch={}\treasons=inspection-error\treview=unknown",
+                    worktree.path.display(),
+                    if worktree.branch.is_empty() {
+                        "-"
+                    } else {
+                        &worktree.branch
+                    }
+                );
+                found += 1;
+                continue;
+            }
+        };
+
+        let mut reasons = Vec::new();
+        if status.dirty {
+            reasons.push("dirty");
+        }
+        match status.merge {
+            git::MergeStatus::Merged => {}
+            git::MergeStatus::Unmerged => reasons.push("unmerged"),
+            git::MergeStatus::Unknown if status.branch.is_some() => reasons.push("merge-unknown"),
+            git::MergeStatus::Unknown => reasons.push("detached"),
+        }
+        if reasons.is_empty() {
+            continue;
+        }
+
+        let (branch, review) = if let Some(branch) = status.branch {
+            match forge::review_status(&worktree.path, &branch) {
+                forge::ReviewStatus::Covered => continue,
+                forge::ReviewStatus::Stale => (branch, "stale"),
+                forge::ReviewStatus::NoneFound => (branch, "none"),
+                forge::ReviewStatus::Unknown(errors) => {
+                    for error in errors {
+                        eprintln!("warn: {} -> {error}", worktree.path.display());
+                    }
+                    (branch, "unknown")
+                }
+            }
+        } else {
+            ("detached".to_string(), "unknown")
+        };
+
+        println!(
+            "{}\tbranch={}\treasons={}\treview={}",
+            worktree.path.display(),
+            branch,
+            reasons.join(","),
+            review
+        );
+        found += 1;
+    }
+
+    if found == 0 {
+        println!("(no potentially unfinished worktrees without active or merged reviews)");
+    }
     Ok(())
+}
+
+fn run_worktrees_prune() -> Result<()> {
+    use std::io::{self, Write};
+    use std::process::{Command, Stdio};
+
+    let mut state = state::load()?;
+    if state.worktrees.is_empty() {
+        println!("(no tracked worktrees)");
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir().context("could not read cwd")?;
+    let mut candidates: Vec<(Worktree, std::path::PathBuf, Option<String>, String)> = Vec::new();
+    for worktree in &state.worktrees {
+        let canonical_worktree =
+            std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
+        let git_refs = git::list_worktrees(&worktree.repo).unwrap_or_default();
+        let repo_path = git_refs
+            .iter()
+            .find(|item| item.is_main)
+            .map(|item| item.path.clone())
+            .unwrap_or_else(|| worktree.repo.clone());
+        let git_ref = git_refs.into_iter().find(|item| {
+            std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
+                == canonical_worktree
+        });
+        let mut labels = Vec::new();
+        if !worktree.path.is_dir() {
+            labels.push("MISSING");
+        }
+        if cwd.starts_with(&worktree.path) {
+            labels.push("CURRENT");
+        }
+        if git_ref.as_ref().is_some_and(|item| item.is_main) {
+            labels.push("MAIN");
+        }
+        if git_ref.as_ref().is_some_and(|item| item.prunable) {
+            labels.push("PRUNABLE");
+        }
+
+        let mut branch = git_ref.as_ref().and_then(|item| item.branch.clone());
+        if worktree.path.is_dir() {
+            match git::inspect_worktree(&worktree.path) {
+                Ok(status) => {
+                    if status.dirty {
+                        labels.push("DIRTY");
+                    } else {
+                        labels.push("CLEAN");
+                    }
+                    labels.push(match status.merge {
+                        git::MergeStatus::Merged => "MERGED",
+                        git::MergeStatus::Unmerged => "UNMERGED",
+                        git::MergeStatus::Unknown => "MERGE-UNKNOWN",
+                    });
+                    if status.branch.is_none() {
+                        labels.push("DETACHED");
+                    }
+                    branch = status.branch.or(branch);
+                }
+                Err(_) => labels.push("INSPECTION-ERROR"),
+            }
+        }
+        if branch.is_none() && git_ref.is_none() && !worktree.branch.is_empty() {
+            branch = Some(worktree.branch.clone());
+        }
+        candidates.push((worktree.clone(), repo_path, branch, labels.join(",")));
+    }
+    candidates.sort_by(|left, right| left.0.path.cmp(&right.0.path));
+
+    let mut child = Command::new("fzf")
+        .env_remove("FZF_DEFAULT_OPTS")
+        .env_remove("FZF_DEFAULT_OPTS_FILE")
+        .args([
+            "--multi",
+            "--prompt",
+            "prune> ",
+            "--header",
+            "tab to select; enter reviews selection; type delete to confirm permanent removal",
+            "--layout",
+            "reverse",
+            "--height",
+            "80%",
+            "--delimiter",
+            "\t",
+            "--with-nth",
+            "2..",
+            "--tiebreak",
+            "begin,index",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("failed to launch fzf for worktree pruning")?;
+
+    {
+        let stdin = child.stdin.as_mut().context("failed to open fzf stdin")?;
+        for (idx, (worktree, _, branch, labels)) in candidates.iter().enumerate() {
+            let branch_display: String = branch
+                .as_deref()
+                .unwrap_or("detached")
+                .chars()
+                .flat_map(char::escape_default)
+                .collect();
+            let path_display: String = worktree
+                .path
+                .to_string_lossy()
+                .chars()
+                .flat_map(char::escape_default)
+                .collect();
+            writeln!(
+                stdin,
+                "{idx}\t{labels:<32}\t{branch_display:<32}\t{path_display}"
+            )?;
+        }
+    }
+
+    let output = child.wait_with_output().context("fzf did not complete")?;
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("fzf returned invalid utf-8")?;
+    let mut selected = Vec::new();
+    for line in stdout.lines() {
+        let Some(first) = line.split('\t').next().map(str::trim) else {
+            continue;
+        };
+        let idx = first
+            .parse::<usize>()
+            .map_err(|_| anyhow!("fzf returned malformed row id: {first:?}"))?;
+        let candidate = candidates
+            .get(idx)
+            .ok_or_else(|| anyhow!("fzf returned out-of-range row id: {idx}"))?;
+        selected.push(candidate.clone());
+    }
+    if selected.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!(
+        "Permanently delete {} selected worktree(s), including local branches:",
+        selected.len()
+    );
+    for (worktree, _, _, _) in &selected {
+        let path_display: String = worktree
+            .path
+            .to_string_lossy()
+            .chars()
+            .flat_map(char::escape_default)
+            .collect();
+        eprintln!("  {path_display}");
+    }
+    eprint!("Type 'delete' to confirm: ");
+    io::stderr().flush()?;
+    let mut confirmation = String::new();
+    io::stdin().read_line(&mut confirmation)?;
+    if confirmation.trim() != "delete" {
+        println!("cancelled");
+        return Ok(());
+    }
+
+    let mut removed = 0usize;
+    let mut failures = Vec::new();
+    for (worktree, repo_path, fallback_branch, _) in selected {
+        let git_refs = match git::list_worktrees(&repo_path) {
+            Ok(refs) => refs,
+            Err(error) => {
+                failures.push(format!("{}: {error}", worktree.path.display()));
+                continue;
+            }
+        };
+        let canonical_worktree =
+            std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
+        let git_ref = git_refs.into_iter().find(|item| {
+            std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
+                == canonical_worktree
+        });
+        if git_ref.as_ref().is_some_and(|item| item.is_main) {
+            failures.push(format!(
+                "{}: refusing to remove the primary worktree",
+                worktree.path.display()
+            ));
+            continue;
+        }
+        if let Some(item) = &git_ref {
+            if let Err(error) = git::remove_worktree(&repo_path, &item.path) {
+                failures.push(format!("{}: {error}", worktree.path.display()));
+                continue;
+            }
+        } else if worktree.path.exists() {
+            failures.push(format!(
+                "{}: directory is not registered as a Git worktree",
+                worktree.path.display()
+            ));
+            continue;
+        }
+
+        let branch = git_ref.and_then(|item| item.branch).or(fallback_branch);
+        if let Some(branch) = branch {
+            if let Err(error) = git::delete_local_branch(&repo_path, &branch) {
+                if let Some(item) = state
+                    .worktrees
+                    .iter_mut()
+                    .find(|item| item.path == worktree.path)
+                {
+                    item.repo = repo_path.clone();
+                    item.branch = branch;
+                }
+                state.recent.retain(|item| item.path != worktree.path);
+                state::save(&state)?;
+                failures.push(format!("{}: {error}", worktree.path.display()));
+                continue;
+            }
+        }
+
+        state.worktrees.retain(|item| item.path != worktree.path);
+        state.recent.retain(|item| item.path != worktree.path);
+        state::save(&state)?;
+        removed += 1;
+    }
+
+    println!("removed {removed} worktree(s)");
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        for failure in &failures {
+            eprintln!("warn: {failure}");
+        }
+        Err(anyhow!(
+            "failed to fully remove {} worktree(s)",
+            failures.len()
+        ))
+    }
 }
 
 fn run_worktrees_scan() -> Result<()> {
