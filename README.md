@@ -95,6 +95,14 @@ Run `/reload` in Pi, then use commands such as:
 The extension renders command reports with `pi.appendEntry()`, so they do not
 enter LLM context. Interactive prune remains terminal-only.
 
+The extension also registers a `shirei_handoff` tool for delegating work to
+another Pi session. Ask the current agent to hand a task to a repository,
+branch, and base ref. The agent authors a self-contained first prompt, the
+extension lets you edit it, then Shirei creates or reuses the worktree session.
+An existing Pi in the destination receives the prompt as a follow-up; otherwise
+the extension starts Pi there. The source session remains open and regains
+focus, and uncommitted changes are not copied.
+
 ## tmux Binding
 
 Add a binding to your tmux config:
