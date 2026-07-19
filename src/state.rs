@@ -89,10 +89,4 @@ impl State {
         self.worktrees.retain(|w| w.path != wt.path);
         self.worktrees.push(wt);
     }
-
-    pub fn prune_dead_worktrees(&mut self) -> usize {
-        let before = self.worktrees.len();
-        self.worktrees.retain(|w| w.path.is_dir());
-        before - self.worktrees.len()
-    }
 }
