@@ -226,6 +226,15 @@ Supported examples:
 
 `/shirei branch` requires Pi to run inside tmux or Herdr. `/shirei worktrees prune` is intentionally blocked because prune requires an interactive terminal.
 
+The extension also registers the `shirei_handoff` tool. Use it only when the user explicitly asks the current agent to delegate work to another Shirei/Pi session. The tool requires:
+
+- an existing target repository path
+- a destination branch to create or reuse
+- a base commit or branch for new work
+- a self-contained first prompt authored by the current agent
+
+The user can edit and confirm the prompt before anything is sent. The extension creates or reuses the destination worktree and Shirei session, delivers to an existing Pi as a follow-up, or starts Pi there when necessary. It restores focus to the source session and does not copy uncommitted changes.
+
 ## Configuration
 
 Config lookup order:
