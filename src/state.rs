@@ -10,6 +10,10 @@ pub struct State {
     pub recent: Vec<RecentDir>,
     #[serde(default)]
     pub worktrees: Vec<Worktree>,
+    #[serde(default)]
+    pub stack_branches: Vec<StackBranch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebase_progress: Option<RebaseProgress>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +30,51 @@ pub struct Worktree {
     pub branch: String,
     #[serde(with = "time::serde::rfc3339")]
     pub created: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackBranch {
+    pub repo: PathBuf,
+    pub branch: String,
+    pub base: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebaseProgress {
+    pub version: u32,
+    pub repo: PathBuf,
+    pub leaf: String,
+    pub steps: Vec<RebaseStepState>,
+    pub current: usize,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebaseStepState {
+    pub branch: String,
+    pub base: String,
+    pub worktree: PathBuf,
+    pub status: RebaseStepStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RebaseStepStatus {
+    Pending,
+    Running,
+    Conflict,
+    Done,
 }
 
 pub fn state_dir() -> Result<PathBuf> {
@@ -86,7 +135,92 @@ impl State {
     }
 
     pub fn add_worktree(&mut self, wt: Worktree) {
-        self.worktrees.retain(|w| w.path != wt.path);
+        self.worktrees.retain(|w| !path_eq(&w.path, &wt.path));
         self.worktrees.push(wt);
+    }
+
+    pub fn upsert_stack_branch(&mut self, item: StackBranch) {
+        self.stack_branches.retain(|existing| {
+            !(path_eq(&existing.repo, &item.repo) && existing.branch == item.branch)
+        });
+        self.stack_branches.push(item);
+    }
+
+    pub fn untrack_stack_branch(&mut self, repo: &Path, branch: &str) -> bool {
+        let before = self.stack_branches.len();
+        self.stack_branches
+            .retain(|item| !(path_eq(&item.repo, repo) && item.branch == branch));
+        self.stack_branches.len() != before
+    }
+
+    pub fn stack_branch(&self, repo: &Path, branch: &str) -> Option<&StackBranch> {
+        self.stack_branches
+            .iter()
+            .find(|item| path_eq(&item.repo, repo) && item.branch == branch)
+    }
+
+    pub fn stack_branch_mut(&mut self, repo: &Path, branch: &str) -> Option<&mut StackBranch> {
+        self.stack_branches
+            .iter_mut()
+            .find(|item| path_eq(&item.repo, repo) && item.branch == branch)
+    }
+
+    pub fn worktree_for_branch(&self, repo: &Path, branch: &str) -> Option<&Worktree> {
+        self.worktrees
+            .iter()
+            .find(|item| path_eq(&item.repo, repo) && item.branch == branch)
+    }
+
+    pub fn set_rebase_progress(&mut self, progress: RebaseProgress) {
+        self.rebase_progress = Some(progress);
+    }
+
+    pub fn clear_rebase_progress(&mut self) {
+        self.rebase_progress = None;
+    }
+}
+
+fn path_eq(left: &Path, right: &Path) -> bool {
+    let canonical_left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let canonical_right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    canonical_left == canonical_right
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_state_defaults_stack_fields() {
+        let state: State = serde_json::from_str(r#"{"recent":[],"worktrees":[]}"#).unwrap();
+        assert!(state.stack_branches.is_empty());
+        assert!(state.rebase_progress.is_none());
+    }
+
+    #[test]
+    fn upserts_stack_branches_by_repo_and_branch() {
+        let repo = PathBuf::from("/repo");
+        let now = OffsetDateTime::now_utc();
+        let mut state = State::default();
+        state.upsert_stack_branch(StackBranch {
+            repo: repo.clone(),
+            branch: "feature".into(),
+            base: "main".into(),
+            review_url: None,
+            review_id: None,
+            created: now,
+            updated: now,
+        });
+        state.upsert_stack_branch(StackBranch {
+            repo,
+            branch: "feature".into(),
+            base: "other".into(),
+            review_url: None,
+            review_id: None,
+            created: now,
+            updated: now,
+        });
+        assert_eq!(state.stack_branches.len(), 1);
+        assert_eq!(state.stack_branches[0].base, "other");
     }
 }

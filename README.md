@@ -90,10 +90,15 @@ Run `/reload` in Pi, then use commands such as:
 /shirei branch feature/name --base main
 /shirei sessions
 /shirei worktrees unfinished
+/shirei stack list
+/shirei stack rebase --branch feature/name --dry-run
 ```
 
 The extension renders command reports with `pi.appendEntry()`, so they do not
-enter LLM context. Interactive prune remains terminal-only.
+enter LLM context. Interactive prune remains terminal-only. Non-dry-run stack
+submit is terminal-only for now. For LLM-assisted cascade rebases, ask Pi to use
+the `shirei_stack_rebase_assist` tool; it confirms first and then uses the
+fastest available GPT-5.6 Luna/Terra/Sol model to fix conflicts.
 
 The extension also registers a `shirei_handoff` tool for delegating work to
 another Pi session. Ask the current agent to hand a task to a repository,
@@ -162,6 +167,29 @@ Create a new branch from a specific base:
 shirei branch feature/my-change --base main
 ```
 
+Create stacked PR worktrees and record their review bases:
+
+```bash
+shirei stack branch feature/api --base main
+shirei stack branch feature/ui --base feature/api
+shirei stack list
+```
+
+Preview or run a cascade rebase from the root stack branch through a leaf:
+
+```bash
+shirei stack rebase --branch feature/ui --dry-run
+shirei stack rebase --branch feature/ui
+```
+
+If a rebase stops with conflicts, resolve and stage them, then continue:
+
+```bash
+shirei stack rebase --continue
+```
+
+In Pi, use the `shirei_stack_rebase_assist` tool when you explicitly want Pi to drive the cascade rebase and ask the fastest available GPT-5.6 Luna/Terra/Sol model to fix conflicts.
+
 Refresh shirei's worktree registry after creating worktrees outside shirei:
 
 ```bash
@@ -203,15 +231,24 @@ shirei worktrees unfinished
 | `shirei worktrees unfinished` | List dirty, unmerged, missing, or unclassified worktrees without an active or merged PR or MR. |
 | `shirei worktrees scan` | Rebuild tracked worktrees from `git worktree list`. |
 | `shirei worktrees prune` | Select and permanently delete worktree directories, metadata, local branches, and Shirei entries. |
+| `shirei stack branch <name> --base <branch>` | Create or attach to a worktree and record the PR/MR base branch. |
+| `shirei stack track <branch> --base <branch>` | Record stack metadata for an existing branch. |
+| `shirei stack untrack <branch>` | Remove stack metadata without deleting Git branches or worktrees. |
+| `shirei stack list` | Print tracked stack branches and their bases, paths, reviews, and problems. |
+| `shirei stack rebase --branch <leaf>` | Cascade rebase a stack from root to leaf, stopping safely on conflicts. |
+| `shirei stack rebase --continue` | Continue a stopped cascade rebase after conflicts are resolved and staged. |
+| `shirei stack rebase --abort` | Abort the current stopped cascade rebase. |
+| `shirei stack submit --branch <leaf>` | Push stack branches, create/update GitHub PRs or GitLab MRs, and update managed previous/next links. |
 
 ## Picker Order
 
 Rows are grouped in this order:
 
 1. `SESSION`: live tmux sessions or Herdr workspaces. Tmux sessions are sorted by recent activity; Herdr preserves workspace order.
-2. `RECENT`: directories opened recently through shirei.
-3. `WORKTREE`: tracked git worktrees.
-4. `ROOT`: directories discovered under configured roots.
+2. `STACK`: tracked stack branches that have registered worktrees, displayed as `branch base=<base>`.
+3. `RECENT`: directories opened recently through shirei.
+4. `WORKTREE`: tracked git worktrees.
+5. `ROOT`: directories discovered under configured roots.
 
 Earlier groups win. If a live session already represents a directory, that
 directory is hidden from later groups so you do not see duplicate entries.
@@ -285,12 +322,30 @@ It tracks:
 
 - recent directories
 - registered worktrees
+- stack branch metadata (`branch -> base`)
+- transient cascade rebase progress
 
 Worktrees created by shirei live under:
 
 ```text
 <worktree_root>/<repo-slug>/<branch-slug>
 ```
+
+## Stacked PRs
+
+`shirei stack branch <name> --base <branch>` creates or reuses a branch worktree, opens its session, and records the branch's review base. Stack metadata is separate from worktree metadata, so `shirei worktrees scan` does not erase it.
+
+`shirei stack rebase --branch <leaf>` plans the stack from root to leaf and runs `git rebase` one worktree at a time. The core CLI never asks an LLM to resolve conflicts; it stops with a conflict report and persists progress so you can run `shirei stack rebase --continue` or `shirei stack rebase --abort`.
+
+`shirei stack submit --branch <leaf>` pushes each stack branch, creates or updates GitHub PRs with `gh` or GitLab MRs with `glab`, and updates review descriptions with a managed previous/next block. Shirei only appends or replaces text between these markers:
+
+```markdown
+<!-- shirei-stack-links:start -->
+...
+<!-- shirei-stack-links:end -->
+```
+
+User-authored PR description text outside that block is preserved exactly. If Shirei cannot safely replace the managed block, it fails instead of rewriting the whole description.
 
 ## Unfinished Worktrees
 

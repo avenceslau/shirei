@@ -23,8 +23,90 @@ interface ShireiHandoff {
 	createdAt: number;
 }
 
+interface PendingStackRebase {
+	repository: string;
+	branch: string;
+	attempts: number;
+	maxAttempts: number;
+	previousModel?: unknown;
+	modelLabel?: string;
+	currentWorktree?: string;
+	currentBranch?: string;
+	currentBase?: string;
+	currentFiles?: string[];
+}
+
+const DEFAULT_REBASE_MODEL_ORDER = ["openai/gpt-5.6-luna", "openai/gpt-5.6-terra", "openai/gpt-5.6-sol"];
+
+function parseConflictHeader(output: string) {
+	const line = output.split("\n").find((value) => value.startsWith("status=conflict "));
+	if (!line) return undefined;
+	const values = new Map<string, string>();
+	for (const part of line.split(/\s+/).slice(1)) {
+		const separator = part.indexOf("=");
+		if (separator > 0) values.set(part.slice(0, separator), part.slice(separator + 1));
+	}
+	const branch = values.get("branch");
+	const base = values.get("base");
+	const worktree = values.get("worktree");
+	return branch && base && worktree ? { branch, base, worktree } : undefined;
+}
+
+async function conflictSummary(pi: ExtensionAPI, worktree: string) {
+	const diff = await pi.exec("git", ["diff", "--name-only", "--diff-filter=U"], { cwd: worktree, timeout: 10_000 });
+	const files = diff.stdout
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean);
+	const lines: string[] = [];
+	for (const file of files) {
+		let text = "";
+		try {
+			text = await readFile(join(worktree, file), "utf8");
+		} catch {
+			lines.push(`- ${file}: conflict markers unavailable`);
+			continue;
+		}
+		let start: number | undefined;
+		let separator: number | undefined;
+		const blocks: string[] = [];
+		text.split("\n").forEach((line, index) => {
+			const lineNumber = index + 1;
+			if (line.startsWith("<<<<<<<")) {
+				start = lineNumber;
+				separator = undefined;
+			} else if (line.startsWith("=======")) {
+				separator = lineNumber;
+			} else if (line.startsWith(">>>>>>>") && start !== undefined) {
+				blocks.push(separator ? `${start}-${lineNumber} (ours ${start + 1}-${separator - 1}, theirs ${separator + 1}-${lineNumber - 1})` : `${start}-${lineNumber}`);
+				start = undefined;
+				separator = undefined;
+			}
+		});
+		lines.push(`- ${file}${blocks.length ? `: ${blocks.join(", ")}` : ""}`);
+	}
+	return { files, text: lines.join("\n") || "- conflict files unavailable" };
+}
+
+function formatRebasePrompt(branch: string, base: string, worktree: string, conflicts: string) {
+	return `Shirei is cascade rebasing branch ${branch} onto ${base} in ${worktree}.
+Git stopped with conflicts.
+
+Conflicts:
+${conflicts}
+
+Resolve the conflicts by editing files in this worktree only.
+Requirements:
+1. Preserve intended changes from both sides when possible.
+2. Remove all conflict markers.
+3. Run focused checks if practical.
+4. Stage only the resolved conflict files.
+5. Do not continue or abort the rebase; Shirei will run \`shirei stack rebase --continue\` after verification.`;
+}
+
 export default function (pi: ExtensionAPI) {
 	let handoffWatcher: FSWatcher | undefined;
+	let pendingStackRebase: PendingStackRebase | undefined;
 
 	pi.registerEntryRenderer<ShireiReportData>(REPORT_TYPE, (entry, _options, theme) => {
 		const data = entry.data;
@@ -107,9 +189,219 @@ export default function (pi: ExtensionAPI) {
 		await consume();
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		handoffWatcher?.close();
 		handoffWatcher = undefined;
+		if (pendingStackRebase?.previousModel) {
+			try {
+				await pi.setModel(pendingStackRebase.previousModel as never);
+			} catch {}
+		}
+		pendingStackRebase = undefined;
+		ctx.ui.setStatus("shirei-stack-rebase", undefined);
+	});
+
+	const selectFastestRebaseModel = async (ctx: any, order: string[]) => {
+		for (const value of order) {
+			const [provider, ...rest] = value.split("/");
+			const id = rest.join("/");
+			if (!provider || !id) continue;
+			const model = ctx.modelRegistry.find(provider, id);
+			if (!model) continue;
+			if (await pi.setModel(model)) return { model, label: value };
+		}
+		return undefined;
+	};
+
+	const finishPendingStackRebase = async (ctx: any, message: string, level: "info" | "warning" | "error") => {
+		if (pendingStackRebase?.previousModel) {
+			try {
+				await pi.setModel(pendingStackRebase.previousModel as never);
+			} catch {}
+		}
+		pendingStackRebase = undefined;
+		ctx.ui.setStatus("shirei-stack-rebase", undefined);
+		ctx.ui.notify(message, level);
+	};
+
+	const handleStackRebaseOutput = async (output: string, ctx: any) => {
+		const pending = pendingStackRebase;
+		if (!pending) return;
+		const conflict = parseConflictHeader(output);
+		if (!conflict) {
+			await finishPendingStackRebase(ctx, `Completed Shirei stack rebase for ${pending.branch}`, "info");
+			return;
+		}
+		pending.attempts += 1;
+		if (pending.attempts > pending.maxAttempts) {
+			await finishPendingStackRebase(ctx, `Shirei stack rebase stopped after ${pending.maxAttempts} conflict attempt(s)`, "warning");
+			return;
+		}
+		pending.currentWorktree = conflict.worktree;
+		pending.currentBranch = conflict.branch;
+		pending.currentBase = conflict.base;
+		const summary = await conflictSummary(pi, conflict.worktree);
+		pending.currentFiles = summary.files;
+		ctx.ui.setStatus("shirei-stack-rebase", `Conflict on ${conflict.branch}; waiting for ${pending.modelLabel ?? "LLM"}`);
+		const prompt = formatRebasePrompt(conflict.branch, conflict.base, conflict.worktree, summary.text);
+		if (ctx.isIdle()) {
+			pi.sendUserMessage(prompt);
+		} else {
+			pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+		}
+	};
+
+	const continuePendingStackRebase = async (ctx: any) => {
+		const pending = pendingStackRebase;
+		if (!pending || !ctx.isIdle()) return;
+		const worktree = pending.currentWorktree ?? pending.repository;
+		const status = await pi.exec("git", ["diff", "--name-only", "--diff-filter=U"], {
+			cwd: worktree,
+			timeout: 10_000,
+		});
+		if (status.stdout.trim().length > 0) {
+			await handleStackRebaseOutput(`status=conflict branch=${pending.branch} base=unknown worktree=${worktree}`, ctx);
+			return;
+		}
+		const markerFiles: string[] = [];
+		for (const file of pending.currentFiles ?? []) {
+			try {
+				const text = await readFile(join(worktree, file), "utf8");
+				if (text.includes("<<<<<<<") || text.includes("=======") || text.includes(">>>>>>>")) markerFiles.push(file);
+			} catch {}
+		}
+		if (markerFiles.length > 0) {
+			pending.attempts += 1;
+			if (pending.attempts > pending.maxAttempts) {
+				await finishPendingStackRebase(ctx, `Shirei stack rebase stopped after ${pending.maxAttempts} conflict attempt(s)`, "warning");
+				return;
+			}
+			const prompt = formatRebasePrompt(
+				pending.currentBranch ?? pending.branch,
+				pending.currentBase ?? "unknown",
+				worktree,
+				markerFiles.map((file) => `- ${file}: conflict markers still present`).join("\n"),
+			);
+			pi.sendUserMessage(prompt);
+			return;
+		}
+		if (pending.currentFiles?.length) {
+			const added = await pi.exec("git", ["add", "--", ...pending.currentFiles], { cwd: worktree, timeout: 10_000 });
+			if (added.code !== 0) {
+				await finishPendingStackRebase(ctx, added.stderr.trim() || "git add failed for resolved conflict files", "error");
+				return;
+			}
+		}
+		ctx.ui.setStatus("shirei-stack-rebase", `Continuing stack rebase for ${pending.branch}…`);
+		const result = await pi.exec("shirei", ["stack", "rebase", "--continue"], {
+			cwd: pending.repository,
+			timeout: 180_000,
+		});
+		if (result.code !== 0 || result.killed) {
+			await finishPendingStackRebase(ctx, result.stderr.trim() || `shirei stack rebase --continue failed with ${result.code}`, "error");
+			return;
+		}
+		await handleStackRebaseOutput(`${result.stdout}\n${result.stderr}`, ctx);
+	};
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		await continuePendingStackRebase(ctx);
+	});
+
+	pi.registerTool({
+		name: "shirei_stack_rebase_assist",
+		label: "Shirei Stack Rebase Assist",
+		description:
+			"Cascade rebase a Shirei stack and use Pi with the fastest available GPT-5.6 Luna/Terra/Sol model to fix conflicts. Requires interactive confirmation.",
+		promptSnippet: "Cascade rebase a Shirei stack with LLM conflict repair",
+		promptGuidelines: [
+			"Use shirei_stack_rebase_assist only when the user explicitly asks for an LLM-assisted cascade rebase.",
+			"The tool may trigger model calls and source edits; keep conflict fixes focused and do not continue or abort the rebase manually.",
+		],
+		parameters: Type.Object({
+			repository: Type.Optional(Type.String({ description: "Target repository path; defaults to the current repository" })),
+			branch: Type.String({ description: "Leaf branch to cascade rebase through" }),
+			onto: Type.Optional(Type.String({ description: "Override the root rebase target" })),
+			modelOrder: Type.Optional(
+				Type.Array(Type.String(), {
+					description:
+						"Optional speed-first model IDs; defaults to openai/gpt-5.6-luna, openai/gpt-5.6-terra, openai/gpt-5.6-sol",
+				}),
+			),
+			maxConflictAttempts: Type.Optional(Type.Number({ description: "Retry limit per conflict stop; default 2" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (ctx.mode !== "tui") {
+				throw new Error("shirei_stack_rebase_assist requires Pi interactive mode");
+			}
+			if (pendingStackRebase) {
+				throw new Error("A Shirei stack rebase assist is already in progress");
+			}
+			const repositoryInput = params.repository
+				? params.repository.startsWith("~/")
+					? join(homedir(), params.repository.slice(2))
+					: params.repository === "~"
+						? homedir()
+						: isAbsolute(params.repository)
+							? params.repository
+							: resolve(ctx.cwd, params.repository)
+				: ctx.cwd;
+			const rootResult = await pi.exec("git", ["-C", repositoryInput, "rev-parse", "--show-toplevel"], {
+				timeout: 10_000,
+			});
+			if (rootResult.code !== 0) {
+				throw new Error(rootResult.stderr.trim() || `${repositoryInput} is not inside a Git repository`);
+			}
+			const repository = await realpath(rootResult.stdout.trim()).catch(() => resolve(rootResult.stdout.trim()));
+			const branch = params.branch.trim();
+			if (!branch) throw new Error("A leaf branch is required");
+			const branchCheck = await pi.exec("git", ["check-ref-format", "--branch", branch], {
+				cwd: repository,
+				timeout: 10_000,
+			});
+			if (branchCheck.code !== 0) {
+				throw new Error(branchCheck.stderr.trim() || `Invalid branch name: ${branch}`);
+			}
+			const args = ["stack", "rebase", "--branch", branch, "--dry-run"];
+			if (params.onto?.trim()) args.push("--onto", params.onto.trim());
+			const dryRun = await pi.exec("shirei", args, { cwd: repository, timeout: 60_000 });
+			if (dryRun.code !== 0 || dryRun.killed) {
+				throw new Error(dryRun.stderr.trim() || `shirei stack rebase --dry-run exited with ${dryRun.code}`);
+			}
+			const confirmed = await ctx.ui.confirm(
+				"Run LLM-assisted Shirei stack rebase?",
+				`${repository}\nbranch: ${branch}\n\nPlan:\n${dryRun.stdout.trim()}\n\nConflicts will be sent to Pi for repair.`,
+			);
+			if (!confirmed) {
+				return { content: [{ type: "text" as const, text: "Shirei stack rebase assist cancelled." }], details: { cancelled: true } };
+			}
+			const previousModel = ctx.model;
+			const selected = await selectFastestRebaseModel(ctx, params.modelOrder?.length ? params.modelOrder : DEFAULT_REBASE_MODEL_ORDER);
+			if (!selected) {
+				throw new Error("No configured/authenticated GPT-5.6 Luna, Terra, or Sol model is available");
+			}
+			pendingStackRebase = {
+				repository,
+				branch,
+				attempts: 0,
+				maxAttempts: Math.max(1, Math.floor(params.maxConflictAttempts ?? 2)),
+				previousModel,
+				modelLabel: selected.label,
+			};
+			ctx.ui.setStatus("shirei-stack-rebase", `Rebasing ${branch} with ${selected.label}…`);
+			const runArgs = ["stack", "rebase", "--branch", branch];
+			if (params.onto?.trim()) runArgs.push("--onto", params.onto.trim());
+			const result = await pi.exec("shirei", runArgs, { cwd: repository, timeout: 180_000 });
+			if (result.code !== 0 || result.killed) {
+				await finishPendingStackRebase(ctx, result.stderr.trim() || `shirei stack rebase exited with ${result.code}`, "error");
+				throw new Error(result.stderr.trim() || `shirei stack rebase exited with ${result.code}`);
+			}
+			await handleStackRebaseOutput(`${result.stdout}\n${result.stderr}`, ctx);
+			return {
+				content: [{ type: "text" as const, text: "Started Shirei stack rebase assist." }],
+				details: { repository, branch, model: selected.label, pending: Boolean(pendingStackRebase) },
+			};
+		},
 	});
 
 	pi.registerTool({
@@ -430,6 +722,11 @@ export default function (pi: ExtensionAPI) {
 				"worktrees",
 				"worktrees unfinished",
 				"worktrees scan",
+				"stack list",
+				"stack branch",
+				"stack track",
+				"stack rebase --dry-run",
+				"stack submit --dry-run",
 			];
 			const matches = values.filter((value) => value.startsWith(prefix.trimStart()));
 			return matches.length > 0 ? matches.map((value) => ({ value, label: value })) : null;
@@ -462,6 +759,43 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				commandArgs = ["branch", branch, "--base", base];
+			} else if (parts[0] === "stack") {
+				if (parts[1] === "branch") {
+					if (!process.env.TMUX && !process.env.HERDR_ENV) {
+						ctx.ui.notify("/shirei stack branch requires Pi to be running inside tmux or Herdr", "warning");
+						return;
+					}
+					if (parts.length !== 5 || !(parts[3] === "--base" || parts[3] === "-b")) {
+						ctx.ui.notify("Usage: /shirei stack branch <name> --base <branch>", "warning");
+						return;
+					}
+					commandArgs = ["stack", "branch", parts[2], "--base", parts[4]];
+				} else if (parts[1] === "track") {
+					if (parts.length !== 5 || !(parts[3] === "--base" || parts[3] === "-b")) {
+						ctx.ui.notify("Usage: /shirei stack track <branch> --base <branch>", "warning");
+						return;
+					}
+					commandArgs = ["stack", "track", parts[2], "--base", parts[4]];
+				} else if (parts[1] === "untrack" && parts.length === 3) {
+					commandArgs = ["stack", "untrack", parts[2]];
+				} else if (parts[1] === "list" && parts.slice(2).every((part) => ["--all", "--porcelain"].includes(part))) {
+					commandArgs = parts;
+				} else if (parts[1] === "rebase") {
+					if (!parts.includes("--dry-run")) {
+						ctx.ui.notify("Use shirei_stack_rebase_assist for LLM-assisted stack rebases, or add --dry-run", "warning");
+						return;
+					}
+					commandArgs = parts;
+				} else if (parts[1] === "submit") {
+					if (!parts.includes("--dry-run")) {
+						ctx.ui.notify("/shirei stack submit is high-impact; run it in a terminal for now", "warning");
+						return;
+					}
+					commandArgs = parts;
+				} else {
+					ctx.ui.notify("Usage: /shirei stack branch|track|untrack|list|rebase --dry-run|submit --dry-run", "warning");
+					return;
+				}
 			} else if (parts.length === 1 && ["recent", "sessions"].includes(parts[0])) {
 				commandArgs = parts;
 			} else if (parts[0] === "worktrees" && parts[1] === "prune") {

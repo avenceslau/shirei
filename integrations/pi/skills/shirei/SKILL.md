@@ -1,7 +1,7 @@
 ---
 name: shirei
-description: Use the Shirei terminal session manager and its worktree-aware project switching workflows. Load when opening or listing Shirei sessions, creating branch worktrees, finding unfinished worktrees, interactively deleting worktrees, scanning Shirei state, generating shell completions, configuring tmux or Herdr, or troubleshooting the shirei CLI.
-compatibility: Requires shirei and one configured backend (tmux or Herdr); interactive commands also require fzf. Unfinished-review detection optionally uses gh and glab.
+description: Use the Shirei terminal session manager and its worktree-aware project switching workflows. Load when opening or listing Shirei sessions, creating branch worktrees, managing stacked PRs, cascade rebasing stack branches, finding unfinished worktrees, interactively deleting worktrees, scanning Shirei state, generating shell completions, configuring tmux or Herdr, or troubleshooting the shirei CLI.
+compatibility: Requires shirei and one configured backend (tmux or Herdr); interactive commands also require fzf. Unfinished-review detection and stack submit optionally use gh and glab.
 ---
 
 # Shirei CLI
@@ -50,6 +50,10 @@ Prefer installed help and source over remembered flags or stale documentation.
 | Find unfinished work | `shirei worktrees unfinished` | Read-only; consults Git and available forge CLIs. |
 | Delete worktrees | `shirei worktrees prune` | Interactive, confirmed, and destructive. |
 | Rebuild the registry | `shirei worktrees scan` | Replaces the registry from discovered Git worktrees. |
+| Create stacked PR branch | `shirei stack branch NAME --base BASE` | Creates/opens worktree and records review base. |
+| List stacked PRs | `shirei stack list` | Read-only stack metadata report. |
+| Cascade rebase stack | `shirei stack rebase --branch LEAF [--dry-run]` | Mutating unless `--dry-run`; stops on conflicts. |
+| Submit stacked PRs | `shirei stack submit --branch LEAF [--dry-run]` | Pushes and edits GitHub PRs or GitLab MRs unless `--dry-run`. |
 | Generate completions | `shirei completions <shell>` | Supports Bash, Elvish, Fish, PowerShell, and Zsh. |
 
 Shirei has no JSON output, noninteractive picker mode, or command that changes the parent shell's directory.
@@ -63,9 +67,10 @@ shirei
 The picker shows:
 
 1. Live backend sessions/workspaces
-2. Recent directories
-3. Registered linked worktrees
-4. Directories found under configured roots
+2. Tracked stack branches with registered worktrees
+3. Recent directories
+4. Registered linked worktrees
+5. Directories found under configured roots
 
 Selecting a live entry activates it. Selecting a directory creates or reuses a session/workspace, activates it, and records the directory as recent. Cancelling fzf normally exits successfully without taking action.
 
@@ -196,6 +201,25 @@ shirei worktrees scan
 
 Configured roots support literal paths and a final `/*` for direct children only. They are not general recursive globs.
 
+## Stacked PRs
+
+`shirei stack branch NAME --base BASE` creates or reuses a worktree/session and records `NAME -> BASE` as stack metadata. Use it when the user wants stacked PR/MR workflows instead of a standalone branch.
+
+Common commands:
+
+```bash
+shirei stack branch feature/api --base main
+shirei stack branch feature/ui --base feature/api
+shirei stack list
+shirei stack rebase --branch feature/ui --dry-run
+```
+
+`shirei stack rebase --branch LEAF` cascades from the root stack branch through `LEAF`, running Git rebase one worktree at a time. It is mutating and requires clean worktrees. On conflict it stops, records progress, prints conflicted files, and expects the user to resolve/stage files before `shirei stack rebase --continue`; `--abort` aborts the active cascade rebase.
+
+In Pi, use the `shirei_stack_rebase_assist` tool only when the user explicitly asks for LLM-assisted conflict repair. The tool confirms, switches to the fastest available model in the default order `openai/gpt-5.6-luna`, `openai/gpt-5.6-terra`, `openai/gpt-5.6-sol`, sends focused conflict prompts, verifies markers/unmerged paths are gone, stages resolved files, continues the rebase, and restores the previous model.
+
+`shirei stack submit --branch LEAF` pushes stack branches and uses `gh` for GitHub PRs or `glab` for GitLab MRs. It updates descriptions only by appending or replacing the managed block between `<!-- shirei-stack-links:start -->` and `<!-- shirei-stack-links:end -->`; user-authored description text outside that block must be preserved exactly. Use `--dry-run` before non-dry-run submit.
+
 ## Shell Completions
 
 Generate static command, subcommand, and option completions:
@@ -222,9 +246,14 @@ Supported examples:
 /shirei worktrees
 /shirei worktrees unfinished
 /shirei worktrees scan
+/shirei stack list
+/shirei stack rebase --branch feature/ui --dry-run
+/shirei stack submit --branch feature/ui --dry-run
 ```
 
-`/shirei branch` requires Pi to run inside tmux or Herdr. `/shirei worktrees prune` is intentionally blocked because prune requires an interactive terminal.
+`/shirei branch` and `/shirei stack branch` require Pi to run inside tmux or Herdr. `/shirei worktrees prune` is intentionally blocked because prune requires an interactive terminal. Non-dry-run `/shirei stack submit` is blocked in Pi for now; run it in a terminal. For LLM-assisted cascade rebases, use the `shirei_stack_rebase_assist` tool rather than a plain `/shirei stack rebase` command.
+
+The extension also registers the `shirei_stack_rebase_assist` tool. Use it only when the user explicitly asks the current agent to cascade rebase a stack with LLM conflict repair. It requires a leaf branch and optionally accepts a repository, root `--onto` target, model order, and retry limit. It confirms before mutating, chooses the first available/authenticated model from Luna -> Terra -> Sol by default, and restores the previous model on completion/failure.
 
 The extension also registers the `shirei_handoff` tool. Use it only when the user explicitly asks the current agent to delegate work to another Shirei/Pi session. The tool requires:
 
@@ -286,10 +315,12 @@ Inside tmux, Shirei switches clients; outside tmux, it attaches and may block un
 1. Retrieve installed help before relying on flags.
 2. Treat `shirei`, `pick`, bare `branch`, `kill`, and `worktrees prune` as interactive commands.
 3. Never run `worktrees prune` unattended or provide its `delete` confirmation automatically.
-4. Treat `branch` as high-impact because it changes Git, state, sessions, and may execute repository code.
-5. Use `shirei branch NAME --base REF` only after confirming branch, base, and side effects.
-6. Require explicit intent before `kill`; it terminates live processes.
-7. Back up state before `worktrees scan` when registry continuity matters.
-8. Do not infer success from fzf cancellation; cancellation normally exits successfully.
-9. Do not assume a saved path or branch is still valid.
-10. Do not invent commands or flags; verify them against current help.
+4. Treat `branch` and `stack branch` as high-impact because they change Git, state, sessions, and may execute repository code.
+5. Use `shirei branch NAME --base REF` or `shirei stack branch NAME --base REF` only after confirming branch, base, and side effects.
+6. Treat non-dry-run `stack rebase` and `stack submit` as high-impact; prefer `--dry-run` first.
+7. Never let stack submit rewrite a whole PR description. Only the managed previous/next block may be appended or replaced.
+8. Require explicit intent before `kill`; it terminates live processes.
+9. Back up state before `worktrees scan` when registry continuity matters.
+10. Do not infer success from fzf cancellation; cancellation normally exits successfully.
+11. Do not assume a saved path or branch is still valid.
+12. Do not invent commands or flags; verify them against current help.

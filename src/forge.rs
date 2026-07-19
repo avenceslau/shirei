@@ -1,4 +1,6 @@
+use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -10,7 +12,7 @@ pub enum ReviewStatus {
     Unknown(Vec<String>),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ForgeKind {
     GitHub,
     GitLab,
@@ -332,6 +334,436 @@ pub fn review_status(worktree: &Path, branch: &str) -> ReviewStatus {
     } else {
         ReviewStatus::NoneFound
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewRequest<'a> {
+    pub worktree: &'a Path,
+    pub branch: &'a str,
+    pub base: &'a str,
+    pub draft: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum EnsureReviewOutcome {
+    Created {
+        url: Option<String>,
+        id: Option<String>,
+    },
+    Updated {
+        url: Option<String>,
+        id: Option<String>,
+    },
+    AlreadyCorrect {
+        url: Option<String>,
+        id: Option<String>,
+    },
+}
+
+impl EnsureReviewOutcome {
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            EnsureReviewOutcome::Created { id, .. }
+            | EnsureReviewOutcome::Updated { id, .. }
+            | EnsureReviewOutcome::AlreadyCorrect { id, .. } => id.as_deref(),
+        }
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            EnsureReviewOutcome::Created { url, .. }
+            | EnsureReviewOutcome::Updated { url, .. }
+            | EnsureReviewOutcome::AlreadyCorrect { url, .. } => url.as_deref(),
+        }
+    }
+}
+
+pub fn ensure_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcome> {
+    match preferred_forge(request.worktree)? {
+        ForgeKind::GitLab => ensure_gitlab_review(request),
+        ForgeKind::GitHub | ForgeKind::Unknown => ensure_github_review(request),
+    }
+}
+
+pub fn get_review_body(worktree: &Path, review_id: &str) -> Result<String> {
+    match preferred_forge(worktree)? {
+        ForgeKind::GitLab => get_gitlab_review_body(worktree, review_id),
+        ForgeKind::GitHub | ForgeKind::Unknown => get_github_review_body(worktree, review_id),
+    }
+}
+
+pub fn update_review_body(worktree: &Path, review_id: &str, body: &str) -> Result<()> {
+    match preferred_forge(worktree)? {
+        ForgeKind::GitLab => update_gitlab_review_body(worktree, review_id, body),
+        ForgeKind::GitHub | ForgeKind::Unknown => {
+            update_github_review_body(worktree, review_id, body)
+        }
+    }
+}
+
+fn ensure_github_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcome> {
+    let list = Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--head",
+            request.branch,
+            "--state",
+            "open",
+            "--limit",
+            "20",
+            "--json",
+            "number,url,baseRefName",
+        ])
+        .current_dir(request.worktree)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run gh pr list")?;
+    if !list.status.success() {
+        return Err(anyhow!(
+            "gh pr list failed: {}",
+            String::from_utf8_lossy(&list.stderr).trim()
+        ));
+    }
+    let existing: serde_json::Value =
+        serde_json::from_slice(&list.stdout).context("parse gh pr list JSON")?;
+    if let Some(item) = existing.as_array().and_then(|items| items.first()) {
+        let number = item["number"]
+            .as_i64()
+            .ok_or_else(|| anyhow!("gh pr list returned an item without number"))?
+            .to_string();
+        let url = item["url"].as_str().map(str::to_string);
+        let current_base = item["baseRefName"].as_str().unwrap_or_default();
+        if current_base != request.base {
+            let edit = Command::new("gh")
+                .args(["pr", "edit", &number, "--base", request.base])
+                .current_dir(request.worktree)
+                .env("GH_PROMPT_DISABLED", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .stdin(Stdio::null())
+                .output()
+                .context("failed to run gh pr edit")?;
+            if !edit.status.success() {
+                return Err(anyhow!(
+                    "gh pr edit failed: {}",
+                    String::from_utf8_lossy(&edit.stderr).trim()
+                ));
+            }
+            return Ok(EnsureReviewOutcome::Updated {
+                url,
+                id: Some(number),
+            });
+        }
+        return Ok(EnsureReviewOutcome::AlreadyCorrect {
+            url,
+            id: Some(number),
+        });
+    }
+
+    let mut args = vec![
+        "pr",
+        "create",
+        "--base",
+        request.base,
+        "--head",
+        request.branch,
+        "--fill",
+    ];
+    if request.draft {
+        args.push("--draft");
+    }
+    let create = Command::new("gh")
+        .args(args)
+        .current_dir(request.worktree)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run gh pr create")?;
+    if !create.status.success() {
+        return Err(anyhow!(
+            "gh pr create failed: {}",
+            String::from_utf8_lossy(&create.stderr).trim()
+        ));
+    }
+    let url = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    let viewed = view_github_review(request.worktree, request.branch)?;
+    Ok(EnsureReviewOutcome::Created {
+        url: (!url.is_empty()).then_some(url).or(viewed.1),
+        id: viewed.0,
+    })
+}
+
+fn get_github_review_body(worktree: &Path, review_id: &str) -> Result<String> {
+    let output = Command::new("gh")
+        .args(["pr", "view", review_id, "--json", "body"])
+        .current_dir(worktree)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run gh pr view")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "gh pr view failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse gh pr view JSON")?;
+    Ok(value["body"].as_str().unwrap_or_default().to_string())
+}
+
+fn update_github_review_body(worktree: &Path, review_id: &str, body: &str) -> Result<()> {
+    let path = std::env::temp_dir().join(format!(
+        "shirei-pr-body-{}-{}.md",
+        std::process::id(),
+        review_id.replace('/', "-")
+    ));
+    fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    let output = Command::new("gh")
+        .arg("pr")
+        .arg("edit")
+        .arg(review_id)
+        .arg("--body-file")
+        .arg(&path)
+        .current_dir(worktree)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run gh pr edit --body-file")?;
+    let _ = fs::remove_file(&path);
+    if !output.status.success() {
+        return Err(anyhow!(
+            "gh pr edit --body-file failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn view_github_review(worktree: &Path, selector: &str) -> Result<(Option<String>, Option<String>)> {
+    let output = Command::new("gh")
+        .args(["pr", "view", selector, "--json", "number,url"])
+        .current_dir(worktree)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run gh pr view")?;
+    if !output.status.success() {
+        return Ok((None, None));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse gh pr view JSON")?;
+    Ok((
+        value["number"].as_i64().map(|number| number.to_string()),
+        value["url"].as_str().map(str::to_string),
+    ))
+}
+
+fn preferred_forge(worktree: &Path) -> Result<ForgeKind> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["remote", "-v"])
+        .output()
+        .context("failed to run git remote -v")?;
+    if !output.status.success() {
+        return Ok(ForgeKind::Unknown);
+    }
+    let mut saw_github = false;
+    for target in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter_map(remote_target)
+    {
+        match target.kind {
+            ForgeKind::GitLab => return Ok(ForgeKind::GitLab),
+            ForgeKind::GitHub => saw_github = true,
+            ForgeKind::Unknown => {}
+        }
+    }
+    if saw_github {
+        Ok(ForgeKind::GitHub)
+    } else {
+        Ok(ForgeKind::Unknown)
+    }
+}
+
+fn ensure_gitlab_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcome> {
+    let list = Command::new("glab")
+        .args([
+            "mr",
+            "list",
+            "--source-branch",
+            request.branch,
+            "--all",
+            "--output",
+            "json",
+        ])
+        .current_dir(request.worktree)
+        .env("GLAB_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run glab mr list")?;
+    if !list.status.success() {
+        return Err(anyhow!(
+            "glab mr list failed: {}",
+            String::from_utf8_lossy(&list.stderr).trim()
+        ));
+    }
+    let existing: serde_json::Value =
+        serde_json::from_slice(&list.stdout).context("parse glab mr list JSON")?;
+    if let Some(item) = existing.as_array().and_then(|items| items.first()) {
+        let id = item["iid"]
+            .as_i64()
+            .or_else(|| item["id"].as_i64())
+            .ok_or_else(|| anyhow!("glab mr list returned an item without iid/id"))?
+            .to_string();
+        let url = item["web_url"]
+            .as_str()
+            .or_else(|| item["webUrl"].as_str())
+            .map(str::to_string);
+        let current_base = item["target_branch"]
+            .as_str()
+            .or_else(|| item["targetBranch"].as_str())
+            .unwrap_or_default();
+        if current_base != request.base {
+            let edit = Command::new("glab")
+                .args(["mr", "update", &id, "--target-branch", request.base])
+                .current_dir(request.worktree)
+                .env("GLAB_PROMPT_DISABLED", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .stdin(Stdio::null())
+                .output()
+                .context("failed to run glab mr update")?;
+            if !edit.status.success() {
+                return Err(anyhow!(
+                    "glab mr update failed: {}",
+                    String::from_utf8_lossy(&edit.stderr).trim()
+                ));
+            }
+            return Ok(EnsureReviewOutcome::Updated { url, id: Some(id) });
+        }
+        return Ok(EnsureReviewOutcome::AlreadyCorrect { url, id: Some(id) });
+    }
+
+    let mut args = vec![
+        "mr",
+        "create",
+        "--source-branch",
+        request.branch,
+        "--target-branch",
+        request.base,
+        "--fill",
+    ];
+    if request.draft {
+        args.push("--draft");
+    }
+    let create = Command::new("glab")
+        .args(args)
+        .current_dir(request.worktree)
+        .env("GLAB_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run glab mr create")?;
+    if !create.status.success() {
+        return Err(anyhow!(
+            "glab mr create failed: {}",
+            String::from_utf8_lossy(&create.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    let viewed = view_gitlab_review(request.worktree, request.branch)?;
+    Ok(EnsureReviewOutcome::Created {
+        url: (!stdout.is_empty()).then_some(stdout).or(viewed.1),
+        id: viewed.0,
+    })
+}
+
+fn get_gitlab_review_body(worktree: &Path, review_id: &str) -> Result<String> {
+    let output = Command::new("glab")
+        .args(["mr", "view", review_id, "--output", "json"])
+        .current_dir(worktree)
+        .env("GLAB_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run glab mr view")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "glab mr view failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse glab mr view JSON")?;
+    Ok(value["description"]
+        .as_str()
+        .or_else(|| value["body"].as_str())
+        .unwrap_or_default()
+        .to_string())
+}
+
+fn update_gitlab_review_body(worktree: &Path, review_id: &str, body: &str) -> Result<()> {
+    let path = std::env::temp_dir().join(format!(
+        "shirei-mr-body-{}-{}.md",
+        std::process::id(),
+        review_id.replace('/', "-")
+    ));
+    fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    let output = Command::new("glab")
+        .arg("mr")
+        .arg("update")
+        .arg(review_id)
+        .arg("--description-file")
+        .arg(&path)
+        .current_dir(worktree)
+        .env("GLAB_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run glab mr update --description-file")?;
+    let _ = fs::remove_file(&path);
+    if !output.status.success() {
+        return Err(anyhow!(
+            "glab mr update --description-file failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn view_gitlab_review(worktree: &Path, selector: &str) -> Result<(Option<String>, Option<String>)> {
+    let output = Command::new("glab")
+        .args(["mr", "view", selector, "--output", "json"])
+        .current_dir(worktree)
+        .env("GLAB_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run glab mr view")?;
+    if !output.status.success() {
+        return Ok((None, None));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse glab mr view JSON")?;
+    Ok((
+        value["iid"]
+            .as_i64()
+            .or_else(|| value["id"].as_i64())
+            .map(|number| number.to_string()),
+        value["web_url"]
+            .as_str()
+            .or_else(|| value["webUrl"].as_str())
+            .map(str::to_string),
+    ))
 }
 
 #[cfg(test)]

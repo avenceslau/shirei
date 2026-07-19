@@ -6,11 +6,12 @@ use std::process::{Command, Stdio};
 
 use crate::config::{expand_tilde, Config};
 use crate::session::{self, Backend, Session};
-use crate::state::State;
+use crate::state::{StackBranch, State};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Session,
+    Stack,
     Recent,
     Worktree,
     Root,
@@ -20,6 +21,7 @@ impl Section {
     fn label(self) -> &'static str {
         match self {
             Section::Session => "SESSION",
+            Section::Stack => "STACK",
             Section::Recent => "RECENT",
             Section::Worktree => "WORKTREE",
             Section::Root => "ROOT",
@@ -29,6 +31,7 @@ impl Section {
     fn ansi(self) -> &'static str {
         match self {
             Section::Session => "\x1b[36m",
+            Section::Stack => "\x1b[35m",
             Section::Recent => "\x1b[33m",
             Section::Worktree => "\x1b[32m",
             Section::Root => "\x1b[37m",
@@ -64,6 +67,19 @@ pub fn build_rows(state: &State, cfg: &Config, backend: Backend) -> Result<Vec<R
         seen_session_names.insert(name.clone());
         if !path.is_empty() {
             seen_paths.insert(PathBuf::from(path));
+        }
+    }
+
+    for item in &state.stack_branches {
+        if let Some(worktree) = state.worktree_for_branch(&item.repo, &item.branch) {
+            push_stack_row(
+                &mut rows,
+                &mut seen_session_names,
+                &mut seen_paths,
+                item,
+                &worktree.path,
+                backend.names_are_unique(),
+            );
         }
     }
 
@@ -127,6 +143,48 @@ pub fn build_rows(state: &State, cfg: &Config, backend: Backend) -> Result<Vec<R
     }
 
     Ok(rows)
+}
+
+fn push_stack_row(
+    rows: &mut Vec<Row>,
+    seen_session_names: &mut HashSet<String>,
+    seen_paths: &mut HashSet<PathBuf>,
+    item: &StackBranch,
+    path: &Path,
+    deduplicate_names: bool,
+) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    if !seen_paths.insert(path.to_path_buf()) {
+        return false;
+    }
+    let repo_slug = session::sanitize_name(
+        &item
+            .repo
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "repo".to_string()),
+    );
+    let branch_slug = session::sanitize_name(&item.branch);
+    let name_hint = format!("{repo_slug}-{branch_slug}");
+    if deduplicate_names && seen_session_names.contains(&name_hint) {
+        return false;
+    }
+    rows.push(Row {
+        section: Section::Stack,
+        display: format!(
+            "{}  \x1b[90mbase={} {}\x1b[0m",
+            item.branch,
+            item.base,
+            path.display()
+        ),
+        target: Target::OpenDir {
+            path: path.to_path_buf(),
+            name_hint,
+        },
+    });
+    true
 }
 
 fn push_dir_row(
