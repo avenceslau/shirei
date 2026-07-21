@@ -368,7 +368,7 @@ Run `shirei pr create --dry-run` to validate and print the planned branch, commi
 
 `shirei stack branch <name> --base <branch>` creates or reuses a branch worktree, opens its session, and records the branch's review base. Stack metadata is separate from worktree metadata, so `shirei worktrees scan` does not erase it.
 
-`shirei stack rebase --branch <leaf>` plans the stack from root to leaf and runs `git rebase` one worktree at a time. The core CLI never asks an LLM to resolve conflicts; it stops with a conflict report and persists progress so you can run `shirei stack rebase --continue` or `shirei stack rebase --abort`.
+`shirei stack rebase --branch <leaf>` validates every registered branch worktree and snapshots its branch head and merge-base OIDs before changing any branch. It then runs `git rebase --onto <new-parent-oid> <old-parent-oid>` inside each branch's own worktree from root to leaf, preventing rewritten parent commits from being replayed into children. Dry-run prints the worktree and OID boundaries for every step. The core CLI never asks an LLM to resolve conflicts; it stops with a conflict report and persists OID-aware progress so you can run `shirei stack rebase --continue` or `shirei stack rebase --abort`.
 
 `shirei stack submit --branch <leaf>` pushes each stack branch, creates or updates GitHub PRs with `gh` or GitLab MRs with `glab`, and updates review descriptions with a managed previous/next block. Shirei only appends or replaces text between these markers:
 

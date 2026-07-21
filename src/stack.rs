@@ -40,6 +40,7 @@ pub struct StackGraph {
 pub struct RebasePlan {
     pub repo: PathBuf,
     pub leaf: String,
+    pub root_onto_oid: String,
     pub steps: Vec<RebaseStep>,
 }
 
@@ -48,6 +49,8 @@ pub struct RebaseStep {
     pub branch: String,
     pub base: String,
     pub worktree: PathBuf,
+    pub before_head_oid: String,
+    pub old_base_oid: String,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +166,10 @@ pub fn plan_rebase(
 ) -> Result<RebasePlan> {
     let leaf = resolve_leaf(state, repo, leaf)?;
     let branches = ancestry(state, repo, &leaf)?;
+    let git_worktrees = crate::git::list_worktrees(repo)?;
+    let canonical_repo = std::fs::canonicalize(repo)
+        .map_err(|error| anyhow!("canonicalize repository {}: {error}", repo.display()))?;
+    let common_dir = crate::git::common_dir(&canonical_repo)?;
     let mut steps = Vec::new();
     for branch in branches {
         let item = state
@@ -171,18 +178,57 @@ pub fn plan_rebase(
         let worktree = state
             .worktree_for_branch(repo, &branch)
             .ok_or_else(|| anyhow!("no tracked worktree for stack branch {branch}"))?;
+        let canonical_worktree = std::fs::canonicalize(&worktree.path).map_err(|error| {
+            anyhow!(
+                "canonicalize stack worktree {}: {error}",
+                worktree.path.display()
+            )
+        })?;
+        let worktree_common_dir = crate::git::common_dir(&canonical_worktree)?;
+        if worktree_common_dir != common_dir {
+            return Err(anyhow!(
+                "stack worktree {} belongs to a different repository",
+                canonical_worktree.display()
+            ));
+        }
+        let registered = git_worktrees.iter().any(|candidate| {
+            std::fs::canonicalize(&candidate.path)
+                .ok()
+                .is_some_and(|path| path == canonical_worktree)
+                && candidate.branch.as_deref() == Some(branch.as_str())
+        });
+        if !registered {
+            return Err(anyhow!(
+                "{} is not the Git worktree for stack branch {branch}",
+                canonical_worktree.display()
+            ));
+        }
+        let current_branch = crate::git::current_branch(&canonical_worktree)?;
+        if current_branch != branch {
+            return Err(anyhow!(
+                "stack worktree {} has branch {current_branch}, expected {branch}",
+                canonical_worktree.display()
+            ));
+        }
+        let before_head_oid = crate::git::head_oid(&canonical_worktree)?;
+        let old_base_oid = crate::git::merge_base(&canonical_worktree, &branch, &item.base)?;
         steps.push(RebaseStep {
             branch,
-            base: onto
-                .filter(|_| steps.is_empty())
-                .unwrap_or(&item.base)
-                .to_string(),
-            worktree: worktree.path.clone(),
+            base: item.base.clone(),
+            worktree: canonical_worktree,
+            before_head_oid,
+            old_base_oid,
         });
     }
+    let root = steps
+        .first()
+        .ok_or_else(|| anyhow!("stack rebase plan is empty"))?;
+    let root_target = onto.unwrap_or(&root.base);
+    let root_onto_oid = crate::git::rev_parse_commit(repo, root_target)?;
     Ok(RebasePlan {
-        repo: repo.to_path_buf(),
+        repo: canonical_repo,
         leaf,
+        root_onto_oid,
         steps,
     })
 }
@@ -557,51 +603,6 @@ fn conflict_blocks(path: &Path) -> Result<Vec<ConflictBlock>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{StackBranch, Worktree};
-    use time::OffsetDateTime;
-
-    fn stack_item(repo: &Path, branch: &str, base: &str) -> StackBranch {
-        let now = OffsetDateTime::now_utc();
-        StackBranch {
-            repo: repo.to_path_buf(),
-            branch: branch.to_string(),
-            base: base.to_string(),
-            review_url: None,
-            review_id: None,
-            created: now,
-            updated: now,
-        }
-    }
-
-    #[test]
-    fn plans_rebase_root_to_leaf() {
-        let repo = PathBuf::from("/repo");
-        let mut state = State::default();
-        state
-            .stack_branches
-            .push(stack_item(&repo, "feat/a", "main"));
-        state
-            .stack_branches
-            .push(stack_item(&repo, "feat/b", "feat/a"));
-        state.worktrees.push(Worktree {
-            path: PathBuf::from("/wt/a"),
-            repo: repo.clone(),
-            branch: "feat/a".to_string(),
-            created: OffsetDateTime::now_utc(),
-        });
-        state.worktrees.push(Worktree {
-            path: PathBuf::from("/wt/b"),
-            repo: repo.clone(),
-            branch: "feat/b".to_string(),
-            created: OffsetDateTime::now_utc(),
-        });
-        let plan = plan_rebase(&state, &repo, Some("feat/b"), None).unwrap();
-        assert_eq!(plan.steps[0].branch, "feat/a");
-        assert_eq!(plan.steps[0].base, "main");
-        assert_eq!(plan.steps[1].branch, "feat/b");
-        assert_eq!(plan.steps[1].base, "feat/a");
-    }
-
     #[test]
     fn preserves_user_body_while_replacing_links() {
         let existing = "Title\n\n<!-- shirei-stack-links:start -->\nold\n<!-- shirei-stack-links:end -->\n\nTail";

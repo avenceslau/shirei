@@ -30,6 +30,30 @@ pub fn repo_root(start: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(root))
 }
 
+pub fn common_dir(start: &Path) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .context("failed to run git rev-parse --git-common-dir")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git rev-parse --git-common-dir failed in {}: {}",
+            start.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let value = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let path = if value.is_absolute() {
+        value
+    } else {
+        start.join(value)
+    };
+    std::fs::canonicalize(&path)
+        .with_context(|| format!("canonicalize git common dir {}", path.display()))
+}
+
 pub fn list_branches(repo: &Path) -> Result<Vec<Branch>> {
     let local = run_git_lines(
         repo,
@@ -391,6 +415,22 @@ pub fn head_oid(repo: &Path) -> Result<String> {
     rev_parse_commit(repo, "HEAD")
 }
 
+pub fn merge_base(repo: &Path, left: &str, right: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", left, right])
+        .output()
+        .context("failed to run git merge-base")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git merge-base failed for {left} and {right}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 pub fn default_remote_branch(repo: &Path, remote: &str) -> Result<String> {
     let reference = format!("refs/remotes/{remote}/HEAD");
     let output = Command::new("git")
@@ -449,8 +489,59 @@ pub enum GitRebaseStatus {
     Failed(String),
 }
 
-pub fn rebase(worktree: &Path, new_base: &str) -> Result<GitRebaseStatus> {
-    run_rebase_command(worktree, &["rebase", new_base])
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveRebase {
+    pub branch: String,
+    pub onto_oid: String,
+    pub original_head_oid: String,
+}
+
+pub fn active_rebase(worktree: &Path) -> Result<Option<ActiveRebase>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .context("failed to resolve worktree git dir")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git rev-parse --absolute-git-dir failed in {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let git_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let directory = ["rebase-merge", "rebase-apply"]
+        .into_iter()
+        .map(|name| git_dir.join(name))
+        .find(|path| path.is_dir());
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    let read = |name: &str| -> Result<String> {
+        let path = directory.join(name);
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("read rebase metadata {}", path.display()))
+            .map(|value| value.trim().to_string())
+    };
+    let head_name = read("head-name")?;
+    let branch = head_name
+        .strip_prefix("refs/heads/")
+        .ok_or_else(|| anyhow!("active rebase has unexpected head name {head_name}"))?
+        .to_string();
+    Ok(Some(ActiveRebase {
+        branch,
+        onto_oid: read("onto")?,
+        original_head_oid: read("orig-head")?,
+    }))
+}
+
+pub fn rebase_onto(
+    worktree: &Path,
+    new_base_oid: &str,
+    old_base_oid: &str,
+) -> Result<GitRebaseStatus> {
+    run_rebase_command(worktree, &["rebase", "--onto", new_base_oid, old_base_oid])
 }
 
 pub fn rebase_continue(worktree: &Path) -> Result<GitRebaseStatus> {

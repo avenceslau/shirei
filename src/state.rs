@@ -52,6 +52,8 @@ pub struct RebaseProgress {
     pub version: u32,
     pub repo: PathBuf,
     pub leaf: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_onto_oid: Option<String>,
     pub steps: Vec<RebaseStepState>,
     pub current: usize,
     #[serde(with = "time::serde::rfc3339")]
@@ -65,6 +67,12 @@ pub struct RebaseStepState {
     pub branch: String,
     pub base: String,
     pub worktree: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_head_oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_base_oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_head_oid: Option<String>,
     pub status: RebaseStepStatus,
 }
 
@@ -195,6 +203,36 @@ mod tests {
         let state: State = serde_json::from_str(r#"{"recent":[],"worktrees":[]}"#).unwrap();
         assert!(state.stack_branches.is_empty());
         assert!(state.rebase_progress.is_none());
+    }
+
+    #[test]
+    fn old_rebase_progress_defaults_oid_fields() {
+        let state: State = serde_json::from_str(
+            r#"{
+                "recent": [],
+                "worktrees": [],
+                "rebase_progress": {
+                    "version": 1,
+                    "repo": "/repo",
+                    "leaf": "feature",
+                    "steps": [{
+                        "branch": "feature",
+                        "base": "main",
+                        "worktree": "/worktree",
+                        "status": "conflict"
+                    }],
+                    "current": 0,
+                    "started": "2026-01-01T00:00:00Z",
+                    "updated": "2026-01-01T00:00:00Z"
+                }
+            }"#,
+        )
+        .unwrap();
+        let progress = state.rebase_progress.unwrap();
+        assert!(progress.root_onto_oid.is_none());
+        assert!(progress.steps[0].before_head_oid.is_none());
+        assert!(progress.steps[0].old_base_oid.is_none());
+        assert!(progress.steps[0].after_head_oid.is_none());
     }
 
     #[test]

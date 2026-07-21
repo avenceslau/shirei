@@ -550,15 +550,39 @@ fn run_stack_rebase(
     let repo = resolve_repo(repo_arg)?;
     let plan = stack::plan_rebase(&state, &repo, branch, onto)?;
     if dry_run {
-        println!("repo={} leaf={}", plan.repo.display(), plan.leaf);
-        for (idx, step) in plan.steps.iter().enumerate() {
-            println!(
-                "{}. {}\tworktree={}\trebase-onto={}",
-                idx + 1,
-                step.branch,
-                step.worktree.display(),
-                step.base
-            );
+        println!(
+            "repo={} leaf={} root-onto={}",
+            plan.repo.display(),
+            plan.leaf,
+            plan.root_onto_oid
+        );
+        for (index, step) in plan.steps.iter().enumerate() {
+            if index == 0 {
+                println!(
+                    "{}. branch={}\tworktree={}\tbefore-head={}\told-base={}\tonto={}\tcommand=git rebase --onto {} {}",
+                    index + 1,
+                    step.branch,
+                    step.worktree.display(),
+                    step.before_head_oid,
+                    step.old_base_oid,
+                    plan.root_onto_oid,
+                    plan.root_onto_oid,
+                    step.old_base_oid
+                );
+            } else {
+                println!(
+                    "{}. branch={}\tworktree={}\tbefore-head={}\told-base={}\tonto=deferred-after-step-{}:{}\tcommand=git rebase --onto <after-step-{}-head> {}",
+                    index + 1,
+                    step.branch,
+                    step.worktree.display(),
+                    step.before_head_oid,
+                    step.old_base_oid,
+                    index,
+                    plan.steps[index - 1].branch,
+                    index,
+                    step.old_base_oid
+                );
+            }
         }
         return Ok(());
     }
@@ -566,12 +590,127 @@ fn run_stack_rebase(
     run_rebase_progress(&mut state)
 }
 
+fn validate_rebase_step_worktree(
+    progress: &RebaseProgress,
+    step: &RebaseStepState,
+    paused_rebase: bool,
+) -> Result<Option<git::ActiveRebase>> {
+    let expected_common_dir = git::common_dir(&progress.repo)?;
+    let actual_common_dir = git::common_dir(&step.worktree)?;
+    if actual_common_dir != expected_common_dir {
+        return Err(anyhow!(
+            "rebase worktree {} belongs to a different repository",
+            step.worktree.display()
+        ));
+    }
+    let canonical_worktree = std::fs::canonicalize(&step.worktree)
+        .with_context(|| format!("canonicalize rebase worktree {}", step.worktree.display()))?;
+    let worktrees = git::list_worktrees(&progress.repo)?;
+    let registered = worktrees.iter().find(|candidate| {
+        std::fs::canonicalize(&candidate.path)
+            .ok()
+            .is_some_and(|path| path == canonical_worktree)
+    });
+    let Some(registered) = registered else {
+        return Err(anyhow!(
+            "{} is no longer a registered Git worktree",
+            step.worktree.display()
+        ));
+    };
+    if !paused_rebase {
+        if registered.branch.as_deref() != Some(step.branch.as_str()) {
+            return Err(anyhow!(
+                "{} is not registered for stack branch {}",
+                step.worktree.display(),
+                step.branch
+            ));
+        }
+        let current_branch = git::current_branch(&step.worktree)?;
+        if current_branch != step.branch {
+            return Err(anyhow!(
+                "rebase worktree {} has branch {current_branch}, expected {}",
+                step.worktree.display(),
+                step.branch
+            ));
+        }
+        return Ok(None);
+    }
+
+    if registered
+        .branch
+        .as_deref()
+        .is_some_and(|branch| branch != step.branch)
+    {
+        return Err(anyhow!(
+            "{} is registered for a different branch during rebase",
+            step.worktree.display()
+        ));
+    }
+    let active = git::active_rebase(&step.worktree)?
+        .ok_or_else(|| anyhow!("no active Git rebase found in {}", step.worktree.display()))?;
+    if active.branch != step.branch {
+        return Err(anyhow!(
+            "active rebase in {} belongs to {}, expected {}",
+            step.worktree.display(),
+            active.branch,
+            step.branch
+        ));
+    }
+    Ok(Some(active))
+}
+
+fn expected_rebase_onto_oid(progress: &RebaseProgress) -> Result<String> {
+    if progress.current == 0 {
+        return progress
+            .root_onto_oid
+            .clone()
+            .ok_or_else(|| anyhow!("rebase progress is missing root onto OID"));
+    }
+    let parent = &progress.steps[progress.current - 1];
+    let after_head_oid = parent.after_head_oid.as_deref().ok_or_else(|| {
+        anyhow!(
+            "rebase progress is missing completed parent OID for {}",
+            progress.steps[progress.current].branch
+        )
+    })?;
+    let parent_branch_oid = git::rev_parse_commit(&parent.worktree, &parent.branch)?;
+    if parent_branch_oid != after_head_oid {
+        return Err(anyhow!(
+            "completed parent branch {} moved from {} to {}",
+            parent.branch,
+            after_head_oid,
+            parent_branch_oid
+        ));
+    }
+    Ok(after_head_oid.to_string())
+}
+
 fn run_stack_rebase_abort(state: &mut State) -> Result<()> {
     let Some(progress) = state.rebase_progress.clone() else {
         println!("(no stack rebase in progress)");
         return Ok(());
     };
-    if progress.version != 1 {
+    if progress.version == 1 {
+        if let Some(step) = progress.steps.get(progress.current) {
+            if matches!(
+                step.status,
+                RebaseStepStatus::Conflict | RebaseStepStatus::Running
+            ) {
+                if git::active_rebase(&step.worktree)?.is_some() {
+                    return Err(anyhow!(
+                        "legacy stack rebase progress cannot be verified safely; run `git -C {} rebase --abort`, then rerun `shirei stack rebase --abort` to clear the saved progress",
+                        step.worktree.display()
+                    ));
+                }
+                validate_rebase_step_worktree(&progress, step, false)?;
+            }
+        }
+        state.clear_rebase_progress();
+        state::save(state)?;
+        println!("cleared legacy stack rebase progress for {}", progress.leaf);
+        return Ok(());
+    }
+    if progress.version != 2 {
         return Err(anyhow!(
             "unsupported stack rebase progress version {}",
             progress.version
@@ -582,6 +721,27 @@ fn run_stack_rebase_abort(state: &mut State) -> Result<()> {
             step.status,
             RebaseStepStatus::Conflict | RebaseStepStatus::Running
         ) {
+            let before_head_oid = step.before_head_oid.as_deref().ok_or_else(|| {
+                anyhow!("rebase progress is missing before-head for {}", step.branch)
+            })?;
+            let expected_onto_oid = expected_rebase_onto_oid(&progress)?;
+            let active = validate_rebase_step_worktree(&progress, step, true)?
+                .ok_or_else(|| anyhow!("active rebase validation returned no metadata"))?;
+            if active.original_head_oid != before_head_oid || active.onto_oid != expected_onto_oid {
+                return Err(anyhow!(
+                    "active Git rebase in {} does not match Shirei progress",
+                    step.worktree.display()
+                ));
+            }
+            let branch_oid = git::rev_parse_commit(&step.worktree, &step.branch)?;
+            if branch_oid != before_head_oid {
+                return Err(anyhow!(
+                    "stack branch {} moved from {} to {} during rebase",
+                    step.branch,
+                    before_head_oid,
+                    branch_oid
+                ));
+            }
             git::rebase_abort(&step.worktree)?;
         }
     }
@@ -595,7 +755,12 @@ fn run_stack_rebase_continue(state: &mut State) -> Result<()> {
     let Some(progress) = state.rebase_progress.clone() else {
         return Err(anyhow!("no stack rebase in progress"));
     };
-    if progress.version != 1 {
+    if progress.version == 1 {
+        return Err(anyhow!(
+            "legacy stack rebase progress cannot continue safely; run `shirei stack rebase --abort` and restart the rebase"
+        ));
+    }
+    if progress.version != 2 {
         return Err(anyhow!(
             "unsupported stack rebase progress version {}",
             progress.version
@@ -604,9 +769,39 @@ fn run_stack_rebase_continue(state: &mut State) -> Result<()> {
     let Some(step) = progress.steps.get(progress.current) else {
         return Err(anyhow!("stack rebase progress is out of range"));
     };
+    if !matches!(
+        step.status,
+        RebaseStepStatus::Conflict | RebaseStepStatus::Running
+    ) {
+        return Err(anyhow!("stack rebase step {} is not paused", step.branch));
+    }
+    let before_head_oid = step
+        .before_head_oid
+        .as_deref()
+        .ok_or_else(|| anyhow!("rebase progress is missing before-head for {}", step.branch))?;
+    let expected_onto_oid = expected_rebase_onto_oid(&progress)?;
+    let active = validate_rebase_step_worktree(&progress, step, true)?
+        .ok_or_else(|| anyhow!("active rebase validation returned no metadata"))?;
+    if active.original_head_oid != before_head_oid || active.onto_oid != expected_onto_oid {
+        return Err(anyhow!(
+            "active Git rebase in {} does not match Shirei progress",
+            step.worktree.display()
+        ));
+    }
+    let branch_oid = git::rev_parse_commit(&step.worktree, &step.branch)?;
+    if branch_oid != before_head_oid {
+        return Err(anyhow!(
+            "stack branch {} moved from {} to {} during rebase",
+            step.branch,
+            before_head_oid,
+            branch_oid
+        ));
+    }
     match git::rebase_continue(&step.worktree)? {
         git::GitRebaseStatus::Clean => {
+            let after_head_oid = git::head_oid(&step.worktree)?;
             if let Some(progress) = state.rebase_progress.as_mut() {
+                progress.steps[progress.current].after_head_oid = Some(after_head_oid);
                 progress.steps[progress.current].status = RebaseStepStatus::Done;
                 progress.current += 1;
                 progress.updated = OffsetDateTime::now_utc();
@@ -615,6 +810,11 @@ fn run_stack_rebase_continue(state: &mut State) -> Result<()> {
             run_rebase_progress(state)
         }
         git::GitRebaseStatus::Conflict => {
+            if let Some(progress) = state.rebase_progress.as_mut() {
+                progress.steps[progress.current].status = RebaseStepStatus::Conflict;
+                progress.updated = OffsetDateTime::now_utc();
+            }
+            state::save(state)?;
             let report = stack::find_conflicts(&step.worktree, &step.branch, &step.base)?;
             for line in stack::format_conflict_report(&report) {
                 println!("{line}");
@@ -633,9 +833,10 @@ fn start_rebase_progress(state: &mut State, plan: &stack::RebasePlan) -> Result<
     }
     let now = OffsetDateTime::now_utc();
     state.set_rebase_progress(RebaseProgress {
-        version: 1,
+        version: 2,
         repo: plan.repo.clone(),
         leaf: plan.leaf.clone(),
+        root_onto_oid: Some(plan.root_onto_oid.clone()),
         steps: plan
             .steps
             .iter()
@@ -643,6 +844,9 @@ fn start_rebase_progress(state: &mut State, plan: &stack::RebasePlan) -> Result<
                 branch: step.branch.clone(),
                 base: step.base.clone(),
                 worktree: step.worktree.clone(),
+                before_head_oid: Some(step.before_head_oid.clone()),
+                old_base_oid: Some(step.old_base_oid.clone()),
+                after_head_oid: None,
                 status: RebaseStepStatus::Pending,
             })
             .collect(),
@@ -658,6 +862,12 @@ fn run_rebase_progress(state: &mut State) -> Result<()> {
         let Some(progress) = state.rebase_progress.clone() else {
             return Err(anyhow!("no stack rebase in progress"));
         };
+        if progress.version != 2 {
+            return Err(anyhow!(
+                "unsupported stack rebase progress version {}",
+                progress.version
+            ));
+        }
         if progress.current >= progress.steps.len() {
             let leaf = progress.leaf;
             state.clear_rebase_progress();
@@ -666,20 +876,42 @@ fn run_rebase_progress(state: &mut State) -> Result<()> {
             return Ok(());
         }
         let step = progress.steps[progress.current].clone();
+        let before_head_oid = step
+            .before_head_oid
+            .as_deref()
+            .ok_or_else(|| anyhow!("rebase progress is missing before-head for {}", step.branch))?;
+        let old_base_oid = step
+            .old_base_oid
+            .as_deref()
+            .ok_or_else(|| anyhow!("rebase progress is missing old-base for {}", step.branch))?;
+        let onto_oid = expected_rebase_onto_oid(&progress)?;
+        validate_rebase_step_worktree(&progress, &step, false)?;
         if !git::worktree_is_clean(&step.worktree)? {
             return Err(anyhow!(
                 "worktree is not clean before rebase: {}",
                 step.worktree.display()
             ));
         }
+        let current_head_oid = git::head_oid(&step.worktree)?;
+        if current_head_oid != before_head_oid {
+            return Err(anyhow!(
+                "stack branch {} moved from {} to {} before rebase",
+                step.branch,
+                before_head_oid,
+                current_head_oid
+            ));
+        }
+        git::rev_parse_commit(&step.worktree, old_base_oid)?;
         if let Some(progress) = state.rebase_progress.as_mut() {
             progress.steps[progress.current].status = RebaseStepStatus::Running;
             progress.updated = OffsetDateTime::now_utc();
         }
         state::save(state)?;
-        match git::rebase(&step.worktree, &step.base)? {
+        match git::rebase_onto(&step.worktree, &onto_oid, old_base_oid)? {
             git::GitRebaseStatus::Clean => {
+                let after_head_oid = git::head_oid(&step.worktree)?;
                 if let Some(progress) = state.rebase_progress.as_mut() {
+                    progress.steps[progress.current].after_head_oid = Some(after_head_oid);
                     progress.steps[progress.current].status = RebaseStepStatus::Done;
                     progress.current += 1;
                     progress.updated = OffsetDateTime::now_utc();

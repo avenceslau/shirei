@@ -226,7 +226,7 @@ shirei stack list
 shirei stack rebase --branch feature/ui --dry-run
 ```
 
-`shirei stack rebase --branch LEAF` cascades from the root stack branch through `LEAF`, running Git rebase one worktree at a time. It is mutating and requires clean worktrees. On conflict it stops, records progress, prints conflicted files, and expects the user to resolve/stage files before `shirei stack rebase --continue`; `--abort` aborts the active cascade rebase.
+`shirei stack rebase --branch LEAF` validates every registered branch worktree and snapshots branch-head and merge-base OIDs before mutation. It cascades from the root through `LEAF` with `git rebase --onto <new-parent-oid> <old-parent-oid>` inside each branch's own worktree, so rewritten parent commits are not replayed into children. It requires clean worktrees. On conflict it stops, records OID-aware progress, prints conflicted files, and expects the user to resolve/stage files before `shirei stack rebase --continue`; `--abort` aborts the active cascade rebase.
 
 In Pi, use the `shirei_stack_rebase_assist` tool only when the user explicitly asks for LLM-assisted conflict repair. The tool confirms, switches to the fastest available model in the default order `openai/gpt-5.6-luna`, `openai/gpt-5.6-terra`, `openai/gpt-5.6-sol`, sends focused conflict prompts, verifies markers/unmerged paths are gone, stages resolved files, continues the rebase, and restores the previous model.
 
