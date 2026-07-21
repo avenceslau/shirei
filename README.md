@@ -21,7 +21,7 @@ new session in that directory.
 - `git`
 - `fzf`
 
-The unfinished-worktree report also uses the CLI for your repository host:
+Review creation, stack submission, and unfinished-worktree detection use the authenticated CLI for your repository host:
 
 - `gh` for GitHub pull requests
 - `glab` for GitLab merge requests
@@ -96,9 +96,11 @@ Run `/reload` in Pi, then use commands such as:
 
 The extension renders command reports with `pi.appendEntry()`, so they do not
 enter LLM context. Interactive prune remains terminal-only. Non-dry-run stack
-submit is terminal-only for now. For LLM-assisted cascade rebases, ask Pi to use
-the `shirei_stack_rebase_assist` tool; it confirms first and then uses the
-fastest available GPT-5.6 Luna/Terra/Sol model to fix conflicts.
+submit is terminal-only for now. For a standalone review, ask Pi to use
+`shirei_pr_create`; it previews the push and review, then requires confirmation
+before running `shirei pr create`. For LLM-assisted cascade rebases, ask Pi to
+use `shirei_stack_rebase_assist`; it confirms first and then uses the fastest
+available GPT-5.6 Luna/Terra/Sol model to fix conflicts.
 
 The extension also registers a `shirei_handoff` tool for delegating work to
 another Pi session. Ask the current agent to hand a task to a repository,
@@ -178,6 +180,13 @@ Create a new branch from a specific base:
 shirei branch feature/my-change --base main
 ```
 
+Preview and create a standalone pull request or merge request:
+
+```bash
+shirei pr create --dry-run
+shirei pr create --title "Describe the change" --body-file /tmp/review.md
+```
+
 Create stacked PR worktrees and record their review bases:
 
 ```bash
@@ -242,6 +251,8 @@ shirei worktrees unfinished
 | `shirei worktrees unfinished` | List dirty, unmerged, missing, or unclassified worktrees without an active or merged PR or MR. |
 | `shirei worktrees scan` | Rebuild tracked worktrees from `git worktree list`. |
 | `shirei worktrees prune` | Select and permanently delete worktree directories, metadata, local branches, and Shirei entries. |
+| `shirei pr create` | Push the current branch and create or reuse its GitHub PR or GitLab MR. |
+| `shirei pr create --dry-run` | Preview standalone review creation without pushing or contacting the forge. |
 | `shirei stack branch <name> --base <branch>` | Create or attach to a worktree and record the PR/MR base branch. |
 | `shirei stack track <branch> --base <branch>` | Record stack metadata for an existing branch. |
 | `shirei stack untrack <branch>` | Remove stack metadata without deleting Git branches or worktrees. |
@@ -341,6 +352,14 @@ Worktrees created by shirei live under:
 ```text
 <worktree_root>/<repo-slug>/<branch-slug>
 ```
+
+## Standalone PRs and MRs
+
+`shirei pr create` requires a clean worktree, pushes the current branch to `origin` or the first configured remote, and creates or reuses an open GitHub PR or GitLab MR. The target defaults to the selected remote's HEAD branch; pass `--base` when that ref is unavailable or another target is intended.
+
+Use `--title` and either `--body` or `--body-file` to override commit-derived review text. `--draft` creates a new review as a draft. Shirei reuses an open review that already targets the selected base; reviews targeting other branches are left untouched.
+
+Run `shirei pr create --dry-run` to validate and print the planned branch, commit, remote, push, and review without mutating Git or contacting `gh` or `glab`. In Pi, prefer the `shirei_pr_create` tool; it always runs this preview, requires confirmation, and rejects the operation if the confirmed branch, commit, or remote changes before creation.
 
 ## Stacked PRs
 

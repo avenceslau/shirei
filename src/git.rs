@@ -341,6 +341,74 @@ pub fn default_remote(repo: &Path) -> Result<Option<String>> {
     Ok(remotes.into_iter().next())
 }
 
+pub fn current_branch(repo: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .context("failed to run git symbolic-ref")?;
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || branch.is_empty() {
+        return Err(anyhow!("cannot create a review from detached HEAD"));
+    }
+    Ok(branch)
+}
+
+pub fn remote_url(repo: &Path, remote: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["remote", "get-url", remote])
+        .output()
+        .context("failed to run git remote get-url")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git remote get-url failed for {remote}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub fn remote_push_url(repo: &Path, remote: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["remote", "get-url", "--push", remote])
+        .output()
+        .context("failed to run git remote get-url --push")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git remote get-url --push failed for {remote}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub fn head_oid(repo: &Path) -> Result<String> {
+    rev_parse_commit(repo, "HEAD")
+}
+
+pub fn default_remote_branch(repo: &Path, remote: &str) -> Result<String> {
+    let reference = format!("refs/remotes/{remote}/HEAD");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["symbolic-ref", "--quiet", "--short", &reference])
+        .output()
+        .with_context(|| format!("failed to resolve {reference}"))?;
+    let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let prefix = format!("{remote}/");
+    if !output.status.success() || !resolved.starts_with(&prefix) {
+        return Err(anyhow!(
+            "could not determine the default branch for {remote}; pass --base"
+        ));
+    }
+    Ok(resolved[prefix.len()..].to_string())
+}
+
 pub fn push_branch(repo_or_worktree: &Path, remote: &str, branch: &str) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
@@ -549,8 +617,15 @@ mod tests {
         fs::write(repo.join("README.md"), "main\n").unwrap();
         git(&repo, &["add", "README.md"]);
         git(&repo, &["commit", "-m", "initial"]);
+        assert_eq!(current_branch(&repo).unwrap(), "main");
         let repo_arg = repo.to_string_lossy().to_string();
         git(&repo, &["remote", "add", "origin", &repo_arg]);
+        assert_eq!(remote_url(&repo, "origin").unwrap(), repo_arg);
+        assert_eq!(remote_push_url(&repo, "origin").unwrap(), repo_arg);
+        assert_eq!(
+            head_oid(&repo).unwrap(),
+            rev_parse_commit(&repo, "HEAD").unwrap()
+        );
         git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         git(
             &repo,
@@ -560,6 +635,7 @@ mod tests {
                 "refs/remotes/origin/main",
             ],
         );
+        assert_eq!(default_remote_branch(&repo, "origin").unwrap(), "main");
         let worktree_arg = worktree.to_string_lossy().to_string();
         git(
             &repo,
@@ -567,6 +643,7 @@ mod tests {
         );
 
         let clean = inspect_worktree(&worktree).unwrap();
+        assert_eq!(current_branch(&worktree).unwrap(), "feature/test");
         assert_eq!(clean.branch.as_deref(), Some("feature/test"));
         assert!(!clean.dirty);
         assert_eq!(clean.merge, MergeStatus::Merged);
@@ -581,6 +658,12 @@ mod tests {
         let unmerged = inspect_worktree(&worktree).unwrap();
         assert!(!unmerged.dirty);
         assert_eq!(unmerged.merge, MergeStatus::Unmerged);
+
+        git(&worktree, &["checkout", "--detach"]);
+        assert!(current_branch(&worktree)
+            .unwrap_err()
+            .to_string()
+            .contains("detached HEAD"));
 
         fs::write(worktree.join("dirty.txt"), "delete me\n").unwrap();
         remove_worktree(&repo, &worktree).unwrap();

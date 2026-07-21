@@ -104,6 +104,19 @@ Requirements:
 5. Do not continue or abort the rebase; Shirei will run \`shirei stack rebase --continue\` after verification.`;
 }
 
+function repositoryInput(value: string | undefined, cwd: string): string {
+	if (!value) {
+		return cwd;
+	}
+	if (value === "~") {
+		return homedir();
+	}
+	if (value.startsWith("~/")) {
+		return join(homedir(), value.slice(2));
+	}
+	return isAbsolute(value) ? value : resolve(cwd, value);
+}
+
 export default function (pi: ExtensionAPI) {
 	let handoffWatcher: FSWatcher | undefined;
 	let pendingStackRebase: PendingStackRebase | undefined;
@@ -337,20 +350,12 @@ export default function (pi: ExtensionAPI) {
 			if (pendingStackRebase) {
 				throw new Error("A Shirei stack rebase assist is already in progress");
 			}
-			const repositoryInput = params.repository
-				? params.repository.startsWith("~/")
-					? join(homedir(), params.repository.slice(2))
-					: params.repository === "~"
-						? homedir()
-						: isAbsolute(params.repository)
-							? params.repository
-							: resolve(ctx.cwd, params.repository)
-				: ctx.cwd;
-			const rootResult = await pi.exec("git", ["-C", repositoryInput, "rev-parse", "--show-toplevel"], {
+			const requestedRepository = repositoryInput(params.repository, ctx.cwd);
+			const rootResult = await pi.exec("git", ["-C", requestedRepository, "rev-parse", "--show-toplevel"], {
 				timeout: 10_000,
 			});
 			if (rootResult.code !== 0) {
-				throw new Error(rootResult.stderr.trim() || `${repositoryInput} is not inside a Git repository`);
+				throw new Error(rootResult.stderr.trim() || `${requestedRepository} is not inside a Git repository`);
 			}
 			const repository = await realpath(rootResult.stdout.trim()).catch(() => resolve(rootResult.stdout.trim()));
 			const branch = params.branch.trim();
@@ -405,6 +410,122 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "shirei_pr_create",
+		label: "Shirei PR Create",
+		description:
+			"Preview, confirm, push, and create or reuse a standalone GitHub pull request or GitLab merge request through Shirei.",
+		promptSnippet: "Create a standalone pull request or merge request with preview and confirmation",
+		promptGuidelines: [
+			"Use shirei_pr_create instead of calling gh pr create or glab mr create directly for standalone reviews.",
+			"Use Shirei stack submission instead when the branch belongs to a tracked Shirei stack.",
+		],
+		parameters: Type.Object({
+			repository: Type.Optional(
+				Type.String({ description: "Target repository path; defaults to the current repository" }),
+			),
+			base: Type.Optional(Type.String({ description: "Target branch; defaults to the remote's HEAD branch" })),
+			title: Type.Optional(Type.String({ description: "Review title; defaults to commit information" })),
+			body: Type.Optional(Type.String({ description: "Review body; defaults to commit information" })),
+			draft: Type.Optional(Type.Boolean({ description: "Create the review as a draft" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (ctx.mode !== "tui") {
+				throw new Error("shirei_pr_create requires Pi interactive mode so review creation can be confirmed");
+			}
+
+			const requestedRepository = repositoryInput(params.repository, ctx.cwd);
+			const rootResult = await pi.exec("git", ["-C", requestedRepository, "rev-parse", "--show-toplevel"], {
+				timeout: 10_000,
+			});
+			if (rootResult.code !== 0) {
+				throw new Error(rootResult.stderr.trim() || `${requestedRepository} is not inside a Git repository`);
+			}
+			const repository = await realpath(rootResult.stdout.trim()).catch(() => resolve(rootResult.stdout.trim()));
+			const args = ["pr", "create"];
+			if (params.base !== undefined) {
+				args.push("--base", params.base);
+			}
+			if (params.title !== undefined) {
+				args.push("--title", params.title);
+			}
+			if (params.body !== undefined) {
+				args.push("--body", params.body);
+			}
+			if (params.draft === true) {
+				args.push("--draft");
+			}
+
+			const preview = await pi.exec("shirei", [...args, "--dry-run"], {
+				cwd: repository,
+				timeout: 60_000,
+			});
+			if (preview.code !== 0 || preview.killed) {
+				throw new Error(preview.stderr.trim() || `shirei pr create --dry-run exited with ${preview.code}`);
+			}
+			const previewText = preview.stdout.trim();
+			const plan = new Map<string, string>();
+			for (const line of previewText.split("\n")) {
+				const separator = line.indexOf("=");
+				if (separator > 0) {
+					plan.set(line.slice(0, separator), line.slice(separator + 1));
+				}
+			}
+			const branch = plan.get("branch");
+			const head = plan.get("head");
+			const base = plan.get("base");
+			const remoteTarget = plan.get("remote_target");
+			if (!branch || !head || !base || !remoteTarget) {
+				throw new Error("shirei pr create --dry-run returned an incomplete review plan");
+			}
+			const confirmed = await ctx.ui.confirm(
+				"Create pull request or merge request?",
+				previewText,
+			);
+			if (!confirmed) {
+				return {
+					content: [{ type: "text" as const, text: "Shirei review creation cancelled." }],
+					details: {
+						repository,
+						preview: previewText,
+						cancelled: true,
+					},
+				};
+			}
+
+			const confirmedArgs = [
+				...args,
+				...(params.base === undefined ? ["--base", base] : []),
+				"--expected-branch",
+				branch,
+				"--expected-head",
+				head,
+				"--expected-remote",
+				remoteTarget,
+			];
+			const result = await pi.exec("shirei", confirmedArgs, {
+				cwd: repository,
+				timeout: 180_000,
+			});
+			if (result.code !== 0 || result.killed) {
+				throw new Error(result.stderr.trim() || `shirei pr create exited with ${result.code}`);
+			}
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: result.stdout.trim() || "Shirei created the review.",
+					},
+				],
+				details: {
+					repository,
+					preview: previewText,
+					cancelled: false,
+				},
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "shirei_handoff",
 		label: "Shirei Handoff",
 		description:
@@ -425,18 +546,12 @@ export default function (pi: ExtensionAPI) {
 				throw new Error("shirei_handoff requires Pi interactive mode so the prompt can be reviewed");
 			}
 
-			const repositoryInput = params.repository.startsWith("~/")
-				? join(homedir(), params.repository.slice(2))
-				: params.repository === "~"
-					? homedir()
-					: isAbsolute(params.repository)
-						? params.repository
-						: resolve(ctx.cwd, params.repository);
-			const rootResult = await pi.exec("git", ["-C", repositoryInput, "rev-parse", "--show-toplevel"], {
+			const requestedRepository = repositoryInput(params.repository, ctx.cwd);
+			const rootResult = await pi.exec("git", ["-C", requestedRepository, "rev-parse", "--show-toplevel"], {
 				timeout: 10_000,
 			});
 			if (rootResult.code !== 0) {
-				throw new Error(rootResult.stderr.trim() || `${repositoryInput} is not inside a Git repository`);
+				throw new Error(rootResult.stderr.trim() || `${requestedRepository} is not inside a Git repository`);
 			}
 			const repository = await realpath(rootResult.stdout.trim()).catch(() => resolve(rootResult.stdout.trim()));
 			const branch = params.branch.trim();

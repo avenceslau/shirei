@@ -26,6 +26,12 @@ struct RemoteTarget {
     kind: ForgeKind,
 }
 
+struct ReviewTarget {
+    kind: ForgeKind,
+    repository: String,
+    display: String,
+}
+
 fn remote_target(remote: &str) -> Option<RemoteTarget> {
     let without_query = remote.split(['?', '#']).next().unwrap_or(remote);
     let trimmed = without_query.trim_end_matches(".git");
@@ -341,16 +347,15 @@ pub struct ReviewRequest<'a> {
     pub worktree: &'a Path,
     pub branch: &'a str,
     pub base: &'a str,
+    pub remote: &'a str,
+    pub title: Option<&'a str>,
+    pub body: Option<&'a str>,
     pub draft: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum EnsureReviewOutcome {
     Created {
-        url: Option<String>,
-        id: Option<String>,
-    },
-    Updated {
         url: Option<String>,
         id: Option<String>,
     },
@@ -364,7 +369,6 @@ impl EnsureReviewOutcome {
     pub fn id(&self) -> Option<&str> {
         match self {
             EnsureReviewOutcome::Created { id, .. }
-            | EnsureReviewOutcome::Updated { id, .. }
             | EnsureReviewOutcome::AlreadyCorrect { id, .. } => id.as_deref(),
         }
     }
@@ -372,48 +376,77 @@ impl EnsureReviewOutcome {
     pub fn url(&self) -> Option<&str> {
         match self {
             EnsureReviewOutcome::Created { url, .. }
-            | EnsureReviewOutcome::Updated { url, .. }
             | EnsureReviewOutcome::AlreadyCorrect { url, .. } => url.as_deref(),
         }
     }
 }
 
+pub fn review_url_identity(url: &str) -> Result<String> {
+    remote_target(url)
+        .map(|target| target.display)
+        .ok_or_else(|| anyhow!("unsupported forge remote format"))
+}
+
+pub fn review_remote_identity(worktree: &Path, remote: &str) -> Result<String> {
+    Ok(review_target(worktree, remote)?.display)
+}
+
 pub fn ensure_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcome> {
-    match preferred_forge(request.worktree)? {
-        ForgeKind::GitLab => ensure_gitlab_review(request),
-        ForgeKind::GitHub | ForgeKind::Unknown => ensure_github_review(request),
+    let target = review_target(request.worktree, request.remote)?;
+    match target.kind {
+        ForgeKind::GitHub => ensure_github_review(request, &target.repository),
+        ForgeKind::GitLab => ensure_gitlab_review(request, &target.repository),
+        ForgeKind::Unknown => unreachable!(),
     }
 }
 
-pub fn get_review_body(worktree: &Path, review_id: &str) -> Result<String> {
-    match preferred_forge(worktree)? {
-        ForgeKind::GitLab => get_gitlab_review_body(worktree, review_id),
-        ForgeKind::GitHub | ForgeKind::Unknown => get_github_review_body(worktree, review_id),
+pub fn get_review_body(worktree: &Path, remote: &str, review_id: &str) -> Result<String> {
+    let target = review_target(worktree, remote)?;
+    match target.kind {
+        ForgeKind::GitHub => get_github_review_body(worktree, review_id, &target.repository),
+        ForgeKind::GitLab => get_gitlab_review_body(worktree, review_id, &target.repository),
+        ForgeKind::Unknown => unreachable!(),
     }
 }
 
-pub fn update_review_body(worktree: &Path, review_id: &str, body: &str) -> Result<()> {
-    match preferred_forge(worktree)? {
-        ForgeKind::GitLab => update_gitlab_review_body(worktree, review_id, body),
-        ForgeKind::GitHub | ForgeKind::Unknown => {
-            update_github_review_body(worktree, review_id, body)
+pub fn update_review_body(
+    worktree: &Path,
+    remote: &str,
+    review_id: &str,
+    body: &str,
+) -> Result<()> {
+    let target = review_target(worktree, remote)?;
+    match target.kind {
+        ForgeKind::GitHub => {
+            update_github_review_body(worktree, review_id, body, &target.repository)
         }
+        ForgeKind::GitLab => {
+            update_gitlab_review_body(worktree, review_id, body, &target.repository)
+        }
+        ForgeKind::Unknown => unreachable!(),
     }
 }
 
-fn ensure_github_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcome> {
+fn ensure_github_review(
+    request: ReviewRequest<'_>,
+    repository: &str,
+) -> Result<EnsureReviewOutcome> {
     let list = Command::new("gh")
         .args([
             "pr",
             "list",
             "--head",
             request.branch,
+            "--base",
+            request.base,
             "--state",
             "open",
             "--limit",
-            "20",
+            "100",
             "--json",
-            "number,url,baseRefName",
+            "number,url,baseRefName,headRepository,headRepositoryOwner",
+            "--repo",
+            repository,
         ])
         .current_dir(request.worktree)
         .env("GH_PROMPT_DISABLED", "1")
@@ -429,33 +462,43 @@ fn ensure_github_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcom
     }
     let existing: serde_json::Value =
         serde_json::from_slice(&list.stdout).context("parse gh pr list JSON")?;
-    if let Some(item) = existing.as_array().and_then(|items| items.first()) {
+    let items = existing
+        .as_array()
+        .ok_or_else(|| anyhow!("gh pr list returned non-array JSON"))?;
+    let mut repository_parts = repository.rsplit('/');
+    let repository_name = repository_parts
+        .next()
+        .ok_or_else(|| anyhow!("invalid GitHub repository target"))?;
+    let repository_owner = repository_parts
+        .next()
+        .ok_or_else(|| anyhow!("invalid GitHub repository target"))?;
+    let repository_with_owner = format!("{repository_owner}/{repository_name}");
+    let candidates: Vec<&serde_json::Value> = items
+        .iter()
+        .filter(|item| {
+            let owner = item["headRepositoryOwner"]["login"].as_str();
+            let name = item["headRepository"]["name"].as_str();
+            let name_with_owner = item["headRepository"]["nameWithOwner"].as_str();
+            (owner == Some(repository_owner) && name == Some(repository_name))
+                || name_with_owner == Some(repository_with_owner.as_str())
+        })
+        .collect();
+    let exact = candidates
+        .iter()
+        .copied()
+        .find(|item| item["baseRefName"].as_str() == Some(request.base));
+    if exact.is_none() && candidates.len() > 1 {
+        return Err(anyhow!(
+            "multiple open GitHub pull requests exist for {}; specify the intended base outside Shirei",
+            request.branch
+        ));
+    }
+    if let Some(item) = exact.or_else(|| candidates.first().copied()) {
         let number = item["number"]
             .as_i64()
             .ok_or_else(|| anyhow!("gh pr list returned an item without number"))?
             .to_string();
         let url = item["url"].as_str().map(str::to_string);
-        let current_base = item["baseRefName"].as_str().unwrap_or_default();
-        if current_base != request.base {
-            let edit = Command::new("gh")
-                .args(["pr", "edit", &number, "--base", request.base])
-                .current_dir(request.worktree)
-                .env("GH_PROMPT_DISABLED", "1")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .stdin(Stdio::null())
-                .output()
-                .context("failed to run gh pr edit")?;
-            if !edit.status.success() {
-                return Err(anyhow!(
-                    "gh pr edit failed: {}",
-                    String::from_utf8_lossy(&edit.stderr).trim()
-                ));
-            }
-            return Ok(EnsureReviewOutcome::Updated {
-                url,
-                id: Some(number),
-            });
-        }
         return Ok(EnsureReviewOutcome::AlreadyCorrect {
             url,
             id: Some(number),
@@ -470,7 +513,15 @@ fn ensure_github_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcom
         "--head",
         request.branch,
         "--fill",
+        "--repo",
+        repository,
     ];
+    if let Some(title) = request.title {
+        args.extend(["--title", title]);
+    }
+    if let Some(body) = request.body {
+        args.extend(["--body", body]);
+    }
     if request.draft {
         args.push("--draft");
     }
@@ -488,17 +539,25 @@ fn ensure_github_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcom
             String::from_utf8_lossy(&create.stderr).trim()
         ));
     }
-    let url = String::from_utf8_lossy(&create.stdout).trim().to_string();
-    let viewed = view_github_review(request.worktree, request.branch)?;
+    let output = String::from_utf8_lossy(&create.stdout);
+    let created_url = output
+        .split_whitespace()
+        .rev()
+        .find(|value| value.starts_with("http://") || value.starts_with("https://"))
+        .map(str::to_string);
+    let selector = created_url.as_deref().unwrap_or(request.branch);
+    let viewed = view_github_review(request.worktree, selector, repository)?;
     Ok(EnsureReviewOutcome::Created {
-        url: (!url.is_empty()).then_some(url).or(viewed.1),
+        url: created_url.or(viewed.1),
         id: viewed.0,
     })
 }
 
-fn get_github_review_body(worktree: &Path, review_id: &str) -> Result<String> {
+fn get_github_review_body(worktree: &Path, review_id: &str, repository: &str) -> Result<String> {
     let output = Command::new("gh")
-        .args(["pr", "view", review_id, "--json", "body"])
+        .args([
+            "pr", "view", review_id, "--json", "body", "--repo", repository,
+        ])
         .current_dir(worktree)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -516,7 +575,12 @@ fn get_github_review_body(worktree: &Path, review_id: &str) -> Result<String> {
     Ok(value["body"].as_str().unwrap_or_default().to_string())
 }
 
-fn update_github_review_body(worktree: &Path, review_id: &str, body: &str) -> Result<()> {
+fn update_github_review_body(
+    worktree: &Path,
+    review_id: &str,
+    body: &str,
+    repository: &str,
+) -> Result<()> {
     let path = std::env::temp_dir().join(format!(
         "shirei-pr-body-{}-{}.md",
         std::process::id(),
@@ -529,6 +593,8 @@ fn update_github_review_body(worktree: &Path, review_id: &str, body: &str) -> Re
         .arg(review_id)
         .arg("--body-file")
         .arg(&path)
+        .arg("--repo")
+        .arg(repository)
         .current_dir(worktree)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -545,9 +611,21 @@ fn update_github_review_body(worktree: &Path, review_id: &str, body: &str) -> Re
     Ok(())
 }
 
-fn view_github_review(worktree: &Path, selector: &str) -> Result<(Option<String>, Option<String>)> {
+fn view_github_review(
+    worktree: &Path,
+    selector: &str,
+    repository: &str,
+) -> Result<(Option<String>, Option<String>)> {
     let output = Command::new("gh")
-        .args(["pr", "view", selector, "--json", "number,url"])
+        .args([
+            "pr",
+            "view",
+            selector,
+            "--json",
+            "number,url",
+            "--repo",
+            repository,
+        ])
         .current_dir(worktree)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -565,45 +643,45 @@ fn view_github_review(worktree: &Path, selector: &str) -> Result<(Option<String>
     ))
 }
 
-fn preferred_forge(worktree: &Path) -> Result<ForgeKind> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["remote", "-v"])
-        .output()
-        .context("failed to run git remote -v")?;
-    if !output.status.success() {
-        return Ok(ForgeKind::Unknown);
-    }
-    let mut saw_github = false;
-    for target in String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.split_whitespace().nth(1))
-        .filter_map(remote_target)
-    {
-        match target.kind {
-            ForgeKind::GitLab => return Ok(ForgeKind::GitLab),
-            ForgeKind::GitHub => saw_github = true,
-            ForgeKind::Unknown => {}
-        }
-    }
-    if saw_github {
-        Ok(ForgeKind::GitHub)
-    } else {
-        Ok(ForgeKind::Unknown)
-    }
+fn review_target(worktree: &Path, remote: &str) -> Result<ReviewTarget> {
+    let url = crate::git::remote_url(worktree, remote)?;
+    let target = remote_target(&url)
+        .ok_or_else(|| anyhow!("unsupported forge remote format for {remote}"))?;
+    let kind = match target.kind {
+        ForgeKind::GitHub => ForgeKind::GitHub,
+        ForgeKind::GitLab => ForgeKind::GitLab,
+        ForgeKind::Unknown => ForgeKind::GitHub,
+    };
+    let repository = match kind {
+        ForgeKind::GitHub => target.gh_repo,
+        ForgeKind::GitLab => target.glab_repo,
+        ForgeKind::Unknown => unreachable!(),
+    };
+    Ok(ReviewTarget {
+        kind,
+        repository,
+        display: target.display,
+    })
 }
 
-fn ensure_gitlab_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcome> {
+fn ensure_gitlab_review(
+    request: ReviewRequest<'_>,
+    repository: &str,
+) -> Result<EnsureReviewOutcome> {
     let list = Command::new("glab")
         .args([
             "mr",
             "list",
             "--source-branch",
             request.branch,
-            "--all",
+            "--target-branch",
+            request.base,
+            "--per-page",
+            "100",
             "--output",
             "json",
+            "--repo",
+            repository,
         ])
         .current_dir(request.worktree)
         .env("GLAB_PROMPT_DISABLED", "1")
@@ -619,7 +697,34 @@ fn ensure_gitlab_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcom
     }
     let existing: serde_json::Value =
         serde_json::from_slice(&list.stdout).context("parse glab mr list JSON")?;
-    if let Some(item) = existing.as_array().and_then(|items| items.first()) {
+    let items = existing
+        .as_array()
+        .ok_or_else(|| anyhow!("glab mr list returned non-array JSON"))?;
+    let candidates: Vec<&serde_json::Value> = items
+        .iter()
+        .filter(|item| {
+            let source_project = item["source_project_id"]
+                .as_i64()
+                .or_else(|| item["sourceProjectId"].as_i64());
+            let target_project = item["target_project_id"]
+                .as_i64()
+                .or_else(|| item["targetProjectId"].as_i64());
+            source_project.is_some() && source_project == target_project
+        })
+        .collect();
+    let exact = candidates.iter().copied().find(|item| {
+        item["target_branch"]
+            .as_str()
+            .or_else(|| item["targetBranch"].as_str())
+            == Some(request.base)
+    });
+    if exact.is_none() && candidates.len() > 1 {
+        return Err(anyhow!(
+            "multiple open GitLab merge requests exist for {}; specify the intended base outside Shirei",
+            request.branch
+        ));
+    }
+    if let Some(item) = exact.or_else(|| candidates.first().copied()) {
         let id = item["iid"]
             .as_i64()
             .or_else(|| item["id"].as_i64())
@@ -629,30 +734,51 @@ fn ensure_gitlab_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcom
             .as_str()
             .or_else(|| item["webUrl"].as_str())
             .map(str::to_string);
-        let current_base = item["target_branch"]
-            .as_str()
-            .or_else(|| item["targetBranch"].as_str())
-            .unwrap_or_default();
-        if current_base != request.base {
-            let edit = Command::new("glab")
-                .args(["mr", "update", &id, "--target-branch", request.base])
-                .current_dir(request.worktree)
-                .env("GLAB_PROMPT_DISABLED", "1")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .stdin(Stdio::null())
-                .output()
-                .context("failed to run glab mr update")?;
-            if !edit.status.success() {
-                return Err(anyhow!(
-                    "glab mr update failed: {}",
-                    String::from_utf8_lossy(&edit.stderr).trim()
-                ));
-            }
-            return Ok(EnsureReviewOutcome::Updated { url, id: Some(id) });
-        }
         return Ok(EnsureReviewOutcome::AlreadyCorrect { url, id: Some(id) });
     }
 
+    let generated_title = if request.title.is_none() {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(request.worktree)
+            .args(["log", "-1", "--format=%s", request.branch])
+            .output()
+            .context("failed to derive merge request title from git")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git log failed while deriving merge request title: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    };
+    let generated_body = if request.body.is_none() {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(request.worktree)
+            .args(["log", "-1", "--format=%b", request.branch])
+            .output()
+            .context("failed to derive merge request description from git")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git log failed while deriving merge request description: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    };
+    let title = request
+        .title
+        .or(generated_title.as_deref())
+        .unwrap_or_default();
+    let body = request
+        .body
+        .or(generated_body.as_deref())
+        .unwrap_or_default();
     let mut args = vec![
         "mr",
         "create",
@@ -660,7 +786,13 @@ fn ensure_gitlab_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcom
         request.branch,
         "--target-branch",
         request.base,
-        "--fill",
+        "--title",
+        title,
+        "--description",
+        body,
+        "--yes",
+        "--repo",
+        repository,
     ];
     if request.draft {
         args.push("--draft");
@@ -669,6 +801,7 @@ fn ensure_gitlab_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcom
         .args(args)
         .current_dir(request.worktree)
         .env("GLAB_PROMPT_DISABLED", "1")
+        .env("NO_PROMPT", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .output()
@@ -679,17 +812,31 @@ fn ensure_gitlab_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcom
             String::from_utf8_lossy(&create.stderr).trim()
         ));
     }
-    let stdout = String::from_utf8_lossy(&create.stdout).trim().to_string();
-    let viewed = view_gitlab_review(request.worktree, request.branch)?;
+    let output = String::from_utf8_lossy(&create.stdout);
+    let created_url = output
+        .split_whitespace()
+        .rev()
+        .find(|value| value.starts_with("http://") || value.starts_with("https://"))
+        .map(str::to_string);
+    let created_id = created_url.as_deref().and_then(|url| {
+        url.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|value| value.chars().all(|character| character.is_ascii_digit()))
+    });
+    let selector = created_id.unwrap_or(request.branch);
+    let viewed = view_gitlab_review(request.worktree, selector, repository)?;
     Ok(EnsureReviewOutcome::Created {
-        url: (!stdout.is_empty()).then_some(stdout).or(viewed.1),
+        url: created_url.or(viewed.1),
         id: viewed.0,
     })
 }
 
-fn get_gitlab_review_body(worktree: &Path, review_id: &str) -> Result<String> {
+fn get_gitlab_review_body(worktree: &Path, review_id: &str, repository: &str) -> Result<String> {
     let output = Command::new("glab")
-        .args(["mr", "view", review_id, "--output", "json"])
+        .args([
+            "mr", "view", review_id, "--output", "json", "--repo", repository,
+        ])
         .current_dir(worktree)
         .env("GLAB_PROMPT_DISABLED", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -711,7 +858,12 @@ fn get_gitlab_review_body(worktree: &Path, review_id: &str) -> Result<String> {
         .to_string())
 }
 
-fn update_gitlab_review_body(worktree: &Path, review_id: &str, body: &str) -> Result<()> {
+fn update_gitlab_review_body(
+    worktree: &Path,
+    review_id: &str,
+    body: &str,
+    repository: &str,
+) -> Result<()> {
     let path = std::env::temp_dir().join(format!(
         "shirei-mr-body-{}-{}.md",
         std::process::id(),
@@ -724,6 +876,8 @@ fn update_gitlab_review_body(worktree: &Path, review_id: &str, body: &str) -> Re
         .arg(review_id)
         .arg("--description-file")
         .arg(&path)
+        .arg("--repo")
+        .arg(repository)
         .current_dir(worktree)
         .env("GLAB_PROMPT_DISABLED", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -740,9 +894,15 @@ fn update_gitlab_review_body(worktree: &Path, review_id: &str, body: &str) -> Re
     Ok(())
 }
 
-fn view_gitlab_review(worktree: &Path, selector: &str) -> Result<(Option<String>, Option<String>)> {
+fn view_gitlab_review(
+    worktree: &Path,
+    selector: &str,
+    repository: &str,
+) -> Result<(Option<String>, Option<String>)> {
     let output = Command::new("glab")
-        .args(["mr", "view", selector, "--output", "json"])
+        .args([
+            "mr", "view", selector, "--output", "json", "--repo", repository,
+        ])
         .current_dir(worktree)
         .env("GLAB_PROMPT_DISABLED", "1")
         .env("GIT_TERMINAL_PROMPT", "0")

@@ -61,10 +61,46 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<WorktreesCmd>,
     },
+    /// Create pull requests or merge requests.
+    Pr {
+        #[command(subcommand)]
+        action: PrCmd,
+    },
     /// Manage stacked PR branches, rebases, and review submission.
     Stack {
         #[command(subcommand)]
         action: StackCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PrCmd {
+    /// Push the current branch and create or reuse its review.
+    Create {
+        /// Target branch. Defaults to the selected remote's HEAD branch.
+        #[arg(short = 'b', long = "base")]
+        base: Option<String>,
+        /// Review title. Defaults to commit information.
+        #[arg(long = "title")]
+        title: Option<String>,
+        /// Review body. Defaults to commit information.
+        #[arg(long = "body", conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read the review body from a file.
+        #[arg(long = "body-file", conflicts_with = "body")]
+        body_file: Option<PathBuf>,
+        /// Create the review as a draft.
+        #[arg(long = "draft")]
+        draft: bool,
+        /// Preview without pushing or contacting the forge.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long = "expected-branch", hide = true)]
+        expected_branch: Option<String>,
+        #[arg(long = "expected-head", hide = true)]
+        expected_head: Option<String>,
+        #[arg(long = "expected-remote", hide = true)]
+        expected_remote: Option<String>,
     },
 }
 
@@ -158,6 +194,7 @@ fn main() -> Result<()> {
             Some(WorktreesCmd::Scan) => run_worktrees_scan(),
             None => run_worktrees_list(),
         },
+        Cmd::Pr { action } => run_pr(action),
         Cmd::Stack { action } => match action {
             StackCmd::Branch { name, base } => run_stack_branch(&name, &base),
             StackCmd::Track { branch, base, repo } => {
@@ -666,6 +703,124 @@ fn run_rebase_progress(state: &mut State) -> Result<()> {
     }
 }
 
+fn run_pr(action: PrCmd) -> Result<()> {
+    let PrCmd::Create {
+        base,
+        title,
+        body,
+        body_file,
+        draft,
+        dry_run,
+        expected_branch,
+        expected_head,
+        expected_remote,
+    } = action;
+
+    let repo = resolve_repo(None)?;
+    let branch = git::current_branch(&repo)?;
+    let head = git::head_oid(&repo)?;
+    if !git::worktree_is_clean(&repo)? {
+        return Err(anyhow!(
+            "worktree is dirty; commit or stash changes before creating a review"
+        ));
+    }
+
+    let remote = git::default_remote(&repo)?.ok_or_else(|| anyhow!("repository has no remotes"))?;
+    let remote_identity = forge::review_remote_identity(&repo, &remote)?;
+    let push_url = git::remote_push_url(&repo, &remote)?;
+    let push_identity = forge::review_url_identity(&push_url)?;
+    if push_identity != remote_identity {
+        return Err(anyhow!(
+            "{remote} fetches from {remote_identity} but pushes to {push_identity}; split-source reviews are not supported"
+        ));
+    }
+    if expected_branch
+        .as_deref()
+        .is_some_and(|value| value != branch)
+    {
+        return Err(anyhow!("review plan changed: current branch is {branch}"));
+    }
+    if expected_head.as_deref().is_some_and(|value| value != head) {
+        return Err(anyhow!("review plan changed: HEAD is now {head}"));
+    }
+    if expected_remote
+        .as_deref()
+        .is_some_and(|value| value != remote_identity)
+    {
+        return Err(anyhow!(
+            "review plan changed: {remote} now points to {remote_identity}"
+        ));
+    }
+
+    let base = match base.as_deref() {
+        Some(value) if value.trim().is_empty() => {
+            return Err(anyhow!("--base cannot be empty"));
+        }
+        Some(value) => value.trim().to_string(),
+        None => git::default_remote_branch(&repo, &remote)?,
+    };
+    let title = match title.as_deref() {
+        Some(value) if value.trim().is_empty() => {
+            return Err(anyhow!("--title cannot be empty"));
+        }
+        Some(value) => Some(value.trim()),
+        None => None,
+    };
+    let file_body = body_file
+        .as_deref()
+        .map(|path| {
+            std::fs::read_to_string(path)
+                .with_context(|| format!("read review body from {}", path.display()))
+        })
+        .transpose()?;
+    let body = body.as_deref().or(file_body.as_deref());
+
+    if dry_run {
+        println!("action=push-and-ensure-open-review");
+        println!("repo={}", repo.display());
+        println!("remote={remote}");
+        println!("remote_target={remote_identity}");
+        println!("branch={branch}");
+        println!("head={head}");
+        println!("base={base}");
+        println!("draft={draft}");
+        println!(
+            "title={}",
+            title
+                .map(serde_json::to_string)
+                .transpose()?
+                .unwrap_or_else(|| "<fill-from-commits>".to_string())
+        );
+        println!(
+            "body={}",
+            body.map(serde_json::to_string)
+                .transpose()?
+                .unwrap_or_else(|| "<fill-from-commits>".to_string())
+        );
+        return Ok(());
+    }
+
+    git::push_branch(&repo, &remote, &branch)?;
+    let outcome = forge::ensure_review(forge::ReviewRequest {
+        worktree: &repo,
+        branch: &branch,
+        base: &base,
+        remote: &remote,
+        title,
+        body,
+        draft,
+    })?;
+    let status = match outcome {
+        forge::EnsureReviewOutcome::Created { .. } => "created",
+        forge::EnsureReviewOutcome::AlreadyCorrect { .. } => "existing",
+    };
+    println!(
+        "{status} branch={branch}\tbase={base}\turl={}",
+        outcome.url().unwrap_or("-")
+    );
+    Ok(())
+}
+
 fn run_stack_submit(
     branch: Option<&str>,
     repo_arg: Option<&Path>,
@@ -693,6 +848,14 @@ fn run_stack_submit(
     }
 
     let remote = git::default_remote(&repo)?.ok_or_else(|| anyhow!("repository has no remotes"))?;
+    let remote_identity = forge::review_remote_identity(&repo, &remote)?;
+    let push_url = git::remote_push_url(&repo, &remote)?;
+    let push_identity = forge::review_url_identity(&push_url)?;
+    if push_identity != remote_identity {
+        return Err(anyhow!(
+            "{remote} fetches from {remote_identity} but pushes to {push_identity}; split-source reviews are not supported"
+        ));
+    }
     let mut reviews = Vec::new();
     for step in &plan.steps {
         let worktree = step
@@ -707,6 +870,9 @@ fn run_stack_submit(
             worktree,
             branch: &step.branch,
             base: &step.base,
+            remote: &remote,
+            title: None,
+            body: None,
             draft,
         })?;
         let now = OffsetDateTime::now_utc();
@@ -734,7 +900,7 @@ fn run_stack_submit(
             .find(|step| step.branch == review.branch)
             .ok_or_else(|| anyhow!("missing submit step for {}", review.branch))?;
         let worktree = step.worktree.as_ref().unwrap();
-        let body = forge::get_review_body(worktree, id)?;
+        let body = forge::get_review_body(worktree, &remote, id)?;
         let rendered = stack::render_stack_links(
             links
                 .get(&review.branch)
@@ -742,7 +908,7 @@ fn run_stack_submit(
         );
         let updated = stack::replace_stack_links_block(&body, &rendered)?;
         if updated != body {
-            forge::update_review_body(worktree, id, &updated)?;
+            forge::update_review_body(worktree, &remote, id, &updated)?;
         }
     }
     state::save(&state)?;

@@ -1,7 +1,7 @@
 ---
 name: shirei
-description: Use the Shirei terminal session manager and its worktree-aware project switching workflows. Load when opening or listing Shirei sessions, creating branch worktrees, managing stacked PRs, cascade rebasing stack branches, finding unfinished worktrees, interactively deleting worktrees, scanning Shirei state, generating shell completions, configuring tmux or Herdr, or troubleshooting the shirei CLI.
-compatibility: Requires shirei and one configured backend (tmux or Herdr); interactive commands also require fzf. Unfinished-review detection and stack submit optionally use gh and glab.
+description: Use the Shirei terminal session manager and its worktree-aware project switching and review workflows. Load when opening or listing Shirei sessions, creating branch worktrees, creating standalone PRs or MRs, managing stacked PRs, cascade rebasing stack branches, finding unfinished worktrees, interactively deleting worktrees, scanning Shirei state, generating shell completions, configuring tmux or Herdr, or troubleshooting the shirei CLI.
+compatibility: Requires shirei and one configured backend (tmux or Herdr); interactive commands also require fzf. Review creation, unfinished-review detection, and stack submit use authenticated gh or glab CLIs.
 ---
 
 # Shirei CLI
@@ -50,6 +50,8 @@ Prefer installed help and source over remembered flags or stale documentation.
 | Find unfinished work | `shirei worktrees unfinished` | Read-only; consults Git and available forge CLIs. |
 | Delete worktrees | `shirei worktrees prune` | Interactive, confirmed, and destructive. |
 | Rebuild the registry | `shirei worktrees scan` | Replaces the registry from discovered Git worktrees. |
+| Create standalone review | `shirei pr create [--base BASE] [--draft]` | Pushes the current branch and creates or reuses its PR/MR. |
+| Preview standalone review | `shirei pr create --dry-run` | Validates and previews without pushing or contacting the forge. |
 | Create stacked PR branch | `shirei stack branch NAME --base BASE` | Creates/opens worktree and records review base. |
 | List stacked PRs | `shirei stack list` | Read-only stack metadata report. |
 | Cascade rebase stack | `shirei stack rebase --branch LEAF [--dry-run]` | Mutating unless `--dry-run`; stops on conflicts. |
@@ -201,6 +203,16 @@ shirei worktrees scan
 
 Configured roots support literal paths and a final `/*` for direct children only. They are not general recursive globs.
 
+## Standalone PRs and MRs
+
+Prefer `shirei pr create` over calling `gh pr create` or `glab mr create` directly. Shirei selects the forge from Git remotes and uses the authenticated host CLI underneath.
+
+The command operates on the current branch and requires a clean worktree. It pushes to `origin`, or the first configured remote when `origin` is absent. `--base` selects the target; otherwise Shirei resolves the selected remote's HEAD branch and fails with guidance when that ref is unavailable. `--title` and either `--body` or `--body-file` override commit-derived text, while `--draft` creates a new review as a draft.
+
+An existing open review targeting the selected base is reused without overwriting its title, body, or draft state. Reviews targeting other branches are left untouched, and closed or merged reviews do not block a new review.
+
+Always run `shirei pr create --dry-run` before mutation. Dry-run validates the Git state and prints the planned branch, commit, remote, push, and review without pushing or invoking `gh` or `glab`. In Pi, use `shirei_pr_create` rather than a shell command; the tool requires confirmation and rejects the operation if the confirmed branch, commit, or remote changes before mutation.
+
 ## Stacked PRs
 
 `shirei stack branch NAME --base BASE` creates or reuses a worktree/session and records `NAME -> BASE` as stack metadata. Use it when the user wants stacked PR/MR workflows instead of a standalone branch.
@@ -252,6 +264,8 @@ Supported examples:
 ```
 
 `/shirei branch` and `/shirei stack branch` require Pi to run inside tmux or Herdr. `/shirei worktrees prune` is intentionally blocked because prune requires an interactive terminal. Non-dry-run `/shirei stack submit` is blocked in Pi for now; run it in a terminal. For LLM-assisted cascade rebases, use the `shirei_stack_rebase_assist` tool rather than a plain `/shirei stack rebase` command.
+
+The extension also registers `shirei_pr_create`. Use it for standalone PR/MR creation instead of invoking forge CLIs directly. It accepts an optional repository, base, title, body, and draft flag; it runs `shirei pr create --dry-run`, shows the full preview, and requires confirmation before pushing or creating a review.
 
 The extension also registers the `shirei_stack_rebase_assist` tool. Use it only when the user explicitly asks the current agent to cascade rebase a stack with LLM conflict repair. It requires a leaf branch and optionally accepts a repository, root `--onto` target, model order, and retry limit. It confirms before mutating, chooses the first available/authenticated model from Luna -> Terra -> Sol by default, and restores the previous model on completion/failure.
 
@@ -317,10 +331,12 @@ Inside tmux, Shirei switches clients; outside tmux, it attaches and may block un
 3. Never run `worktrees prune` unattended or provide its `delete` confirmation automatically.
 4. Treat `branch` and `stack branch` as high-impact because they change Git, state, sessions, and may execute repository code.
 5. Use `shirei branch NAME --base REF` or `shirei stack branch NAME --base REF` only after confirming branch, base, and side effects.
-6. Treat non-dry-run `stack rebase` and `stack submit` as high-impact; prefer `--dry-run` first.
-7. Never let stack submit rewrite a whole PR description. Only the managed previous/next block may be appended or replaced.
-8. Require explicit intent before `kill`; it terminates live processes.
-9. Back up state before `worktrees scan` when registry continuity matters.
-10. Do not infer success from fzf cancellation; cancellation normally exits successfully.
-11. Do not assume a saved path or branch is still valid.
-12. Do not invent commands or flags; verify them against current help.
+6. Prefer `shirei pr create` over direct `gh pr create` or `glab mr create` for standalone reviews.
+7. In Pi, use `shirei_pr_create` so standalone review creation is previewed and confirmed.
+8. Treat non-dry-run `pr create`, `stack rebase`, and `stack submit` as high-impact; prefer `--dry-run` first.
+9. Never let stack submit rewrite a whole PR description. Only the managed previous/next block may be appended or replaced.
+10. Require explicit intent before `kill`; it terminates live processes.
+11. Back up state before `worktrees scan` when registry continuity matters.
+12. Do not infer success from fzf cancellation; cancellation normally exits successfully.
+13. Do not assume a saved path or branch is still valid.
+14. Do not invent commands or flags; verify them against current help.
