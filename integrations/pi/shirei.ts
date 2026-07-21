@@ -413,10 +413,12 @@ export default function (pi: ExtensionAPI) {
 		name: "shirei_pr_create",
 		label: "Shirei PR Create",
 		description:
-			"Preview, confirm, push, and create or reuse a standalone GitHub pull request or GitLab merge request through Shirei.",
-		promptSnippet: "Create a standalone pull request or merge request with preview and confirmation",
+			"Create or reuse a standalone GitHub pull request or GitLab merge request with an agent-authored title and description, preview, and confirmation.",
+		promptSnippet: "Author, preview, and confirm a standalone pull request or merge request",
 		promptGuidelines: [
+			"Before using shirei_pr_create, inspect the branch diff and commits against its review base.",
 			"Use shirei_pr_create instead of calling gh pr create or glab mr create directly for standalone reviews.",
+			"Write a concise review title and a polished body that explains motivation, key decisions, system impact, testing, and stack position when applicable; omit empty sections and placeholders.",
 			"Use Shirei stack submission instead when the branch belongs to a tracked Shirei stack.",
 		],
 		parameters: Type.Object({
@@ -424,8 +426,11 @@ export default function (pi: ExtensionAPI) {
 				Type.String({ description: "Target repository path; defaults to the current repository" }),
 			),
 			base: Type.Optional(Type.String({ description: "Target branch; defaults to the remote's HEAD branch" })),
-			title: Type.Optional(Type.String({ description: "Review title; defaults to commit information" })),
-			body: Type.Optional(Type.String({ description: "Review body; defaults to commit information" })),
+			title: Type.String({ description: "Concise agent-authored review title based on the branch diff" }),
+			body: Type.String({
+				description:
+					"Polished agent-authored review description covering motivation, decisions, impact, testing, and stack position when relevant",
+			}),
 			draft: Type.Optional(Type.Boolean({ description: "Create the review as a draft" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -441,15 +446,14 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(rootResult.stderr.trim() || `${requestedRepository} is not inside a Git repository`);
 			}
 			const repository = await realpath(rootResult.stdout.trim()).catch(() => resolve(rootResult.stdout.trim()));
-			const args = ["pr", "create"];
+			const title = params.title.trim();
+			const body = params.body.trim();
+			if (!title || !body) {
+				throw new Error("shirei_pr_create requires a non-empty agent-authored title and body");
+			}
+			const args = ["pr", "create", "--title", title, "--body", body];
 			if (params.base !== undefined) {
 				args.push("--base", params.base);
-			}
-			if (params.title !== undefined) {
-				args.push("--title", params.title);
-			}
-			if (params.body !== undefined) {
-				args.push("--body", params.body);
 			}
 			if (params.draft === true) {
 				args.push("--draft");

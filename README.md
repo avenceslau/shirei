@@ -99,8 +99,9 @@ Run `/reload` in Pi, then use commands such as:
 The extension renders command reports with `pi.appendEntry()`, so they do not
 enter LLM context. Interactive prune remains terminal-only. Non-dry-run stack
 submit is terminal-only for now. For a standalone review, ask Pi to use
-`shirei_pr_create`; it previews the push and review, then requires confirmation
-before running `shirei pr create`. For LLM-assisted cascade rebases, ask Pi to
+`shirei_pr_create`; the agent inspects the branch, authors the title and
+review description, previews the complete push and review, then requires
+confirmation before running `shirei pr create`. For LLM-assisted cascade rebases, ask Pi to
 use `shirei_stack_rebase_assist`; it confirms first and then uses the fastest
 available GPT-5.6 Luna/Terra/Sol model to fix conflicts.
 
@@ -361,7 +362,7 @@ Worktrees created by shirei live under:
 
 Use `--title` and either `--body` or `--body-file` to override commit-derived review text. `--draft` creates a new review as a draft. Shirei reuses an open review that already targets the selected base; reviews targeting other branches are left untouched.
 
-Run `shirei pr create --dry-run` to validate and print the planned branch, commit, remote, push, and review without mutating Git or contacting `gh` or `glab`. In Pi, prefer the `shirei_pr_create` tool; it always runs this preview, requires confirmation, and rejects the operation if the confirmed branch, commit, or remote changes before creation.
+Run `shirei pr create --dry-run` to validate and print the planned branch, commit, remote, push, and review without mutating Git or contacting `gh` or `glab`. The terminal command keeps title and body optional. In Pi, `shirei_pr_create` requires the agent to inspect the diff and commits and provide a polished title and description. It always previews that authored text, requires confirmation, and rejects the operation if the confirmed branch, commit, or remote changes before creation.
 
 ## Stacked PRs
 
