@@ -23,8 +23,10 @@ new session in that directory.
 
 Review creation, stack submission, and unfinished-worktree detection use the authenticated CLI for your repository host:
 
-- `gh` for GitHub pull requests
-- `glab` for GitLab merge requests
+- `gh` 2.40.0 or newer for GitHub pull requests
+- `glab` 1.50.0 or newer for GitLab merge requests
+
+Shirei checks the selected CLI version before pushing a branch for review and returns an update instruction when it is missing, unparseable, or too old.
 
 ## Install
 
@@ -376,6 +378,12 @@ Run `shirei pr create --dry-run` to validate and print the planned branch, commi
 ```
 
 User-authored PR description text outside that block is preserved exactly. If Shirei cannot safely replace the managed block, it fails instead of rewriting the whole description.
+
+## Forge CLI Contracts
+
+All GitHub and GitLab subprocess interaction is isolated in `src/forge.rs`. Commands receive an explicit repository target and request JSON output with explicit fields whenever the CLI supports it. Review creation itself has no JSON output mode in `gh` or `glab`, so Shirei accepts only the emitted review URL and immediately resolves review metadata through a JSON command.
+
+`tests/forge_cli_contract.rs` runs Shirei against fake `gh` and `glab` executables. The tests lock the required version checks, repository flags, JSON fields, noninteractive behavior, and the absence of GitLab's implicit push flags.
 
 ## Unfinished Worktrees
 

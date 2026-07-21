@@ -1,7 +1,7 @@
 ---
 name: shirei
 description: Use the Shirei terminal session manager and its worktree-aware project switching and review workflows. Load when opening or listing Shirei sessions, creating branch worktrees, creating standalone PRs or MRs, managing stacked PRs, cascade rebasing stack branches, finding unfinished worktrees, interactively deleting worktrees, scanning Shirei state, generating shell completions, configuring tmux or Herdr, or troubleshooting the shirei CLI.
-compatibility: Requires shirei and one configured backend (tmux or Herdr); interactive commands also require fzf. Review creation, unfinished-review detection, and stack submit use authenticated gh or glab CLIs.
+compatibility: Requires shirei and one configured backend (tmux or Herdr); interactive commands also require fzf. Review creation, unfinished-review detection, and stack submit require authenticated gh >= 2.40.0 or glab >= 1.50.0.
 ---
 
 # Shirei CLI

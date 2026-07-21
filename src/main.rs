@@ -800,6 +800,7 @@ fn run_pr(action: PrCmd) -> Result<()> {
         return Ok(());
     }
 
+    forge::validate_review_cli(&repo, &remote)?;
     git::push_branch(&repo, &remote, &branch)?;
     let outcome = forge::ensure_review(forge::ReviewRequest {
         worktree: &repo,
@@ -856,6 +857,7 @@ fn run_stack_submit(
             "{remote} fetches from {remote_identity} but pushes to {push_identity}; split-source reviews are not supported"
         ));
     }
+    forge::validate_review_cli(&repo, &remote)?;
     let mut reviews = Vec::new();
     for step in &plan.steps {
         let worktree = step

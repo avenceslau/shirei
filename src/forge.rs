@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 #[derive(Debug)]
 pub enum ReviewStatus {
@@ -30,6 +31,88 @@ struct ReviewTarget {
     kind: ForgeKind,
     repository: String,
     display: String,
+}
+
+static GH_VERSION_CHECK: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+static GLAB_VERSION_CHECK: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+
+fn checked_version(command: &str, minimum: (u32, u32, u32)) -> std::result::Result<(), String> {
+    let output = Command::new(command)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("failed to run {command} --version: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{command} --version failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let version_token = text.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        if parts.next()? != command {
+            return None;
+        }
+        let value = parts.next()?;
+        if value == "version" {
+            parts.next()
+        } else {
+            Some(value)
+        }
+    });
+    let version_token = version_token
+        .ok_or_else(|| format!("could not parse {command} version from: {}", text.trim()))?
+        .trim_start_matches('v');
+    let parse_error = || format!("could not parse {command} version from: {}", text.trim());
+    let without_build = match version_token.split_once('+') {
+        Some((_, "")) => return Err(parse_error()),
+        Some((value, _)) => value,
+        None => version_token,
+    };
+    let (core, prerelease) = match without_build.split_once('-') {
+        Some((_, "")) => return Err(parse_error()),
+        Some((value, _)) => (value, true),
+        None => (without_build, false),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3
+        || parts.iter().any(|part| {
+            part.is_empty() || !part.chars().all(|character| character.is_ascii_digit())
+        })
+    {
+        return Err(parse_error());
+    }
+    let version = (
+        parts[0].parse().map_err(|_| parse_error())?,
+        parts[1].parse().map_err(|_| parse_error())?,
+        parts[2].parse().map_err(|_| parse_error())?,
+    );
+    if version < minimum || (version == minimum && prerelease) {
+        return Err(format!(
+            "unsupported {command} version {version_token}; Shirei requires {command} >= {}.{}.{}",
+            minimum.0, minimum.1, minimum.2
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_gh_version() -> Result<()> {
+    GH_VERSION_CHECK
+        .get_or_init(|| checked_version("gh", (2, 40, 0)))
+        .clone()
+        .map_err(|error| anyhow!("{error}; update or reinstall gh"))
+}
+
+fn ensure_glab_version() -> Result<()> {
+    GLAB_VERSION_CHECK
+        .get_or_init(|| checked_version("glab", (1, 50, 0)))
+        .clone()
+        .map_err(|error| anyhow!("{error}; update or reinstall glab"))
 }
 
 fn remote_target(remote: &str) -> Option<RemoteTarget> {
@@ -160,170 +243,178 @@ pub fn review_status(worktree: &Path, branch: &str) -> ReviewStatus {
     for target in remotes.values() {
         let mut remote_covered = false;
         if !matches!(target.kind, ForgeKind::GitLab) {
-            match Command::new("gh")
-                .args([
-                    "pr",
-                    "list",
-                    "--repo",
-                    &target.gh_repo,
-                    "--head",
-                    branch,
-                    "--state",
-                    "all",
-                    "--limit",
-                    "100",
-                    "--json",
-                    "state,mergedAt,headRefOid",
-                ])
-                .current_dir(worktree)
-                .env("GH_PROMPT_DISABLED", "1")
-                .env("GH_HTTP_TIMEOUT", "15")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .stdin(Stdio::null())
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                        Ok(value) if value.as_array().is_some() => {
-                            remote_covered = true;
-                            for item in value.as_array().unwrap() {
-                                let open = item["state"]
-                                    .as_str()
-                                    .is_some_and(|state| state.eq_ignore_ascii_case("open"));
-                                let merged = !item["mergedAt"].is_null();
-                                if !open && !merged {
-                                    continue;
-                                }
-                                let Some(review_head) = item["headRefOid"].as_str() else {
-                                    ambiguous_review = true;
-                                    errors.push(format!(
-                                        "gh returned a review without headRefOid for {}",
-                                        target.display
-                                    ));
-                                    continue;
-                                };
-                                let review_to_local = is_ancestor(worktree, review_head, &head);
-                                let local_to_review = is_ancestor(worktree, &head, review_head);
-                                if (open || merged) && local_to_review == Some(true) {
-                                    return ReviewStatus::Covered;
-                                }
-                                if review_to_local == Some(true) {
-                                    stale_review = true;
-                                }
-                                if review_to_local.is_none() || local_to_review.is_none() {
-                                    ambiguous_review = true;
-                                    errors.push(format!(
-                                        "could not compare local HEAD with a gh review for {}",
-                                        target.display
-                                    ));
+            if let Err(error) = ensure_gh_version() {
+                errors.push(format!("gh unavailable for {}: {error}", target.display));
+            } else {
+                match Command::new("gh")
+                    .args([
+                        "pr",
+                        "list",
+                        "--repo",
+                        &target.gh_repo,
+                        "--head",
+                        branch,
+                        "--state",
+                        "all",
+                        "--limit",
+                        "100",
+                        "--json",
+                        "state,mergedAt,headRefOid",
+                    ])
+                    .current_dir(worktree)
+                    .env("GH_PROMPT_DISABLED", "1")
+                    .env("GH_HTTP_TIMEOUT", "15")
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .stdin(Stdio::null())
+                    .output()
+                {
+                    Ok(output) if output.status.success() => {
+                        match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                            Ok(value) if value.as_array().is_some() => {
+                                remote_covered = true;
+                                for item in value.as_array().unwrap() {
+                                    let open = item["state"]
+                                        .as_str()
+                                        .is_some_and(|state| state.eq_ignore_ascii_case("open"));
+                                    let merged = !item["mergedAt"].is_null();
+                                    if !open && !merged {
+                                        continue;
+                                    }
+                                    let Some(review_head) = item["headRefOid"].as_str() else {
+                                        ambiguous_review = true;
+                                        errors.push(format!(
+                                            "gh returned a review without headRefOid for {}",
+                                            target.display
+                                        ));
+                                        continue;
+                                    };
+                                    let review_to_local = is_ancestor(worktree, review_head, &head);
+                                    let local_to_review = is_ancestor(worktree, &head, review_head);
+                                    if (open || merged) && local_to_review == Some(true) {
+                                        return ReviewStatus::Covered;
+                                    }
+                                    if review_to_local == Some(true) {
+                                        stale_review = true;
+                                    }
+                                    if review_to_local.is_none() || local_to_review.is_none() {
+                                        ambiguous_review = true;
+                                        errors.push(format!(
+                                            "could not compare local HEAD with a gh review for {}",
+                                            target.display
+                                        ));
+                                    }
                                 }
                             }
+                            Ok(_) => errors
+                                .push(format!("gh returned non-array JSON for {}", target.display)),
+                            Err(error) => errors.push(format!(
+                                "gh returned invalid JSON for {}: {error}",
+                                target.display
+                            )),
                         }
-                        Ok(_) => errors
-                            .push(format!("gh returned non-array JSON for {}", target.display)),
-                        Err(error) => errors.push(format!(
-                            "gh returned invalid JSON for {}: {error}",
-                            target.display
-                        )),
                     }
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    errors.push(format!(
-                        "gh could not query {}: {}",
-                        target.display,
-                        stderr.trim()
-                    ));
-                }
-                Err(error) => {
-                    errors.push(format!("gh unavailable for {}: {error}", target.display))
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        errors.push(format!(
+                            "gh could not query {}: {}",
+                            target.display,
+                            stderr.trim()
+                        ));
+                    }
+                    Err(error) => {
+                        errors.push(format!("gh unavailable for {}: {error}", target.display))
+                    }
                 }
             }
         }
 
         if !matches!(target.kind, ForgeKind::GitHub) {
-            match Command::new("glab")
-                .args([
-                    "mr",
-                    "list",
-                    "--repo",
-                    &target.glab_repo,
-                    "--source-branch",
-                    branch,
-                    "--all",
-                    "--per-page",
-                    "100",
-                    "--output",
-                    "json",
-                ])
-                .current_dir(worktree)
-                .env("GLAB_PROMPT_DISABLED", "1")
-                .env("GLAB_HTTP_TIMEOUT", "15")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .stdin(Stdio::null())
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                        Ok(value) if value.as_array().is_some() => {
-                            remote_covered = true;
-                            for item in value.as_array().unwrap() {
-                                let open = item["state"].as_str().is_some_and(|state| {
-                                    state.eq_ignore_ascii_case("open")
-                                        || state.eq_ignore_ascii_case("opened")
-                                });
-                                let merged = item["state"]
-                                    .as_str()
-                                    .is_some_and(|state| state.eq_ignore_ascii_case("merged"))
-                                    || !item["merged_at"].is_null();
-                                if !open && !merged {
-                                    continue;
-                                }
-                                let Some(review_head) = item["sha"].as_str() else {
-                                    ambiguous_review = true;
-                                    errors.push(format!(
-                                        "glab returned a review without sha for {}",
-                                        target.display
-                                    ));
-                                    continue;
-                                };
-                                let review_to_local = is_ancestor(worktree, review_head, &head);
-                                let local_to_review = is_ancestor(worktree, &head, review_head);
-                                if (open || merged) && local_to_review == Some(true) {
-                                    return ReviewStatus::Covered;
-                                }
-                                if review_to_local == Some(true) {
-                                    stale_review = true;
-                                }
-                                if review_to_local.is_none() || local_to_review.is_none() {
-                                    ambiguous_review = true;
-                                    errors.push(format!(
+            if let Err(error) = ensure_glab_version() {
+                errors.push(format!("glab unavailable for {}: {error}", target.display));
+            } else {
+                match Command::new("glab")
+                    .args([
+                        "mr",
+                        "list",
+                        "--repo",
+                        &target.glab_repo,
+                        "--source-branch",
+                        branch,
+                        "--all",
+                        "--per-page",
+                        "100",
+                        "--output",
+                        "json",
+                    ])
+                    .current_dir(worktree)
+                    .env("GLAB_PROMPT_DISABLED", "1")
+                    .env("GLAB_HTTP_TIMEOUT", "15")
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .stdin(Stdio::null())
+                    .output()
+                {
+                    Ok(output) if output.status.success() => {
+                        match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                            Ok(value) if value.as_array().is_some() => {
+                                remote_covered = true;
+                                for item in value.as_array().unwrap() {
+                                    let open = item["state"].as_str().is_some_and(|state| {
+                                        state.eq_ignore_ascii_case("open")
+                                            || state.eq_ignore_ascii_case("opened")
+                                    });
+                                    let merged = item["state"]
+                                        .as_str()
+                                        .is_some_and(|state| state.eq_ignore_ascii_case("merged"))
+                                        || !item["merged_at"].is_null();
+                                    if !open && !merged {
+                                        continue;
+                                    }
+                                    let Some(review_head) = item["sha"].as_str() else {
+                                        ambiguous_review = true;
+                                        errors.push(format!(
+                                            "glab returned a review without sha for {}",
+                                            target.display
+                                        ));
+                                        continue;
+                                    };
+                                    let review_to_local = is_ancestor(worktree, review_head, &head);
+                                    let local_to_review = is_ancestor(worktree, &head, review_head);
+                                    if (open || merged) && local_to_review == Some(true) {
+                                        return ReviewStatus::Covered;
+                                    }
+                                    if review_to_local == Some(true) {
+                                        stale_review = true;
+                                    }
+                                    if review_to_local.is_none() || local_to_review.is_none() {
+                                        ambiguous_review = true;
+                                        errors.push(format!(
                                         "could not compare local HEAD with a glab review for {}",
                                         target.display
                                     ));
+                                    }
                                 }
                             }
+                            Ok(_) => errors.push(format!(
+                                "glab returned non-array JSON for {}",
+                                target.display
+                            )),
+                            Err(error) => errors.push(format!(
+                                "glab returned invalid JSON for {}: {error}",
+                                target.display
+                            )),
                         }
-                        Ok(_) => errors.push(format!(
-                            "glab returned non-array JSON for {}",
-                            target.display
-                        )),
-                        Err(error) => errors.push(format!(
-                            "glab returned invalid JSON for {}: {error}",
-                            target.display
-                        )),
                     }
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    errors.push(format!(
-                        "glab could not query {}: {}",
-                        target.display,
-                        stderr.trim()
-                    ));
-                }
-                Err(error) => {
-                    errors.push(format!("glab unavailable for {}: {error}", target.display))
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        errors.push(format!(
+                            "glab could not query {}: {}",
+                            target.display,
+                            stderr.trim()
+                        ));
+                    }
+                    Err(error) => {
+                        errors.push(format!("glab unavailable for {}: {error}", target.display))
+                    }
                 }
             }
         }
@@ -391,11 +482,25 @@ pub fn review_remote_identity(worktree: &Path, remote: &str) -> Result<String> {
     Ok(review_target(worktree, remote)?.display)
 }
 
+pub fn validate_review_cli(worktree: &Path, remote: &str) -> Result<()> {
+    match review_target(worktree, remote)?.kind {
+        ForgeKind::GitHub => ensure_gh_version(),
+        ForgeKind::GitLab => ensure_glab_version(),
+        ForgeKind::Unknown => unreachable!(),
+    }
+}
+
 pub fn ensure_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcome> {
     let target = review_target(request.worktree, request.remote)?;
     match target.kind {
-        ForgeKind::GitHub => ensure_github_review(request, &target.repository),
-        ForgeKind::GitLab => ensure_gitlab_review(request, &target.repository),
+        ForgeKind::GitHub => {
+            ensure_gh_version()?;
+            ensure_github_review(request, &target.repository)
+        }
+        ForgeKind::GitLab => {
+            ensure_glab_version()?;
+            ensure_gitlab_review(request, &target.repository)
+        }
         ForgeKind::Unknown => unreachable!(),
     }
 }
@@ -403,8 +508,14 @@ pub fn ensure_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcome> 
 pub fn get_review_body(worktree: &Path, remote: &str, review_id: &str) -> Result<String> {
     let target = review_target(worktree, remote)?;
     match target.kind {
-        ForgeKind::GitHub => get_github_review_body(worktree, review_id, &target.repository),
-        ForgeKind::GitLab => get_gitlab_review_body(worktree, review_id, &target.repository),
+        ForgeKind::GitHub => {
+            ensure_gh_version()?;
+            get_github_review_body(worktree, review_id, &target.repository)
+        }
+        ForgeKind::GitLab => {
+            ensure_glab_version()?;
+            get_gitlab_review_body(worktree, review_id, &target.repository)
+        }
         ForgeKind::Unknown => unreachable!(),
     }
 }
@@ -418,9 +529,11 @@ pub fn update_review_body(
     let target = review_target(worktree, remote)?;
     match target.kind {
         ForgeKind::GitHub => {
+            ensure_gh_version()?;
             update_github_review_body(worktree, review_id, body, &target.repository)
         }
         ForgeKind::GitLab => {
+            ensure_glab_version()?;
             update_gitlab_review_body(worktree, review_id, body, &target.repository)
         }
         ForgeKind::Unknown => unreachable!(),
