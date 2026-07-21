@@ -814,7 +814,6 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			await ctx.waitForIdle();
 			ctx.ui.setStatus("shirei-command", `Running shirei ${commandArgs.join(" ")}…`);
 			try {
 				const result = await pi.exec("shirei", commandArgs, { cwd: ctx.cwd, timeout: 180_000 });
