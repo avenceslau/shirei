@@ -40,6 +40,21 @@ struct Pane {
     cwd: String,
 }
 
+#[derive(Deserialize)]
+struct WorkspaceResponse {
+    result: WorkspaceResult,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceResult {
+    workspace: OpenedWorkspace,
+}
+
+#[derive(Deserialize)]
+struct OpenedWorkspace {
+    workspace_id: String,
+}
+
 pub fn list_workspaces() -> Result<Vec<Session>> {
     let Some(response) = snapshot()? else {
         return Ok(Vec::new());
@@ -71,39 +86,7 @@ pub fn list_workspaces() -> Result<Vec<Session>> {
 }
 
 pub fn create_workspace(name: &str, path: &Path) -> Result<String> {
-    if snapshot()?.is_none() {
-        #[cfg(unix)]
-        let mut server = {
-            let mut command = Command::new("nohup");
-            command.args(["herdr", "server"]).process_group(0);
-            command
-        };
-        #[cfg(not(unix))]
-        let mut server = {
-            let mut command = Command::new("herdr");
-            command.arg("server");
-            command
-        };
-        server
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to start herdr server")?;
-
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if snapshot()?.is_some() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return Err(anyhow!(
-                    "herdr server did not become ready within 15 seconds; check ~/.config/herdr/herdr-server.log"
-                ));
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
+    ensure_server()?;
 
     let output = Command::new("herdr")
         .args(["workspace", "create", "--cwd"])
@@ -111,11 +94,23 @@ pub fn create_workspace(name: &str, path: &Path) -> Result<String> {
         .args(["--label", name, "--no-focus"])
         .output()
         .context("failed to run `herdr workspace create`")?;
-    let value: serde_json::Value = parse_output(output, "herdr workspace create")?;
-    value["result"]["workspace"]["workspace_id"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("herdr workspace create returned no workspace id"))
+    let response: WorkspaceResponse = parse_output(output, "herdr workspace create")?;
+    Ok(response.result.workspace.workspace_id)
+}
+
+pub fn open_worktree(name: &str, repo: &Path, path: &Path) -> Result<String> {
+    ensure_server()?;
+
+    let output = Command::new("herdr")
+        .args(["worktree", "open", "--cwd"])
+        .arg(repo)
+        .arg("--path")
+        .arg(path)
+        .args(["--label", name, "--no-focus"])
+        .output()
+        .context("failed to run `herdr worktree open`")?;
+    let response: WorkspaceResponse = parse_output(output, "herdr worktree open")?;
+    Ok(response.result.workspace.workspace_id)
 }
 
 pub fn focus_or_attach(id: &str) -> Result<()> {
@@ -181,6 +176,44 @@ fn snapshot() -> Result<Option<SnapshotResponse>> {
         }
     }
     parse_output(output, "herdr api snapshot").map(Some)
+}
+
+fn ensure_server() -> Result<()> {
+    if snapshot()?.is_some() {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    let mut server = {
+        let mut command = Command::new("nohup");
+        command.args(["herdr", "server"]).process_group(0);
+        command
+    };
+    #[cfg(not(unix))]
+    let mut server = {
+        let mut command = Command::new("herdr");
+        command.arg("server");
+        command
+    };
+    server
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start herdr server")?;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if snapshot()?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "herdr server did not become ready within 15 seconds; check ~/.config/herdr/herdr-server.log"
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn run_status(command: &mut Command, label: &str) -> Result<()> {

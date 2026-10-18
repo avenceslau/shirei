@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 
 use crate::config::{expand_tilde, Config};
 use crate::session::{self, Backend, Session};
-use crate::state::{StackBranch, State};
+use crate::state::{StackBranch, State, Worktree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
@@ -42,7 +42,11 @@ impl Section {
 #[derive(Debug, Clone)]
 pub enum Target {
     ActivateSession(String),
-    OpenDir { path: PathBuf, name_hint: String },
+    OpenDir {
+        path: PathBuf,
+        name_hint: String,
+        worktree: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -84,12 +88,17 @@ pub fn build_rows(state: &State, cfg: &Config, backend: Backend) -> Result<Vec<R
     }
 
     for recent in &state.recent {
+        let worktree = state
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == recent.path);
         if !push_dir_row(
             &mut rows,
             &mut seen_session_names,
             &mut seen_paths,
             Section::Recent,
             &recent.path,
+            worktree,
             backend.names_are_unique(),
         ) {
             continue;
@@ -103,6 +112,7 @@ pub fn build_rows(state: &State, cfg: &Config, backend: Backend) -> Result<Vec<R
             &mut seen_paths,
             Section::Worktree,
             &wt.path,
+            Some(wt),
             backend.names_are_unique(),
         );
     }
@@ -137,6 +147,7 @@ pub fn build_rows(state: &State, cfg: &Config, backend: Backend) -> Result<Vec<R
                 &mut seen_paths,
                 Section::Root,
                 &path,
+                None,
                 backend.names_are_unique(),
             );
         }
@@ -182,6 +193,7 @@ fn push_stack_row(
         target: Target::OpenDir {
             path: path.to_path_buf(),
             name_hint,
+            worktree: true,
         },
     });
     true
@@ -193,6 +205,7 @@ fn push_dir_row(
     seen_paths: &mut HashSet<PathBuf>,
     section: Section,
     path: &Path,
+    worktree: Option<&Worktree>,
     deduplicate_names: bool,
 ) -> bool {
     if !path.is_dir() {
@@ -205,7 +218,19 @@ fn push_dir_row(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
-    let name_hint = session::sanitize_name(&basename);
+    let name_hint = worktree
+        .map(|worktree| {
+            let repo_slug = session::sanitize_name(
+                &worktree
+                    .repo
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "repo".to_string()),
+            );
+            let branch_slug = session::sanitize_name(&worktree.branch);
+            format!("{repo_slug}-{branch_slug}")
+        })
+        .unwrap_or_else(|| session::sanitize_name(&basename));
     if deduplicate_names && seen_session_names.contains(&name_hint) {
         return false;
     }
@@ -215,6 +240,7 @@ fn push_dir_row(
         target: Target::OpenDir {
             path: path.to_path_buf(),
             name_hint,
+            worktree: worktree.is_some(),
         },
     });
     true

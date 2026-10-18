@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::config::BackendKind;
-use crate::{herdr, tmux};
+use crate::{git, herdr, tmux};
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -79,6 +79,13 @@ impl Backend {
                 Ok(name.to_string())
             }
             Self::Herdr => herdr::create_workspace(name, path),
+        }
+    }
+
+    pub fn open_worktree(self, name: &str, path: &Path) -> Result<String> {
+        match self {
+            Self::Tmux => self.create(name, path),
+            Self::Herdr => herdr::open_worktree(name, &git::primary_worktree(path)?, path),
         }
     }
 

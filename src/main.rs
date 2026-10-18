@@ -214,8 +214,16 @@ fn apply_selection(row: &Row, cfg: &Config, backend: Backend, state: &mut State)
         Target::ActivateSession(id) => {
             backend.activate(id)?;
         }
-        Target::OpenDir { path, name_hint } => {
-            open_session(backend, path, name_hint, None)?;
+        Target::OpenDir {
+            path,
+            name_hint,
+            worktree,
+        } => {
+            if *worktree {
+                open_worktree_session(backend, path, name_hint, None)?;
+            } else {
+                open_session(backend, path, name_hint, None)?;
+            }
             state.touch_recent(path, cfg.recent_cap);
             state::save(state)?;
         }
@@ -246,6 +254,30 @@ fn open_session(
         }
         id
     };
+    backend.activate(&id)
+}
+
+fn open_worktree_session(
+    backend: Backend,
+    path: &Path,
+    name_hint: &str,
+    install_cmd: Option<&str>,
+) -> Result<()> {
+    let name = session::sanitize_name(name_hint);
+    if backend.names_are_unique() {
+        if let Some(session) = backend
+            .list()?
+            .into_iter()
+            .find(|session| session.name == name)
+        {
+            return backend.activate(&session.id);
+        }
+    }
+
+    let id = backend.open_worktree(&name, path)?;
+    if let Some(cmd) = install_cmd {
+        backend.run_setup(&id, path, cmd)?;
+    }
     backend.activate(&id)
 }
 
@@ -371,7 +403,7 @@ fn open_branch_result(backend: Backend, result: &BranchOpenResult, cfg: &Config)
             None
         };
     let name_hint = format!("{repo_slug}-{branch_slug}");
-    open_session(backend, &result.path, &name_hint, install_cmd.as_deref())
+    open_worktree_session(backend, &result.path, &name_hint, install_cmd.as_deref())
 }
 
 fn run_stack_branch(name: &str, base: &str) -> Result<()> {

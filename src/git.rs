@@ -105,6 +105,19 @@ pub struct WorktreeStatus {
     pub merge: MergeStatus,
 }
 
+pub fn primary_worktree(repo: &Path) -> Result<PathBuf> {
+    list_worktrees(repo)?
+        .into_iter()
+        .find(|worktree| worktree.is_main)
+        .map(|worktree| worktree.path)
+        .ok_or_else(|| {
+            anyhow!(
+                "could not resolve the primary worktree for {}",
+                repo.display()
+            )
+        })
+}
+
 pub fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeRef>> {
     let output = Command::new("git")
         .arg("-C")
