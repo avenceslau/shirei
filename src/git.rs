@@ -382,12 +382,63 @@ pub fn rev_parse_commit(repo: &Path, rev: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-pub fn default_remote(repo: &Path) -> Result<Option<String>> {
+/// The remote to push `branch` to and open its review on: `requested`, then
+/// the branch's push remote or upstream remote, then `git config
+/// shirei.remote`, then `origin`, then the first remote.
+pub fn review_remote(repo: &Path, branch: &str, requested: Option<&str>) -> Result<String> {
     let remotes = run_git_lines(repo, &["remote"])?;
-    if remotes.iter().any(|remote| remote == "origin") {
-        return Ok(Some("origin".to_string()));
+    let known = |name: &str| remotes.iter().any(|remote| remote == name);
+
+    if let Some(requested) = requested {
+        if !known(requested) {
+            return Err(anyhow!("--remote {requested} is not a configured remote"));
+        }
+        return Ok(requested.to_string());
     }
-    Ok(remotes.into_iter().next())
+    for key in [
+        format!("branch.{branch}.pushRemote"),
+        format!("branch.{branch}.remote"),
+    ] {
+        if let Some(remote) = git_config(repo, &key)? {
+            if known(&remote) {
+                return Ok(remote);
+            }
+        }
+    }
+    if let Some(remote) = git_config(repo, "shirei.remote")? {
+        if !known(&remote) {
+            return Err(anyhow!(
+                "git config shirei.remote names {remote}, which is not a configured remote"
+            ));
+        }
+        return Ok(remote);
+    }
+    if known("origin") {
+        return Ok("origin".to_string());
+    }
+    remotes
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("repository has no remotes"))
+}
+
+fn git_config(repo: &Path, key: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["config", "--get", key])
+        .output()
+        .with_context(|| format!("failed to run git config --get {key}"))?;
+    match output.status.code() {
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        )),
+        Some(1) => Ok(None),
+        _ => Err(anyhow!(
+            "git config --get {key} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
 }
 
 pub fn current_branch(repo: &Path) -> Result<String> {
@@ -968,6 +1019,32 @@ mod tests {
             .unwrap()
             .status
             .success()
+    }
+
+    #[test]
+    fn review_remote_prefers_upstream_then_config_then_origin() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
+        let repo_arg = repo.to_string_lossy().to_string();
+        for remote in ["fork", "origin", "gitlab"] {
+            git(&repo, &["remote", "add", remote, &repo_arg]);
+        }
+
+        assert_eq!(review_remote(&repo, "main", None).unwrap(), "origin");
+        git(&repo, &["config", "shirei.remote", "fork"]);
+        assert_eq!(review_remote(&repo, "main", None).unwrap(), "fork");
+        git(&repo, &["config", "branch.main.remote", "gitlab"]);
+        assert_eq!(review_remote(&repo, "main", None).unwrap(), "gitlab");
+        assert_eq!(
+            review_remote(&repo, "main", Some("origin")).unwrap(),
+            "origin"
+        );
+        assert!(review_remote(&repo, "main", Some("missing")).is_err());
+        git(&repo, &["config", "branch.main.remote", "."]);
+        assert_eq!(review_remote(&repo, "main", None).unwrap(), "fork");
+        git(&repo, &["config", "shirei.remote", "missing"]);
+        assert!(review_remote(&repo, "main", None).is_err());
     }
 
     #[test]

@@ -142,6 +142,10 @@ enum PrCmd {
         /// Preview without pushing or contacting the forge.
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// Remote to push to. Defaults to the branch's upstream remote, then
+        /// `git config shirei.remote`, then origin.
+        #[arg(long = "remote")]
+        remote: Option<String>,
         #[arg(long = "expected-branch", hide = true)]
         expected_branch: Option<String>,
         #[arg(long = "expected-head", hide = true)]
@@ -211,6 +215,10 @@ enum StackCmd {
         dry_run: bool,
         #[arg(long = "draft")]
         draft: bool,
+        /// Remote to push to. Defaults to the root branch's upstream remote,
+        /// then `git config shirei.remote`, then origin.
+        #[arg(long = "remote")]
+        remote: Option<String>,
     },
 }
 
@@ -289,7 +297,14 @@ fn main() -> Result<()> {
                 repo,
                 dry_run,
                 draft,
-            } => run_stack_submit(branch.as_deref(), repo.as_deref(), dry_run, draft),
+                remote,
+            } => run_stack_submit(
+                branch.as_deref(),
+                repo.as_deref(),
+                dry_run,
+                draft,
+                remote.as_deref(),
+            ),
         },
     }
 }
@@ -1095,6 +1110,7 @@ fn run_pr(action: PrCmd) -> Result<()> {
         body_file,
         draft,
         dry_run,
+        remote,
         expected_branch,
         expected_head,
         expected_remote,
@@ -1110,7 +1126,7 @@ fn run_pr(action: PrCmd) -> Result<()> {
         ));
     }
 
-    let remote = git::default_remote(&repo)?.ok_or_else(|| anyhow!("repository has no remotes"))?;
+    let remote = git::review_remote(&repo, &branch, remote.as_deref())?;
     let remote_identity = forge::review_remote_identity(&repo, &remote)?;
     let push_url = git::remote_push_url(&repo, &remote)?;
     let push_identity = forge::review_url_identity(&push_url)?;
@@ -1230,28 +1246,41 @@ fn run_stack_submit(
     repo_arg: Option<&Path>,
     dry_run: bool,
     draft: bool,
+    requested_remote: Option<&str>,
 ) -> Result<()> {
     let repo = resolve_repo(repo_arg)?;
     let mut state = state::load()?;
     let plan = stack::plan_submit(&state, &repo, branch)?;
+    let root = plan
+        .steps
+        .first()
+        .ok_or_else(|| anyhow!("stack submit plan is empty"))?;
+    let remote = git::review_remote(&repo, &root.branch, requested_remote)?;
+    // Stack branches are usually rebased before submit, so they are force
+    // pushed, but only over the remote commit seen before anything is pushed.
+    let mut expected_remote_oids = Vec::new();
+    for step in &plan.steps {
+        expected_remote_oids.push(git::remote_tracking_oid(&repo, &remote, &step.branch)?);
+    }
     if dry_run {
         println!("repo={}", plan.repo.display());
-        for step in &plan.steps {
+        println!("remote={remote}");
+        for (step, expected_remote_oid) in plan.steps.iter().zip(&expected_remote_oids) {
             println!(
-                "submit branch={} base={} worktree={} draft={draft}",
+                "submit branch={} base={} worktree={} draft={draft} push=force-with-lease:{}",
                 step.branch,
                 step.base,
                 step.worktree
                     .as_ref()
                     .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "-".to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                expected_remote_oid.as_deref().unwrap_or("absent")
             );
         }
         println!("description-links=append-or-replace-managed-block-only");
         return Ok(());
     }
 
-    let remote = git::default_remote(&repo)?.ok_or_else(|| anyhow!("repository has no remotes"))?;
     let remote_identity = forge::review_remote_identity(&repo, &remote)?;
     let push_url = git::remote_push_url(&repo, &remote)?;
     let push_identity = forge::review_url_identity(&push_url)?;
@@ -1261,12 +1290,6 @@ fn run_stack_submit(
         ));
     }
     forge::validate_review_cli(&repo, &remote)?;
-    // Stack branches are usually rebased before submit, so they are force
-    // pushed, but only over the remote commit seen before anything is pushed.
-    let mut expected_remote_oids = Vec::new();
-    for step in &plan.steps {
-        expected_remote_oids.push(git::remote_tracking_oid(&repo, &remote, &step.branch)?);
-    }
     let mut reviews = Vec::new();
     for (step, expected_remote_oid) in plan.steps.iter().zip(&expected_remote_oids) {
         let worktree = step

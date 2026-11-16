@@ -127,6 +127,7 @@ case "$1 $2" in
   "mr create")
     shift 2
     check_flags '{create}' "$@"
+    printf 'mr create env GLAB_NO_PROMPT=%s NO_PROMPT=%s\n' "$GLAB_NO_PROMPT" "$NO_PROMPT" >> "$SHIREI_TEST_LOG"
     printf 'https://gitlab.com/owner/repo/-/merge_requests/9\n'
     ;;
   "mr view") printf '%s\n' '{view_json}' ;;
@@ -261,8 +262,49 @@ fn shirei(test: &TestRepo, args: &[&str]) -> Command {
         .env("SHIREI_GIT_LOG", &test.git_log)
         .env("SHIREI_STATE_DIR", &test.state_dir)
         .env("SHIREI_CONFIG", &test.config)
-        .env_remove("SHIREI_LS_REMOTE_OUTPUT");
+        .env_remove("SHIREI_LS_REMOTE_OUTPUT")
+        .env_remove("NO_PROMPT");
     command
+}
+
+#[test]
+fn pr_create_selects_the_remote_from_flag_config_or_upstream() {
+    let test = test_repo("git@github.com:owner/repo.git");
+    git(
+        &test.repo,
+        &["remote", "add", "gitlab", "git@gitlab.com:owner/repo.git"],
+    );
+    git(
+        &test.repo,
+        &["update-ref", "refs/remotes/gitlab/main", "main"],
+    );
+    let remote_of = |args: &[&str]| {
+        let output = run_shirei(&test, args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("remote_target="))
+            .unwrap()
+            .to_string()
+    };
+    let dry_run = ["pr", "create", "--dry-run", "--base", "main"];
+
+    assert_eq!(remote_of(&dry_run), "github.com/owner/repo");
+    assert_eq!(
+        remote_of(&[&dry_run[..], &["--remote", "gitlab"]].concat()),
+        "gitlab.com/owner/repo"
+    );
+    git(&test.repo, &["config", "shirei.remote", "gitlab"]);
+    assert_eq!(remote_of(&dry_run), "gitlab.com/owner/repo");
+    git(
+        &test.repo,
+        &["config", "branch.feature/review.remote", "origin"],
+    );
+    assert_eq!(remote_of(&dry_run), "github.com/owner/repo");
 }
 
 #[test]
@@ -404,6 +446,7 @@ fn installed_glab_accepts_the_flags_shirei_uses() {
         "--description",
         "--yes",
         "--repo",
+        "--head",
         "--draft",
     ] {
         assert!(create_help.contains(flag), "glab mr create lacks {flag}");
@@ -459,16 +502,9 @@ fn gitlab_contract_uses_json_without_implicit_push() {
     let test = test_repo("git@gitlab.com:owner/repo.git");
     executable(
         &test.bin.join("glab"),
-        r#"#!/bin/sh
-printf '%s\n' "$*" >> "$SHIREI_TEST_LOG"
-case "$1 $2" in
-  "--version ") printf 'glab 1.108.0\n' ;;
-  "mr list") printf '[]\n' ;;
-  "mr create") printf 'https://gitlab.com/owner/repo/-/merge_requests/9\n' ;;
-  "mr view") printf '{"iid":9,"web_url":"https://gitlab.com/owner/repo/-/merge_requests/9"}\n' ;;
-  *) exit 2 ;;
-esac
-"#,
+        &strict_fake_glab(
+            r#"{"iid":9,"web_url":"https://gitlab.com/owner/repo/-/merge_requests/9"}"#,
+        ),
     );
 
     let output = run_shirei(
@@ -493,7 +529,11 @@ esac
     let log = fs::read_to_string(&test.log).unwrap();
     assert!(log.contains("--version"));
     assert!(log.contains("mr list --source-branch feature/review --target-branch main --per-page 100 --output json --repo ssh://git@gitlab.com/owner/repo"));
-    assert!(log.contains("mr create --source-branch feature/review --target-branch main --title Add feature --description Review body --yes --repo ssh://git@gitlab.com/owner/repo"));
+    assert!(log.contains("mr create --source-branch feature/review --target-branch main --title Add feature --description Review body --yes --repo ssh://git@gitlab.com/owner/repo --head ssh://git@gitlab.com/owner/repo"));
+    assert!(
+        log.contains("mr create env GLAB_NO_PROMPT=1 NO_PROMPT=\n"),
+        "{log}"
+    );
     assert!(!log.contains("--fill"));
     assert!(!log.contains("--push"));
     assert!(log.contains("mr view 9 --output json --repo ssh://git@gitlab.com/owner/repo"));

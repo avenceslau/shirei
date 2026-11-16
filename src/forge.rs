@@ -347,7 +347,7 @@ pub fn review_status(worktree: &Path, branch: &str) -> ReviewStatus {
                         "json",
                     ])
                     .current_dir(worktree)
-                    .env("GLAB_PROMPT_DISABLED", "1")
+                    .env("GLAB_NO_PROMPT", "1")
                     .env("GLAB_HTTP_TIMEOUT", "15")
                     .env("GIT_TERMINAL_PROMPT", "0")
                     .stdin(Stdio::null())
@@ -797,7 +797,7 @@ fn ensure_gitlab_review(
             repository,
         ])
         .current_dir(request.worktree)
-        .env("GLAB_PROMPT_DISABLED", "1")
+        .env("GLAB_NO_PROMPT", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .output()
@@ -906,6 +906,10 @@ fn ensure_gitlab_review(
         "--yes",
         "--repo",
         repository,
+        // Name the source project instead of letting glab infer it from git
+        // remotes; split-source reviews are not supported.
+        "--head",
+        repository,
     ];
     if request.draft {
         args.push("--draft");
@@ -913,8 +917,7 @@ fn ensure_gitlab_review(
     let create = Command::new("glab")
         .args(args)
         .current_dir(request.worktree)
-        .env("GLAB_PROMPT_DISABLED", "1")
-        .env("NO_PROMPT", "1")
+        .env("GLAB_NO_PROMPT", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .output()
@@ -951,7 +954,7 @@ fn get_gitlab_review_body(worktree: &Path, review_id: &str, repository: &str) ->
             "mr", "view", review_id, "--output", "json", "--repo", repository,
         ])
         .current_dir(worktree)
-        .env("GLAB_PROMPT_DISABLED", "1")
+        .env("GLAB_NO_PROMPT", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .output()
@@ -987,7 +990,7 @@ fn update_gitlab_review_body(
         .arg("--repo")
         .arg(repository)
         .current_dir(worktree)
-        .env("GLAB_PROMPT_DISABLED", "1")
+        .env("GLAB_NO_PROMPT", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .output()
@@ -1011,7 +1014,7 @@ fn view_gitlab_review(
             "mr", "view", selector, "--output", "json", "--repo", repository,
         ])
         .current_dir(worktree)
-        .env("GLAB_PROMPT_DISABLED", "1")
+        .env("GLAB_NO_PROMPT", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .output()

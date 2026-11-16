@@ -477,8 +477,9 @@ export default function (pi: ExtensionAPI) {
 			const branch = plan.get("branch");
 			const head = plan.get("head");
 			const base = plan.get("base");
+			const remote = plan.get("remote");
 			const remoteTarget = plan.get("remote_target");
-			if (!branch || !head || !base || !remoteTarget) {
+			if (!branch || !head || !base || !remote || !remoteTarget) {
 				throw new Error("shirei pr create --dry-run returned an incomplete review plan");
 			}
 			const confirmed = await ctx.ui.confirm(
@@ -499,6 +500,8 @@ export default function (pi: ExtensionAPI) {
 			const confirmedArgs = [
 				...args,
 				...(params.base === undefined ? ["--base", base] : []),
+				"--remote",
+				remote,
 				"--expected-branch",
 				branch,
 				"--expected-head",
