@@ -298,8 +298,7 @@ fn run_branch(name: Option<&str>, base: Option<&str>) -> Result<()> {
     let cfg = config::load()?;
     let backend = Backend::from(cfg.backend);
     let mut state = state::load()?;
-    let cwd = std::env::current_dir().context("could not read cwd")?;
-    let repo = git::repo_root(&cwd)?;
+    let repo = resolve_repo(None)?;
     let result = match open_branch_worktree(&cfg, backend, &mut state, &repo, name, base, true) {
         Ok(result) => result,
         Err(error) if error.to_string().ends_with("selection cancelled") => return Ok(()),
@@ -382,14 +381,6 @@ fn open_branch_worktree(
         }
     };
 
-    let repo_common_dir = git::common_dir(repo)?;
-    // State may identify one repository through different linked-worktree roots.
-    state.worktrees.retain(|existing| {
-        existing.branch != selected.local_name
-            || git::common_dir(&existing.repo)
-                .map(|common_dir| common_dir != repo_common_dir)
-                .unwrap_or(true)
-    });
     state.add_worktree(Worktree {
         path: target.clone(),
         repo: repo.to_path_buf(),
@@ -430,8 +421,7 @@ fn run_stack_branch(name: &str, base: &str) -> Result<()> {
     let cfg = config::load()?;
     let backend = Backend::from(cfg.backend);
     let mut state = state::load()?;
-    let cwd = std::env::current_dir().context("could not read cwd")?;
-    let repo = git::repo_root(&cwd)?;
+    let repo = resolve_repo(None)?;
     git::check_branch_name(&repo, name)?;
     git::rev_parse_commit(&repo, base)?;
     stack::validate_edge(&state, &repo, name, base)?;
@@ -963,7 +953,8 @@ fn run_pr(action: PrCmd) -> Result<()> {
         expected_remote,
     } = action;
 
-    let repo = resolve_repo(None)?;
+    let cwd = std::env::current_dir().context("could not read cwd")?;
+    let repo = git::repo_root(&cwd)?;
     let branch = git::current_branch(&repo)?;
     let head = git::head_oid(&repo)?;
     if !git::worktree_is_clean(&repo)? {
@@ -1188,7 +1179,7 @@ fn resolve_repo(repo_arg: Option<&Path>) -> Result<PathBuf> {
         Some(path) => path.to_path_buf(),
         None => std::env::current_dir().context("could not read cwd")?,
     };
-    git::repo_root(&start)
+    git::main_worktree(&start)
 }
 
 fn pick_branch(
@@ -1728,9 +1719,9 @@ fn run_worktrees_scan() -> Result<()> {
     let cfg = config::load()?;
     let mut state = state::load()?;
 
-    let mut repos: BTreeSet<std::path::PathBuf> = BTreeSet::new();
+    let mut sources: BTreeSet<std::path::PathBuf> = BTreeSet::new();
     for w in &state.worktrees {
-        repos.insert(w.repo.clone());
+        sources.insert(w.repo.clone());
     }
     for root in &cfg.roots {
         if let Some(parent_str) = root.strip_suffix("/*") {
@@ -1739,15 +1730,28 @@ fn run_worktrees_scan() -> Result<()> {
                 for e in entries.flatten() {
                     let path = e.path();
                     if path.join(".git").exists() {
-                        repos.insert(path);
+                        sources.insert(path);
                     }
                 }
             }
         } else {
             let path = expand_tilde(root);
             if path.join(".git").exists() {
-                repos.insert(path);
+                sources.insert(path);
             }
+        }
+    }
+
+    // A source can be any linked worktree; resolving each one to its main
+    // worktree keeps one worktree from being filed under another.
+    let mut errors: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut repos: BTreeSet<std::path::PathBuf> = BTreeSet::new();
+    for source in &sources {
+        match git::main_worktree(source) {
+            Ok(repo) => {
+                repos.insert(repo);
+            }
+            Err(e) => errors.push((source.clone(), e.to_string())),
         }
     }
 
@@ -1764,7 +1768,6 @@ fn run_worktrees_scan() -> Result<()> {
         .collect();
 
     let mut by_path: BTreeMap<std::path::PathBuf, Worktree> = BTreeMap::new();
-    let mut errors: Vec<(std::path::PathBuf, String)> = Vec::new();
     let mut excluded = 0usize;
     for repo in &repos {
         match git::list_worktrees(repo) {

@@ -54,6 +54,25 @@ pub fn common_dir(start: &Path) -> Result<PathBuf> {
         .with_context(|| format!("canonicalize git common dir {}", path.display()))
 }
 
+/// The repository's main worktree. Shirei keys state by it so that every
+/// linked worktree of one repository resolves to the same repository.
+pub fn main_worktree(start: &Path) -> Result<PathBuf> {
+    let common_dir = common_dir(start)?;
+    if common_dir.file_name().is_some_and(|name| name == ".git") {
+        if let Some(parent) = common_dir.parent() {
+            return Ok(parent.to_path_buf());
+        }
+    }
+
+    // Bare repositories and separate git dirs have no `.git` directory to
+    // take the parent of; git lists the main worktree first.
+    let main = list_worktrees(start)?
+        .into_iter()
+        .find(|worktree| worktree.is_main)
+        .ok_or_else(|| anyhow!("no main worktree found for {}", start.display()))?;
+    Ok(std::fs::canonicalize(&main.path).unwrap_or(main.path))
+}
+
 pub fn list_branches(repo: &Path) -> Result<Vec<Branch>> {
     let local = run_git_lines(
         repo,

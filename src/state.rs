@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
@@ -14,6 +15,9 @@ pub struct State {
     pub stack_branches: Vec<StackBranch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebase_progress: Option<RebaseProgress>,
+    /// Older state could key a repository by any of its linked worktrees.
+    #[serde(default)]
+    pub repos_keyed_by_main_worktree: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,14 +108,24 @@ pub fn state_path() -> Result<PathBuf> {
 
 pub fn load() -> Result<State> {
     let path = state_path()?;
+    let empty = State {
+        repos_keyed_by_main_worktree: true,
+        ..State::default()
+    };
     if !path.exists() {
-        return Ok(State::default());
+        return Ok(empty);
     }
     let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     if bytes.is_empty() {
-        return Ok(State::default());
+        return Ok(empty);
     }
-    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+    let mut state: State =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    if !state.repos_keyed_by_main_worktree {
+        state.key_repos_by_main_worktree(|path| crate::git::main_worktree(path).ok());
+        save(&state)?;
+    }
+    Ok(state)
 }
 
 pub fn save(state: &State) -> Result<()> {
@@ -181,6 +195,46 @@ impl State {
         self.worktrees
             .iter()
             .find(|item| path_eq(&item.repo, repo) && item.branch == branch)
+    }
+
+    /// Rewrites every repository key to the repository's main worktree. A
+    /// worktree entry whose recorded repository is gone is resolved through
+    /// the worktree's own path. Entries that cannot be resolved keep their key.
+    pub fn key_repos_by_main_worktree(&mut self, main_worktree: impl Fn(&Path) -> Option<PathBuf>) {
+        let mut resolved: BTreeMap<PathBuf, Option<PathBuf>> = BTreeMap::new();
+        let mut resolve = |path: &Path| {
+            resolved
+                .entry(path.to_path_buf())
+                .or_insert_with(|| main_worktree(path))
+                .clone()
+        };
+
+        let mut renamed: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+        for worktree in &mut self.worktrees {
+            let Some(main) = resolve(&worktree.repo).or_else(|| resolve(&worktree.path)) else {
+                continue;
+            };
+            renamed.insert(worktree.repo.clone(), main.clone());
+            worktree.repo = main;
+        }
+        for item in &mut self.stack_branches {
+            let main = resolve(&item.repo).or_else(|| renamed.get(&item.repo).cloned());
+            if let Some(main) = main {
+                item.repo = main;
+            }
+        }
+
+        // Two old keys of one repository can now hold the same branch; keep
+        // the most recently updated stack entry.
+        self.stack_branches
+            .sort_by(|left, right| right.updated.cmp(&left.updated));
+        let mut seen = BTreeSet::new();
+        self.stack_branches
+            .retain(|item| seen.insert((item.repo.clone(), item.branch.clone())));
+        self.stack_branches
+            .sort_by(|left, right| left.created.cmp(&right.created));
+
+        self.repos_keyed_by_main_worktree = true;
     }
 
     pub fn set_rebase_progress(&mut self, progress: RebaseProgress) {
@@ -259,6 +313,50 @@ mod tests {
 
         assert_eq!(state.worktrees.len(), 1);
         assert_eq!(state.worktrees[0].path, PathBuf::from("/new-worktree"));
+    }
+
+    #[test]
+    fn migration_keys_repos_by_main_worktree() {
+        let main = PathBuf::from("/projects/repo");
+        let linked = PathBuf::from("/worktrees/repo/feature-a");
+        let deleted = PathBuf::from("/worktrees/repo/deleted");
+        let old = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let new = OffsetDateTime::from_unix_timestamp(2_000).unwrap();
+        let stack_branch = |repo: &Path, base: &str, updated| StackBranch {
+            repo: repo.to_path_buf(),
+            branch: "feature-b".into(),
+            base: base.into(),
+            review_url: None,
+            review_id: None,
+            created: old,
+            updated,
+        };
+        let mut state = State {
+            worktrees: vec![Worktree {
+                path: PathBuf::from("/worktrees/repo/feature-b"),
+                repo: deleted.clone(),
+                branch: "feature-b".into(),
+                created: old,
+            }],
+            stack_branches: vec![
+                stack_branch(&linked, "stale-base", old),
+                stack_branch(&main, "feature-a", new),
+                stack_branch(&deleted, "other", old),
+            ],
+            ..State::default()
+        };
+
+        state.key_repos_by_main_worktree(|path| {
+            (path.starts_with("/projects/repo") || path.starts_with("/worktrees/repo"))
+                .then(|| main.clone())
+                .filter(|_| path != deleted)
+        });
+
+        assert!(state.repos_keyed_by_main_worktree);
+        assert_eq!(state.worktrees[0].repo, main);
+        assert_eq!(state.stack_branches.len(), 1);
+        assert_eq!(state.stack_branches[0].repo, main);
+        assert_eq!(state.stack_branches[0].base, "feature-a");
     }
 
     #[test]
