@@ -387,6 +387,87 @@ fn pr_create_on_a_stack_branch_links_every_open_review_both_ways() {
     assert_eq!(review["review_url"], "https://github.com/owner/repo/pull/7");
 }
 
+fn dry_run_title(test: &TestRepo, title: &str) -> (String, String) {
+    let output = run_shirei(
+        test,
+        &[
+            "pr",
+            "create",
+            "--dry-run",
+            "--title",
+            title,
+            "--body",
+            "Why.",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let title = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("title="))
+        .unwrap()
+        .to_string();
+    (title, String::from_utf8_lossy(&output.stderr).to_string())
+}
+
+#[test]
+fn pr_create_adds_the_ticket_prefix_recent_titles_use() {
+    let test = test_repo("git@gitlab.com:owner/repo.git");
+    git(&test.repo, &["switch", "main"]);
+    for (index, subject) in ["ABC-11: one", "ABC-12: two", "ABC-13: three"]
+        .iter()
+        .enumerate()
+    {
+        fs::write(test.repo.join(format!("trunk-{index}.txt")), "x\n").unwrap();
+        git(&test.repo, &["add", "-A"]);
+        git(&test.repo, &["commit", "-m", subject]);
+    }
+    git(
+        &test.repo,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+
+    git(&test.repo, &["switch", "-c", "avenceslau/abc-1725-retries"]);
+    fs::write(test.repo.join("retries.txt"), "x\n").unwrap();
+    git(&test.repo, &["add", "-A"]);
+    git(&test.repo, &["commit", "-m", "add retries"]);
+    assert_eq!(
+        dry_run_title(&test, "Add retries").0,
+        r#""ABC-1725: Add retries""#
+    );
+    assert_eq!(
+        dry_run_title(&test, "ABC-000: Add retries").0,
+        r#""ABC-1725: Add retries""#
+    );
+    assert_eq!(
+        dry_run_title(&test, "ABC-9: Add retries").0,
+        r#""ABC-9: Add retries""#
+    );
+
+    git(&test.repo, &["switch", "-c", "retries-from-trailer"]);
+    git(
+        &test.repo,
+        &["commit", "--amend", "-m", "add retries\n\nRefs: ABC-1800"],
+    );
+    assert_eq!(
+        dry_run_title(&test, "Add retries").0,
+        r#""ABC-1800: Add retries""#
+    );
+
+    git(&test.repo, &["commit", "--amend", "-m", "add retries"]);
+    let (title, stderr) = dry_run_title(&test, "Add retries");
+    assert_eq!(title, r#""Add retries""#);
+    assert!(stderr.contains("no ABC ticket was found"), "{stderr}");
+
+    git(&test.repo, &["config", "shirei.ticketPrefix", "none"]);
+    let (_, stderr) = dry_run_title(&test, "Add retries");
+    assert!(!stderr.contains("ticket"), "{stderr}");
+}
+
 #[test]
 fn pr_create_rejects_a_hand_written_stack_section() {
     let test = test_repo("git@github.com:owner/repo.git");

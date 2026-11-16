@@ -399,13 +399,13 @@ pub fn review_remote(repo: &Path, branch: &str, requested: Option<&str>) -> Resu
         format!("branch.{branch}.pushRemote"),
         format!("branch.{branch}.remote"),
     ] {
-        if let Some(remote) = git_config(repo, &key)? {
+        if let Some(remote) = config_value(repo, &key)? {
             if known(&remote) {
                 return Ok(remote);
             }
         }
     }
-    if let Some(remote) = git_config(repo, "shirei.remote")? {
+    if let Some(remote) = config_value(repo, "shirei.remote")? {
         if !known(&remote) {
             return Err(anyhow!(
                 "git config shirei.remote names {remote}, which is not a configured remote"
@@ -422,7 +422,7 @@ pub fn review_remote(repo: &Path, branch: &str, requested: Option<&str>) -> Resu
         .ok_or_else(|| anyhow!("repository has no remotes"))
 }
 
-fn git_config(repo: &Path, key: &str) -> Result<Option<String>> {
+pub fn config_value(repo: &Path, key: &str) -> Result<Option<String>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -505,6 +505,25 @@ pub fn merge_base(repo: &Path, left: &str, right: &str) -> Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Subjects of the latest `limit` non-merge commits reachable from `rev`.
+pub fn commit_subjects(repo: &Path, rev: &str, limit: usize) -> Result<Vec<String>> {
+    run_git_lines(
+        repo,
+        &[
+            "log",
+            "--no-merges",
+            &format!("--max-count={limit}"),
+            "--format=%s",
+            rev,
+        ],
+    )
+}
+
+/// Full messages of the commits in `range`, joined by newlines.
+pub fn commit_messages(repo: &Path, range: &str) -> Result<String> {
+    Ok(run_git_lines(repo, &["log", "--format=%B", range])?.join("\n"))
 }
 
 pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {

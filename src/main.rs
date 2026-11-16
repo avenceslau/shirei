@@ -1310,9 +1310,16 @@ fn run_pr(action: PrCmd) -> Result<()> {
         Some(value) if value.trim().is_empty() => {
             return Err(anyhow!("--title cannot be empty"));
         }
-        Some(value) => Some(value.trim()),
+        Some(value) => Some(title_with_ticket(
+            &repo,
+            &remote,
+            &base,
+            &branch,
+            value.trim(),
+        )?),
         None => None,
     };
+    let title = title.as_deref();
     let file_body = body_file
         .as_deref()
         .map(|path| {
@@ -1445,6 +1452,53 @@ fn run_pr(action: PrCmd) -> Result<()> {
         }
     }
     state::save(&state)
+}
+
+/// `title` with the repository's `KEY-NNNN:` ticket prefix when its recent
+/// titles use one. The key comes from `git config shirei.ticketPrefix`
+/// (`none` disables it), otherwise from the last 20 titles on the remote's
+/// default branch; the ticket comes from the branch name, then the commits.
+fn title_with_ticket(
+    repo: &Path,
+    remote: &str,
+    base: &str,
+    branch: &str,
+    title: &str,
+) -> Result<String> {
+    let trunk = git::default_remote_branch(repo, remote)
+        .map(|trunk| format!("{remote}/{trunk}"))
+        .or_else(|_| git::rev_parse_commit(repo, base).map(|_| base.to_string()));
+    let Ok(trunk) = trunk else {
+        return Ok(title.to_string());
+    };
+    let key = match git::config_value(repo, "shirei.ticketPrefix")? {
+        Some(value) if value.is_empty() || value.eq_ignore_ascii_case("none") => {
+            return Ok(title.to_string());
+        }
+        Some(value) => value,
+        None => {
+            let titles = git::commit_subjects(repo, &trunk, 20)?;
+            let Some(key) = review::ticket_key_from_titles(&titles) else {
+                return Ok(title.to_string());
+            };
+            key
+        }
+    };
+
+    let ticket = match review::find_ticket(branch, &key) {
+        Some(ticket) => Some(ticket),
+        None => {
+            let messages = git::commit_messages(repo, &format!("{trunk}..HEAD"))?;
+            review::find_ticket(&messages, &key)
+        }
+    };
+    let titled = review::with_ticket(title, &key, ticket.as_deref());
+    if review::find_ticket(&titled, &key).is_none() {
+        eprintln!(
+            "warn: recent titles start with {key}-NNNN: but no {key} ticket was found in the branch name or commits"
+        );
+    }
+    Ok(titled)
 }
 
 /// `body` with the managed stack links block for `branch` appended or
