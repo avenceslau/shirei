@@ -75,6 +75,12 @@ enum Cmd {
         #[command(subcommand)]
         action: StackCmd,
     },
+    /// Print the version and every subcommand with its flags.
+    Capabilities {
+        /// Print JSON instead of one line per command.
+        #[arg(long = "json")]
+        json: bool,
+    },
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -291,6 +297,7 @@ fn main() -> Result<()> {
             None => run_worktrees_list(),
         },
         Cmd::Pr { action } => run_pr(action),
+        Cmd::Capabilities { json } => run_capabilities(json),
         Cmd::Stack { action } => match action {
             StackCmd::Branch {
                 name,
@@ -335,6 +342,85 @@ fn main() -> Result<()> {
                 remote.as_deref(),
             ),
         },
+    }
+}
+
+fn run_capabilities(json: bool) -> Result<()> {
+    let mut commands = Vec::new();
+    collect_command_capabilities(&Args::command(), "shirei", &mut commands);
+    if !json {
+        println!("shirei {VERSION}");
+        for command in &commands {
+            let mut words = vec![command["command"].as_str().unwrap_or_default().to_string()];
+            for positional in command["positionals"].as_array().into_iter().flatten() {
+                words.push(format!("<{}>", positional.as_str().unwrap_or_default()));
+            }
+            for flag in command["flags"].as_array().into_iter().flatten() {
+                words.push(flag["long"].as_str().unwrap_or_default().to_string());
+            }
+            println!("{}", words.join(" "));
+        }
+        return Ok(());
+    }
+
+    let capabilities = serde_json::json!({
+        "name": "shirei",
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_sha": env!("SHIREI_GIT_SHA"),
+        "commands": commands,
+    });
+    println!("{}", serde_json::to_string_pretty(&capabilities)?);
+    Ok(())
+}
+
+/// Describes `command` and its subcommands from the clap definition, so the
+/// output cannot drift from the parser.
+fn collect_command_capabilities(
+    command: &clap::Command,
+    path: &str,
+    out: &mut Vec<serde_json::Value>,
+) {
+    let mut flags = Vec::new();
+    let mut positionals = Vec::new();
+    for arg in command.get_arguments() {
+        if arg.is_hide_set() || matches!(arg.get_id().as_str(), "help" | "version") {
+            continue;
+        }
+        let Some(long) = arg.get_long() else {
+            positionals.push(serde_json::json!(arg.get_id().as_str()));
+            continue;
+        };
+        let takes_value = arg.get_action().takes_values();
+        let values: Vec<String> = arg
+            .get_possible_values()
+            .iter()
+            .map(|value| value.get_name().to_string())
+            .collect();
+        flags.push(serde_json::json!({
+            "long": format!("--{long}"),
+            "short": arg.get_short().map(|short| format!("-{short}")),
+            "takes_value": takes_value,
+            "values": values,
+            "help": arg.get_help().map(|help| help.to_string()),
+        }));
+    }
+    if path != "shirei" {
+        out.push(serde_json::json!({
+            "command": path,
+            "about": command.get_about().map(|about| about.to_string()),
+            "positionals": positionals,
+            "flags": flags,
+        }));
+    }
+    for subcommand in command.get_subcommands() {
+        if subcommand.get_name() == "help" {
+            continue;
+        }
+        collect_command_capabilities(
+            subcommand,
+            &format!("{path} {}", subcommand.get_name()),
+            out,
+        );
     }
 }
 
