@@ -515,6 +515,45 @@ fn pr_create_rejects_internal_names_only_on_public_hosts() {
 }
 
 #[test]
+fn pr_create_enforces_the_word_budget_for_the_change_size() {
+    let test = test_repo("git@github.com:owner/repo.git");
+    let words = |count: usize| vec!["word"; count].join(" ");
+    let run = |body: &str| {
+        run_shirei(
+            &test,
+            &[
+                "pr",
+                "create",
+                "--dry-run",
+                "--title",
+                "Add feature",
+                "--body",
+                body,
+            ],
+        )
+    };
+
+    let within = run(&format!("{}\n\n```\n{}\n```", words(80), words(50)));
+    assert!(
+        within.status.success(),
+        "{}",
+        String::from_utf8_lossy(&within.stderr)
+    );
+    assert!(String::from_utf8_lossy(&within.stdout).contains("body_words=80/80 (small)"));
+
+    let over = run(&words(81));
+    assert!(!over.status.success());
+    let stderr = String::from_utf8_lossy(&over.stderr);
+    assert!(
+        stderr.contains("81 prose words; the budget for a small change (1 changed lines in 0 top-level directories against origin/main) is 80"),
+        "{stderr}"
+    );
+
+    fs::write(&test.config, "[review]\nsmall_max_words = 100\n").unwrap();
+    assert!(run(&words(81)).status.success());
+}
+
+#[test]
 fn pr_create_rejects_a_hand_written_stack_section() {
     let test = test_repo("git@github.com:owner/repo.git");
     track_three_branch_stack(&test);

@@ -1353,6 +1353,10 @@ fn run_pr(action: PrCmd) -> Result<()> {
             ));
         }
     }
+    let word_budget = match body {
+        Some(body) => Some(check_word_budget(&repo, &remote, &base, body, &cfg.review)?),
+        None => None,
+    };
 
     let mut stack_reviews = Vec::new();
     if stack_item.is_some() {
@@ -1395,6 +1399,9 @@ fn run_pr(action: PrCmd) -> Result<()> {
                 .transpose()?
                 .unwrap_or_else(|| "<fill-from-commits>".to_string())
         );
+        if let Some(word_budget) = word_budget {
+            println!("body_words={word_budget}");
+        }
         if let Some(position) = stack_reviews.iter().position(|item| item.branch == branch) {
             let others: Vec<&str> = stack_reviews
                 .iter()
@@ -1468,6 +1475,44 @@ fn run_pr(action: PrCmd) -> Result<()> {
         }
     }
     state::save(&state)
+}
+
+/// Rejects a body with more prose words than the budget for the size of the
+/// change against `base`. Returns `words/budget (size)` for the preview.
+fn check_word_budget(
+    repo: &Path,
+    remote: &str,
+    base: &str,
+    body: &str,
+    cfg: &config::ReviewConfig,
+) -> Result<String> {
+    let remote_base = format!("{remote}/{base}");
+    let base_ref = if git::rev_parse_commit(repo, &remote_base).is_ok() {
+        remote_base
+    } else {
+        base.to_string()
+    };
+    let files = git::changed_lines_by_file(repo, &format!("{base_ref}...HEAD"))?;
+    let changed_lines: usize = files.iter().map(|(lines, _)| lines).sum();
+    let mut top_level_dirs: Vec<&str> = files
+        .iter()
+        .filter_map(|(_, path)| path.split_once('/').map(|(dir, _)| dir))
+        .collect();
+    top_level_dirs.sort_unstable();
+    top_level_dirs.dedup();
+
+    let size = review::ChangeSize::classify(changed_lines, top_level_dirs.len(), cfg);
+    let budget = size.word_budget(cfg);
+    let words = review::prose_word_count(body);
+    if words > budget {
+        return Err(anyhow!(
+            "the review body has {words} prose words; the budget for a {} change ({changed_lines} changed lines in {} top-level directories against {base_ref}) is {budget}. Shorten it to why, behaviour, and testing, or raise review.{}_max_words in the Shirei config.",
+            size.name(),
+            top_level_dirs.len(),
+            size.name()
+        ));
+    }
+    Ok(format!("{words}/{budget} ({})", size.name()))
 }
 
 /// `title` with the repository's `KEY-NNNN:` ticket prefix when its recent

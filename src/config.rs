@@ -42,6 +42,16 @@ pub struct ReviewConfig {
     pub private_hosts: Vec<String>,
     /// Terms added to the built-in public denylist.
     pub extra_public_denylist: Vec<String>,
+    /// A change with at most this many changed lines is small.
+    pub small_max_changed_lines: usize,
+    /// A change with more changed lines than this is large.
+    pub large_above_changed_lines: usize,
+    /// A change touching at least this many top-level directories is large.
+    pub large_min_top_level_dirs: usize,
+    /// Prose word budgets of review bodies by change size.
+    pub small_max_words: usize,
+    pub medium_max_words: usize,
+    pub large_max_words: usize,
 }
 
 impl Default for ReviewConfig {
@@ -49,6 +59,12 @@ impl Default for ReviewConfig {
         Self {
             private_hosts: vec!["gitlab.corp.example".into()],
             extra_public_denylist: Vec::new(),
+            small_max_changed_lines: 100,
+            large_above_changed_lines: 800,
+            large_min_top_level_dirs: 3,
+            small_max_words: 80,
+            medium_max_words: 200,
+            large_max_words: 350,
         }
     }
 }

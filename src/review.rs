@@ -1,6 +1,8 @@
 //! Rules Shirei applies to review titles and descriptions, so the
 //! deterministic parts are produced by code instead of the author.
 
+use crate::config::ReviewConfig;
+
 /// The first Markdown heading named "Stack" or "Stack position", outside
 /// fenced code. Shirei writes stack navigation itself.
 pub fn stack_heading(body: &str) -> Option<String> {
@@ -32,6 +34,76 @@ pub fn stack_heading(body: &str) -> Option<String> {
     }
     None
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeSize {
+    Small,
+    Medium,
+    Large,
+}
+
+impl ChangeSize {
+    pub fn name(self) -> &'static str {
+        match self {
+            ChangeSize::Small => "small",
+            ChangeSize::Medium => "medium",
+            ChangeSize::Large => "large",
+        }
+    }
+
+    pub fn classify(changed_lines: usize, top_level_dirs: usize, cfg: &ReviewConfig) -> Self {
+        if changed_lines > cfg.large_above_changed_lines
+            || top_level_dirs >= cfg.large_min_top_level_dirs
+        {
+            return ChangeSize::Large;
+        }
+        if changed_lines <= cfg.small_max_changed_lines {
+            return ChangeSize::Small;
+        }
+        ChangeSize::Medium
+    }
+
+    pub fn word_budget(self, cfg: &ReviewConfig) -> usize {
+        match self {
+            ChangeSize::Small => cfg.small_max_words,
+            ChangeSize::Medium => cfg.medium_max_words,
+            ChangeSize::Large => cfg.large_max_words,
+        }
+    }
+}
+
+/// Words of prose in `body`: tokens with a letter or digit, outside fenced
+/// code blocks and the managed stack links block.
+pub fn prose_word_count(body: &str) -> usize {
+    let mut words = 0;
+    let mut in_fence = false;
+    let mut in_stack_links = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(STACK_LINKS_START) {
+            in_stack_links = true;
+        }
+        if in_stack_links {
+            in_stack_links = !trimmed.starts_with(STACK_LINKS_END);
+            continue;
+        }
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        words += line
+            .split_whitespace()
+            .filter(|token| token.chars().any(char::is_alphanumeric))
+            .count();
+    }
+    words
+}
+
+const STACK_LINKS_START: &str = "<!-- shirei-stack-links:start -->";
+const STACK_LINKS_END: &str = "<!-- shirei-stack-links:end -->";
 
 /// Internal names that must not appear in reviews on public hosts.
 pub const PUBLIC_DENYLIST: &[&str] = &[
@@ -175,6 +247,20 @@ pub fn with_ticket(title: &str, key: &str, ticket: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_changes_and_counts_only_prose() {
+        let cfg = ReviewConfig::default();
+        assert_eq!(ChangeSize::classify(100, 2, &cfg), ChangeSize::Small);
+        assert_eq!(ChangeSize::classify(101, 1, &cfg), ChangeSize::Medium);
+        assert_eq!(ChangeSize::classify(800, 2, &cfg), ChangeSize::Medium);
+        assert_eq!(ChangeSize::classify(801, 1, &cfg), ChangeSize::Large);
+        assert_eq!(ChangeSize::classify(10, 3, &cfg), ChangeSize::Large);
+        assert_eq!(ChangeSize::Medium.word_budget(&cfg), 200);
+
+        let body = "Why it matters.\n\n- Adds `retry` - now\n\n```\nlots of code words here\n```\n<!-- shirei-stack-links:start -->\nStack: 1 of 2\n<!-- shirei-stack-links:end -->\nTested.";
+        assert_eq!(prose_word_count(body), 7);
+    }
 
     #[test]
     fn finds_denylisted_terms_on_word_boundaries() {

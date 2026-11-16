@@ -521,6 +521,20 @@ pub fn commit_subjects(repo: &Path, rev: &str, limit: usize) -> Result<Vec<Strin
     )
 }
 
+/// Changed lines (added plus deleted) and path of every file `range` changes.
+/// Binary files count as zero lines.
+pub fn changed_lines_by_file(repo: &Path, range: &str) -> Result<Vec<(usize, String)>> {
+    let mut files = Vec::new();
+    for line in run_git_lines(repo, &["diff", "--numstat", range])? {
+        let mut parts = line.splitn(3, '\t');
+        let added = parts.next().unwrap_or_default().parse().unwrap_or(0usize);
+        let deleted = parts.next().unwrap_or_default().parse().unwrap_or(0usize);
+        let path = parts.next().unwrap_or_default().to_string();
+        files.push((added + deleted, path));
+    }
+    Ok(files)
+}
+
 /// Full messages of the commits in `range`, joined by newlines.
 pub fn commit_messages(repo: &Path, range: &str) -> Result<String> {
     Ok(run_git_lines(repo, &["log", "--format=%B", range])?.join("\n"))
