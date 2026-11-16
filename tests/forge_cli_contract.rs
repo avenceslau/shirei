@@ -267,6 +267,152 @@ fn shirei(test: &TestRepo, args: &[&str]) -> Command {
     command
 }
 
+/// feature/parent (review #5) <- feature/review <- feature/child (no review).
+fn track_three_branch_stack(test: &TestRepo) {
+    git(&test.repo, &["branch", "feature/parent", "main"]);
+    git(&test.repo, &["branch", "feature/child", "feature/review"]);
+    let timestamp = "2026-01-01T00:00:00Z";
+    let state = serde_json::json!({
+        "repos_keyed_by_main_worktree": true,
+        "stack_branches": [
+            {"repo": test.repo, "branch": "feature/parent", "base": "main", "review_id": "5", "review_url": "https://github.com/owner/repo/pull/5", "created": timestamp, "updated": timestamp},
+            {"repo": test.repo, "branch": "feature/review", "base": "feature/parent", "created": timestamp, "updated": timestamp},
+            {"repo": test.repo, "branch": "feature/child", "base": "feature/review", "created": timestamp, "updated": timestamp}
+        ]
+    });
+    fs::write(
+        test.state_dir.join("state.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+}
+
+const STACK_FAKE_GH: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$SHIREI_TEST_LOG"
+case "$1 $2" in
+  "--version ") printf 'gh version 2.96.0\n' ;;
+  "pr list")
+    case "$*" in
+      *"--head feature/parent "*) printf '[{"number":5,"url":"https://github.com/owner/repo/pull/5","baseRefName":"main","headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"owner"}}]\n' ;;
+      *) printf '[]\n' ;;
+    esac
+    ;;
+  "pr create") printf 'https://github.com/owner/repo/pull/7\n' ;;
+  "pr view")
+    case "$*" in
+      *"--json body"*) printf '{"body":"Parent body"}\n' ;;
+      *) printf '{"number":7,"url":"https://github.com/owner/repo/pull/7"}\n' ;;
+    esac
+    ;;
+  "pr edit")
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --body-file ]; then
+        printf 'edit body:\n' >> "$SHIREI_TEST_LOG"
+        cat "$2" >> "$SHIREI_TEST_LOG"
+        printf '\n' >> "$SHIREI_TEST_LOG"
+      fi
+      shift
+    done
+    ;;
+  *) exit 2 ;;
+esac
+"#;
+
+#[test]
+fn pr_create_on_a_stack_branch_links_every_open_review_both_ways() {
+    let test = test_repo("git@github.com:owner/repo.git");
+    track_three_branch_stack(&test);
+    executable(&test.bin.join("gh"), STACK_FAKE_GH);
+
+    let preview = run_shirei(
+        &test,
+        &[
+            "pr",
+            "create",
+            "--dry-run",
+            "--title",
+            "Add feature",
+            "--body",
+            "Review body",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&preview.stdout);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert!(stdout.contains("\nbase=feature/parent\n"), "{stdout}");
+    assert!(stdout.contains("stack=2 of 3\n"), "{stdout}");
+    assert!(stdout.contains("stack_links_refresh=feature/parent,feature/child\n"));
+    assert!(stdout.contains(r#"Review body\n\n<!-- shirei-stack-links:start -->\nStack: 2 of 3\n- Previous: [feature/parent](https://github.com/owner/repo/pull/5)\n- Next: feature/child (no review yet)"#), "{stdout}");
+    assert!(!test.log.exists());
+
+    let output = run_shirei(
+        &test,
+        &[
+            "pr",
+            "create",
+            "--title",
+            "Add feature",
+            "--body",
+            "Review body",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = fs::read_to_string(&test.log).unwrap();
+    assert!(
+        log.contains("pr create --base feature/parent --head feature/review"),
+        "{log}"
+    );
+    assert!(log.contains("--body Review body\n\n<!-- shirei-stack-links:start -->\nStack: 2 of 3\n- Previous: [feature/parent](https://github.com/owner/repo/pull/5)"), "{log}");
+    assert!(log.contains("pr edit 5 --body-file"), "{log}");
+    assert!(
+        log.contains("edit body:\nParent body\n\n<!-- shirei-stack-links:start -->\nStack: 1 of 3\n- Previous: none\n- Next: [feature/review](https://github.com/owner/repo/pull/7)\n\nMerge order:\n1. **feature/parent** (this review)\n2. [feature/review](https://github.com/owner/repo/pull/7)\n3. feature/child (no review yet)\n<!-- shirei-stack-links:end -->"),
+        "{log}"
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(test.state_dir.join("state.json")).unwrap()).unwrap();
+    let review = state["stack_branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["branch"] == "feature/review")
+        .unwrap();
+    assert_eq!(review["review_url"], "https://github.com/owner/repo/pull/7");
+}
+
+#[test]
+fn pr_create_rejects_a_hand_written_stack_section() {
+    let test = test_repo("git@github.com:owner/repo.git");
+    track_three_branch_stack(&test);
+
+    let output = run_shirei(
+        &test,
+        &[
+            "pr",
+            "create",
+            "--dry-run",
+            "--title",
+            "Add feature",
+            "--body",
+            "Why\n\n## Stack\n- after #5",
+        ],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("`## Stack` heading"), "{stderr}");
+    assert!(
+        stderr.contains("Shirei adds the stack links block itself"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn pr_create_selects_the_remote_from_flag_config_or_upstream() {
     let test = test_repo("git@github.com:owner/repo.git");

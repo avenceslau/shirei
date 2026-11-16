@@ -4,6 +4,7 @@ mod git;
 mod herdr;
 mod install;
 mod picker;
+mod review;
 mod session;
 mod stack;
 mod state;
@@ -1294,12 +1295,16 @@ fn run_pr(action: PrCmd) -> Result<()> {
         ));
     }
 
-    let base = match base.as_deref() {
-        Some(value) if value.trim().is_empty() => {
+    let mut state = state::load()?;
+    let stack_repo = git::main_worktree(&repo)?;
+    let stack_item = state.stack_branch(&stack_repo, &branch).cloned();
+    let base = match (base.as_deref(), &stack_item) {
+        (Some(value), _) if value.trim().is_empty() => {
             return Err(anyhow!("--base cannot be empty"));
         }
-        Some(value) => value.trim().to_string(),
-        None => default_review_base(&repo, &remote)?,
+        (Some(value), _) => value.trim().to_string(),
+        (None, Some(item)) => item.base.clone(),
+        (None, None) => default_review_base(&repo, &remote)?,
     };
     let title = match title.as_deref() {
         Some(value) if value.trim().is_empty() => {
@@ -1316,8 +1321,35 @@ fn run_pr(action: PrCmd) -> Result<()> {
         })
         .transpose()?;
     let body = body.as_deref().or(file_body.as_deref());
+    if let Some(heading) = body.and_then(review::stack_heading) {
+        let hint = match stack_item {
+            Some(_) => "Shirei adds the stack links block itself",
+            None => "track the branch with `shirei stack track` and Shirei adds the stack links block itself",
+        };
+        return Err(anyhow!(
+            "the review body has a `{heading}` heading; remove that section, {hint}"
+        ));
+    }
+
+    let mut stack_reviews = Vec::new();
+    if stack_item.is_some() {
+        for member in stack::review_chain(&state, &stack_repo, &branch)? {
+            let item = state
+                .stack_branch(&stack_repo, &member)
+                .ok_or_else(|| anyhow!("no stack metadata for {member}"))?;
+            stack_reviews.push(stack::SubmittedReview {
+                base: item.base.clone(),
+                id: item.review_id.clone(),
+                url: item.review_url.clone(),
+                branch: member,
+            });
+        }
+    }
 
     if dry_run {
+        let body = body
+            .map(|body| with_stack_links(body, &stack_reviews, &branch))
+            .transpose()?;
         println!("action=push-and-ensure-open-review");
         println!("repo={}", repo.display());
         println!("remote={remote}");
@@ -1335,22 +1367,44 @@ fn run_pr(action: PrCmd) -> Result<()> {
         );
         println!(
             "body={}",
-            body.map(serde_json::to_string)
+            body.as_ref()
+                .map(serde_json::to_string)
                 .transpose()?
                 .unwrap_or_else(|| "<fill-from-commits>".to_string())
         );
+        if let Some(position) = stack_reviews.iter().position(|item| item.branch == branch) {
+            let others: Vec<&str> = stack_reviews
+                .iter()
+                .filter(|item| item.branch != branch)
+                .map(|item| item.branch.as_str())
+                .collect();
+            println!("stack={} of {}", position + 1, stack_reviews.len());
+            println!("stack_links_refresh={}", others.join(","));
+        }
         return Ok(());
     }
 
     forge::validate_review_cli(&repo, &remote)?;
     git::push_branch(&repo, &remote, &branch)?;
+    // State may name closed reviews; only open ones get links.
+    for item in stack_reviews
+        .iter_mut()
+        .filter(|item| item.branch != branch)
+    {
+        let found = forge::find_open_review(&repo, &remote, &item.branch, &item.base)?;
+        item.id = found.as_ref().map(|found| found.id.clone());
+        item.url = found.and_then(|found| found.url);
+    }
+    let body = body
+        .map(|body| with_stack_links(body, &stack_reviews, &branch))
+        .transpose()?;
     let outcome = forge::ensure_review(forge::ReviewRequest {
         worktree: &repo,
         branch: &branch,
         base: &base,
         remote: &remote,
         title,
-        body,
+        body: body.as_deref(),
         draft,
     })?;
     let status = match outcome {
@@ -1361,7 +1415,50 @@ fn run_pr(action: PrCmd) -> Result<()> {
         "{status} branch={branch}\tbase={base}\turl={}",
         outcome.url().unwrap_or("-")
     );
-    Ok(())
+    if stack_reviews.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(item) = stack_reviews.iter_mut().find(|item| item.branch == branch) {
+        item.id = outcome.id().map(str::to_string);
+        item.url = outcome.url().map(str::to_string);
+    }
+    let links = stack::build_stack_links(&stack_reviews);
+    for item in &stack_reviews {
+        let Some(id) = item.id.as_deref() else {
+            continue;
+        };
+        let current = forge::get_review_body(&repo, &remote, id)?;
+        let rendered = stack::render_stack_links(&links[&item.branch]);
+        let updated = stack::replace_stack_links_block(&current, &rendered)?;
+        if updated != current {
+            forge::update_review_body(&repo, &remote, id, &updated)?;
+            println!(
+                "updated stack links branch={}\turl={}",
+                item.branch,
+                item.url.as_deref().unwrap_or("-")
+            );
+        }
+        if let Some(stored) = state.stack_branch_mut(&stack_repo, &item.branch) {
+            stored.review_id = item.id.clone();
+            stored.review_url = item.url.clone();
+        }
+    }
+    state::save(&state)
+}
+
+/// `body` with the managed stack links block for `branch` appended or
+/// replaced; unchanged when the branch is not in a tracked stack.
+fn with_stack_links(
+    body: &str,
+    stack_reviews: &[stack::SubmittedReview],
+    branch: &str,
+) -> Result<String> {
+    let links = stack::build_stack_links(stack_reviews);
+    let Some(links) = links.get(branch) else {
+        return Ok(body.to_string());
+    };
+    stack::replace_stack_links_block(body, &stack::render_stack_links(links))
 }
 
 fn default_review_base(repo: &Path, remote: &str) -> Result<String> {
@@ -1479,7 +1576,7 @@ fn run_stack_submit(
         });
     }
 
-    let links = stack::build_stack_links(&reviews)?;
+    let links = stack::build_stack_links(&reviews);
     for review in &reviews {
         let Some(id) = review.id.as_deref() else {
             return Err(anyhow!("missing review id for {}", review.branch));

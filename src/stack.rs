@@ -97,14 +97,28 @@ pub struct SubmittedReview {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackLinks {
+    pub branch: String,
+    /// One-based position of `branch` in the merge order.
+    pub position: usize,
     pub previous: Option<ReviewLink>,
     pub next: Vec<ReviewLink>,
+    pub merge_order: Vec<ReviewLink>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewLink {
     pub branch: String,
-    pub url: String,
+    /// `None` while the branch has no open review.
+    pub url: Option<String>,
+}
+
+impl ReviewLink {
+    fn markdown(&self) -> String {
+        match &self.url {
+            Some(url) => format!("[{}]({url})", self.branch),
+            None => format!("{} (no review yet)", self.branch),
+        }
+    }
 }
 
 pub fn build_graph(state: &State, repo: &Path) -> Result<StackGraph> {
@@ -328,70 +342,95 @@ pub fn plan_submit(state: &State, repo: &Path, leaf: Option<&str>) -> Result<Sub
     })
 }
 
-pub fn build_stack_links(reviews: &[SubmittedReview]) -> Result<BTreeMap<String, StackLinks>> {
-    let by_branch: BTreeMap<_, _> = reviews
-        .iter()
-        .map(|review| (review.branch.clone(), review))
-        .collect();
-    let mut links: BTreeMap<String, StackLinks> = BTreeMap::new();
-    for review in reviews {
-        let previous = by_branch
-            .get(&review.base)
-            .map(|parent| {
-                parent
-                    .url
-                    .as_ref()
-                    .map(|url| ReviewLink {
-                        branch: parent.branch.clone(),
-                        url: url.clone(),
-                    })
-                    .ok_or_else(|| {
-                        anyhow!("missing review URL for parent branch {}", parent.branch)
-                    })
-            })
-            .transpose()?;
-        let mut next = Vec::new();
-        for child in reviews
+/// Links for every review in `reviews`, which must be in merge order (root
+/// first), as `review_chain` and `plan_submit` return them.
+pub fn build_stack_links(reviews: &[SubmittedReview]) -> BTreeMap<String, StackLinks> {
+    let link = |review: &SubmittedReview| ReviewLink {
+        branch: review.branch.clone(),
+        url: review.url.clone(),
+    };
+    let merge_order: Vec<ReviewLink> = reviews.iter().map(link).collect();
+    let mut links = BTreeMap::new();
+    for (index, review) in reviews.iter().enumerate() {
+        let previous = reviews
             .iter()
-            .filter(|candidate| candidate.base == review.branch)
-        {
-            let url = child
-                .url
-                .as_ref()
-                .ok_or_else(|| anyhow!("missing review URL for child branch {}", child.branch))?;
-            next.push(ReviewLink {
-                branch: child.branch.clone(),
-                url: url.clone(),
-            });
-        }
-        links.insert(review.branch.clone(), StackLinks { previous, next });
+            .find(|parent| parent.branch == review.base)
+            .map(link);
+        let next = reviews
+            .iter()
+            .filter(|child| child.base == review.branch)
+            .map(link)
+            .collect();
+        links.insert(
+            review.branch.clone(),
+            StackLinks {
+                branch: review.branch.clone(),
+                position: index + 1,
+                previous,
+                next,
+                merge_order: merge_order.clone(),
+            },
+        );
     }
-    Ok(links)
+    links
 }
 
 pub fn render_stack_links(links: &StackLinks) -> String {
     let mut out = Vec::new();
     out.push("<!-- shirei-stack-links:start -->".to_string());
-    out.push("Stack navigation:".to_string());
+    out.push(format!(
+        "Stack: {} of {}",
+        links.position,
+        links.merge_order.len()
+    ));
     match &links.previous {
-        Some(previous) => out.push(format!(
-            "- Previous: [{}]({})",
-            previous.branch, previous.url
-        )),
+        Some(previous) => out.push(format!("- Previous: {}", previous.markdown())),
         None => out.push("- Previous: none".to_string()),
     }
     match links.next.as_slice() {
         [] => out.push("- Next: none".to_string()),
-        [single] => out.push(format!("- Next: [{}]({})", single.branch, single.url)),
+        [single] => out.push(format!("- Next: {}", single.markdown())),
         many => {
             out.push("- Next:".to_string());
             for next in many {
-                out.push(format!("  - [{}]({})", next.branch, next.url));
+                out.push(format!("  - {}", next.markdown()));
             }
+        }
+    }
+    out.push(String::new());
+    out.push("Merge order:".to_string());
+    for (index, entry) in links.merge_order.iter().enumerate() {
+        if entry.branch == links.branch {
+            out.push(format!("{}. **{}** (this review)", index + 1, entry.branch));
+        } else {
+            out.push(format!("{}. {}", index + 1, entry.markdown()));
         }
     }
     out.push("<!-- shirei-stack-links:end -->".to_string());
     out.join("\n")
+}
+
+/// The stack `branch` belongs to, in merge order: its tracked ancestors, the
+/// branch, then its descendants while each has exactly one tracked child.
+pub fn review_chain(state: &State, repo: &Path, branch: &str) -> Result<Vec<String>> {
+    let mut chain = ancestry(state, repo, branch)?;
+    let mut current = branch.to_string();
+    loop {
+        let children: Vec<&str> = state
+            .stack_branches
+            .iter()
+            .filter(|item| path_eq(&item.repo, repo) && item.base == current)
+            .map(|item| item.branch.as_str())
+            .collect();
+        let [child] = children.as_slice() else {
+            return Ok(chain);
+        };
+        if chain.iter().any(|seen| seen == child) {
+            return Err(anyhow!("stack metadata contains a cycle at {child}"));
+        }
+        chain.push(child.to_string());
+        current = child.to_string();
+    }
 }
 
 pub fn replace_stack_links_block(existing_body: &str, rendered_block: &str) -> Result<String> {
@@ -640,6 +679,36 @@ mod tests {
             new_body,
             "Title\n\n<!-- shirei-stack-links:start -->\nnew\n<!-- shirei-stack-links:end -->\n\nTail"
         );
+    }
+
+    #[test]
+    fn renders_position_neighbours_and_merge_order() {
+        let review = |branch: &str, base: &str, url: Option<&str>| SubmittedReview {
+            branch: branch.into(),
+            base: base.into(),
+            id: None,
+            url: url.map(str::to_string),
+        };
+        let links = build_stack_links(&[
+            review("feat/a", "main", Some("https://forge/1")),
+            review("feat/b", "feat/a", Some("https://forge/2")),
+            review("feat/c", "feat/b", None),
+        ]);
+
+        assert_eq!(
+            render_stack_links(&links["feat/b"]),
+            "<!-- shirei-stack-links:start -->\n\
+             Stack: 2 of 3\n\
+             - Previous: [feat/a](https://forge/1)\n\
+             - Next: feat/c (no review yet)\n\
+             \n\
+             Merge order:\n\
+             1. [feat/a](https://forge/1)\n\
+             2. **feat/b** (this review)\n\
+             3. feat/c (no review yet)\n\
+             <!-- shirei-stack-links:end -->"
+        );
+        assert!(render_stack_links(&links["feat/a"]).contains("Stack: 1 of 3\n- Previous: none"));
     }
 
     #[test]

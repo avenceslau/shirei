@@ -501,6 +501,33 @@ pub fn validate_review_cli(worktree: &Path, remote: &str) -> Result<()> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct FoundReview {
+    pub id: String,
+    pub url: Option<String>,
+}
+
+/// The open review of `branch` targeting `base`, without creating one.
+pub fn find_open_review(
+    worktree: &Path,
+    remote: &str,
+    branch: &str,
+    base: &str,
+) -> Result<Option<FoundReview>> {
+    let target = review_target(worktree, remote)?;
+    match target.kind {
+        ForgeKind::GitHub => {
+            ensure_gh_version()?;
+            find_github_review(worktree, branch, base, &target.repository)
+        }
+        ForgeKind::GitLab => {
+            ensure_glab_version()?;
+            find_gitlab_review(worktree, branch, base, &target.repository)
+        }
+        ForgeKind::Unknown => unreachable!(),
+    }
+}
+
 pub fn ensure_review(request: ReviewRequest<'_>) -> Result<EnsureReviewOutcome> {
     let target = review_target(request.worktree, request.remote)?;
     match target.kind {
@@ -551,18 +578,20 @@ pub fn update_review_body(
     }
 }
 
-fn ensure_github_review(
-    request: ReviewRequest<'_>,
+fn find_github_review(
+    worktree: &Path,
+    branch: &str,
+    base: &str,
     repository: &str,
-) -> Result<EnsureReviewOutcome> {
+) -> Result<Option<FoundReview>> {
     let list = Command::new("gh")
         .args([
             "pr",
             "list",
             "--head",
-            request.branch,
+            branch,
             "--base",
-            request.base,
+            base,
             "--state",
             "open",
             "--limit",
@@ -572,7 +601,7 @@ fn ensure_github_review(
             "--repo",
             repository,
         ])
-        .current_dir(request.worktree)
+        .current_dir(worktree)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
@@ -610,22 +639,34 @@ fn ensure_github_review(
     let exact = candidates
         .iter()
         .copied()
-        .find(|item| item["baseRefName"].as_str() == Some(request.base));
+        .find(|item| item["baseRefName"].as_str() == Some(base));
     if exact.is_none() && candidates.len() > 1 {
         return Err(anyhow!(
-            "multiple open GitHub pull requests exist for {}; specify the intended base outside Shirei",
-            request.branch
+            "multiple open GitHub pull requests exist for {branch}; specify the intended base outside Shirei"
         ));
     }
-    if let Some(item) = exact.or_else(|| candidates.first().copied()) {
-        let number = item["number"]
-            .as_i64()
-            .ok_or_else(|| anyhow!("gh pr list returned an item without number"))?
-            .to_string();
-        let url = item["url"].as_str().map(str::to_string);
+    let Some(item) = exact.or_else(|| candidates.first().copied()) else {
+        return Ok(None);
+    };
+    let number = item["number"]
+        .as_i64()
+        .ok_or_else(|| anyhow!("gh pr list returned an item without number"))?
+        .to_string();
+    Ok(Some(FoundReview {
+        id: number,
+        url: item["url"].as_str().map(str::to_string),
+    }))
+}
+
+fn ensure_github_review(
+    request: ReviewRequest<'_>,
+    repository: &str,
+) -> Result<EnsureReviewOutcome> {
+    let existing = find_github_review(request.worktree, request.branch, request.base, repository)?;
+    if let Some(found) = existing {
         return Ok(EnsureReviewOutcome::AlreadyCorrect {
-            url,
-            id: Some(number),
+            url: found.url,
+            id: Some(found.id),
         });
     }
 
@@ -788,18 +829,20 @@ fn review_target(worktree: &Path, remote: &str) -> Result<ReviewTarget> {
     })
 }
 
-fn ensure_gitlab_review(
-    request: ReviewRequest<'_>,
+fn find_gitlab_review(
+    worktree: &Path,
+    branch: &str,
+    base: &str,
     repository: &str,
-) -> Result<EnsureReviewOutcome> {
+) -> Result<Option<FoundReview>> {
     let list = Command::new("glab")
         .args([
             "mr",
             "list",
             "--source-branch",
-            request.branch,
+            branch,
             "--target-branch",
-            request.base,
+            base,
             "--per-page",
             "100",
             "--output",
@@ -807,7 +850,7 @@ fn ensure_gitlab_review(
             "--repo",
             repository,
         ])
-        .current_dir(request.worktree)
+        .current_dir(worktree)
         .env("GLAB_NO_PROMPT", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
@@ -840,25 +883,40 @@ fn ensure_gitlab_review(
         item["target_branch"]
             .as_str()
             .or_else(|| item["targetBranch"].as_str())
-            == Some(request.base)
+            == Some(base)
     });
     if exact.is_none() && candidates.len() > 1 {
         return Err(anyhow!(
-            "multiple open GitLab merge requests exist for {}; specify the intended base outside Shirei",
-            request.branch
+            "multiple open GitLab merge requests exist for {branch}; specify the intended base outside Shirei"
         ));
     }
-    if let Some(item) = exact.or_else(|| candidates.first().copied()) {
-        let id = item["iid"]
-            .as_i64()
-            .or_else(|| item["id"].as_i64())
-            .ok_or_else(|| anyhow!("glab mr list returned an item without iid/id"))?
-            .to_string();
-        let url = item["web_url"]
+    let Some(item) = exact.or_else(|| candidates.first().copied()) else {
+        return Ok(None);
+    };
+    let id = item["iid"]
+        .as_i64()
+        .or_else(|| item["id"].as_i64())
+        .ok_or_else(|| anyhow!("glab mr list returned an item without iid/id"))?
+        .to_string();
+    Ok(Some(FoundReview {
+        id,
+        url: item["web_url"]
             .as_str()
             .or_else(|| item["webUrl"].as_str())
-            .map(str::to_string);
-        return Ok(EnsureReviewOutcome::AlreadyCorrect { url, id: Some(id) });
+            .map(str::to_string),
+    }))
+}
+
+fn ensure_gitlab_review(
+    request: ReviewRequest<'_>,
+    repository: &str,
+) -> Result<EnsureReviewOutcome> {
+    let existing = find_gitlab_review(request.worktree, request.branch, request.base, repository)?;
+    if let Some(found) = existing {
+        return Ok(EnsureReviewOutcome::AlreadyCorrect {
+            url: found.url,
+            id: Some(found.id),
+        });
     }
 
     let generated_title = if request.title.is_none() {
