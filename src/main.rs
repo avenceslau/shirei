@@ -22,10 +22,12 @@ use crate::state::{
     RebaseProgress, RebaseStepState, RebaseStepStatus, StackBranch, State, Worktree,
 };
 
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SHIREI_GIT_SHA"), ")");
+
 #[derive(Parser, Debug)]
 #[command(
     name = "shirei",
-    version,
+    version = VERSION,
     about = "terminal session manager with worktree-aware dir tracking"
 )]
 struct Args {
