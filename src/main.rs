@@ -44,6 +44,8 @@ enum Cmd {
         /// Start-point for a new branch. If omitted, opens an fzf picker to choose one.
         #[arg(short = 'b', long = "base")]
         base: Option<String>,
+        #[command(flatten)]
+        options: WorktreeOptions,
     },
     /// Print recent directories.
     Recent,
@@ -71,6 +73,34 @@ enum Cmd {
         #[command(subcommand)]
         action: StackCmd,
     },
+}
+
+#[derive(clap::Args, Debug, Clone)]
+struct WorktreeOptions {
+    /// Create and register the worktree without opening or switching to a session.
+    /// This is the default when stdin is not a terminal or PI_CODING_AGENT is set.
+    #[arg(long = "no-open", conflicts_with = "open")]
+    no_open: bool,
+    /// Open and switch to the session even when stdin is not a terminal.
+    #[arg(long = "open")]
+    open: bool,
+    /// Print only the worktree path on stdout.
+    #[arg(long = "print-path")]
+    print_path: bool,
+}
+
+impl WorktreeOptions {
+    fn should_open(&self) -> bool {
+        use std::io::IsTerminal;
+
+        if self.open {
+            return true;
+        }
+        if self.no_open {
+            return false;
+        }
+        std::io::stdin().is_terminal() && std::env::var_os("PI_CODING_AGENT").is_none()
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -113,6 +143,8 @@ enum StackCmd {
         /// PR/MR base branch for this stack entry.
         #[arg(short = 'b', long = "base")]
         base: String,
+        #[command(flatten)]
+        options: WorktreeOptions,
     },
     /// Record stack metadata for an existing branch.
     Track {
@@ -173,13 +205,22 @@ enum WorktreesCmd {
     Prune,
     /// Walk configured roots and known repos, rebuild the worktree registry.
     Scan,
+    /// Register one existing linked worktree without scanning.
+    Add {
+        /// Path of a linked worktree listed by `git worktree list`.
+        path: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.cmd.unwrap_or(Cmd::Pick) {
         Cmd::Pick => run_picker(),
-        Cmd::Branch { name, base } => run_branch(name.as_deref(), base.as_deref()),
+        Cmd::Branch {
+            name,
+            base,
+            options,
+        } => run_branch(name.as_deref(), base.as_deref(), &options),
         Cmd::Recent => run_recent(),
         Cmd::Sessions => run_sessions(),
         Cmd::Kill => run_kill(),
@@ -192,11 +233,16 @@ fn main() -> Result<()> {
             Some(WorktreesCmd::Unfinished) => run_worktrees_unfinished(),
             Some(WorktreesCmd::Prune) => run_worktrees_prune(),
             Some(WorktreesCmd::Scan) => run_worktrees_scan(),
+            Some(WorktreesCmd::Add { path }) => run_worktrees_add(&path),
             None => run_worktrees_list(),
         },
         Cmd::Pr { action } => run_pr(action),
         Cmd::Stack { action } => match action {
-            StackCmd::Branch { name, base } => run_stack_branch(&name, &base),
+            StackCmd::Branch {
+                name,
+                base,
+                options,
+            } => run_stack_branch(&name, &base, &options),
             StackCmd::Track { branch, base, repo } => {
                 run_stack_track(&branch, &base, repo.as_deref())
             }
@@ -294,7 +340,7 @@ struct BranchOpenResult {
     outcome: git::WorktreeOutcome,
 }
 
-fn run_branch(name: Option<&str>, base: Option<&str>) -> Result<()> {
+fn run_branch(name: Option<&str>, base: Option<&str>, options: &WorktreeOptions) -> Result<()> {
     let cfg = config::load()?;
     let backend = Backend::from(cfg.backend);
     let mut state = state::load()?;
@@ -305,7 +351,39 @@ fn run_branch(name: Option<&str>, base: Option<&str>) -> Result<()> {
         Err(error) => return Err(error),
     };
     state::save(&state)?;
-    open_branch_result(backend, &result, &cfg)
+    finish_branch(backend, &result, &cfg, options)
+}
+
+fn finish_branch(
+    backend: Backend,
+    result: &BranchOpenResult,
+    cfg: &Config,
+    options: &WorktreeOptions,
+) -> Result<()> {
+    let outcome = match result.outcome {
+        git::WorktreeOutcome::Created => "created",
+        git::WorktreeOutcome::Existed => "existing",
+    };
+    if options.print_path {
+        println!("{}", result.path.display());
+    }
+    if options.should_open() {
+        return open_branch_result(backend, result, cfg);
+    }
+
+    if !options.print_path {
+        println!(
+            "{outcome}\tpath={}\tbranch={}",
+            result.path.display(),
+            result.branch
+        );
+    }
+    if cfg.run_install_on_create && result.outcome == git::WorktreeOutcome::Created {
+        if let Some(cmd) = install::detect(&result.path) {
+            eprintln!("note: skipped `{cmd}` because no session was opened");
+        }
+    }
+    Ok(())
 }
 
 fn open_branch_worktree(
@@ -417,7 +495,7 @@ fn open_branch_result(backend: Backend, result: &BranchOpenResult, cfg: &Config)
     open_session(backend, &result.path, &name_hint, install_cmd.as_deref())
 }
 
-fn run_stack_branch(name: &str, base: &str) -> Result<()> {
+fn run_stack_branch(name: &str, base: &str, options: &WorktreeOptions) -> Result<()> {
     let cfg = config::load()?;
     let backend = Backend::from(cfg.backend);
     let mut state = state::load()?;
@@ -453,7 +531,7 @@ fn run_stack_branch(name: &str, base: &str) -> Result<()> {
         updated: now,
     });
     state::save(&state)?;
-    open_branch_result(backend, &result, &cfg)
+    finish_branch(backend, &result, &cfg, options)
 }
 
 fn run_stack_track(branch: &str, base: &str, repo_arg: Option<&Path>) -> Result<()> {
@@ -1711,6 +1789,53 @@ fn run_worktrees_prune() -> Result<()> {
             failures.len()
         ))
     }
+}
+
+fn run_worktrees_add(path: &Path) -> Result<()> {
+    let canonical_path = std::fs::canonicalize(path)
+        .with_context(|| format!("resolve worktree path {}", path.display()))?;
+    let repo = git::main_worktree(&canonical_path)?;
+    let registered = git::list_worktrees(&repo)?
+        .into_iter()
+        .find(|worktree| {
+            std::fs::canonicalize(&worktree.path).ok().as_ref() == Some(&canonical_path)
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "{} is not listed by `git worktree list` in {}",
+                path.display(),
+                repo.display()
+            )
+        })?;
+    if registered.is_main {
+        return Err(anyhow!(
+            "{} is the main checkout; only linked worktrees are tracked",
+            path.display()
+        ));
+    }
+
+    let mut state = state::load()?;
+    let created = state
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.path == registered.path)
+        .map(|worktree| worktree.created)
+        .unwrap_or_else(OffsetDateTime::now_utc);
+    let branch = registered.branch.unwrap_or_default();
+    state.add_worktree(Worktree {
+        path: registered.path.clone(),
+        repo: repo.clone(),
+        branch: branch.clone(),
+        created,
+    });
+    state::save(&state)?;
+    println!(
+        "added {}\tbranch={}\trepo={}",
+        registered.path.display(),
+        if branch.is_empty() { "-" } else { &branch },
+        repo.display()
+    );
+    Ok(())
 }
 
 fn run_worktrees_scan() -> Result<()> {

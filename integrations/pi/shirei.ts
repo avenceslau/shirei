@@ -651,7 +651,7 @@ export default function (pi: ExtensionAPI) {
 
 			let branchResult;
 			try {
-				branchResult = await pi.exec("shirei", ["branch", branch, "--base", base], {
+				branchResult = await pi.exec("shirei", ["branch", branch, "--base", base, "--open"], {
 					cwd: repository,
 					timeout: 180_000,
 				});
@@ -877,7 +877,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(baseCheck.stderr.trim() || `Unknown base ref: ${base}`, "error");
 					return;
 				}
-				commandArgs = ["branch", branch, "--base", base];
+				commandArgs = ["branch", branch, "--base", base, "--open"];
 			} else if (parts[0] === "stack") {
 				if (parts[1] === "branch") {
 					if (!process.env.TMUX && !process.env.HERDR_ENV) {
@@ -888,7 +888,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify("Usage: /shirei stack branch <name> --base <branch>", "warning");
 						return;
 					}
-					commandArgs = ["stack", "branch", parts[2], "--base", parts[4]];
+					commandArgs = ["stack", "branch", parts[2], "--base", parts[4], "--open"];
 				} else if (parts[1] === "track") {
 					if (parts.length !== 5 || !(parts[3] === "--base" || parts[3] === "-b")) {
 						ctx.ui.notify("Usage: /shirei stack track <branch> --base <branch>", "warning");

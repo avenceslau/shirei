@@ -740,10 +740,12 @@ pub fn create_worktree(
         args
     };
 
+    // Keep stdout for `--print-path`; git's progress belongs on stderr.
     let status = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(&args)
+        .stdout(std::io::stderr())
         .status()
         .context("failed to run git worktree add")?;
     if !status.success() {
