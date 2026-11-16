@@ -657,9 +657,12 @@ pub fn create_worktree(
             remote.clone(),
         ]
     } else {
+        // A new branch must not track its base (for example origin/main), or a
+        // later `git push` would target the base branch.
         let mut args = vec![
             "worktree".into(),
             "add".into(),
+            "--no-track".into(),
             target.display().to_string(),
             "-b".into(),
             branch.local_name.clone(),
@@ -721,6 +724,55 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {} failed", args.join(" "));
+    }
+
+    fn init_repo(repo: &Path) {
+        fs::create_dir_all(repo).unwrap();
+        git(repo, &["init", "--initial-branch=main"]);
+        git(repo, &["config", "user.email", "test@example.com"]);
+        git(repo, &["config", "user.name", "Test User"]);
+        fs::write(repo.join("README.md"), "main\n").unwrap();
+        git(repo, &["add", "README.md"]);
+        git(repo, &["commit", "-m", "initial"]);
+    }
+
+    fn new_branch(name: &str) -> Branch {
+        Branch {
+            display: name.to_string(),
+            local_name: name.to_string(),
+            local: false,
+            remote: None,
+        }
+    }
+
+    fn git_succeeds(path: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+
+    #[test]
+    fn new_branch_from_remote_base_does_not_track_it() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
+        let repo_arg = repo.to_string_lossy().to_string();
+        git(&repo, &["remote", "add", "origin", &repo_arg]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let target = temp.path().join("worktrees").join("feature");
+
+        let outcome =
+            create_worktree(&repo, &new_branch("feature"), &target, Some("origin/main")).unwrap();
+
+        assert_eq!(outcome, WorktreeOutcome::Created);
+        assert_eq!(current_branch(&target).unwrap(), "feature");
+        assert!(!git_succeeds(&repo, &["config", "branch.feature.merge"]));
+        assert!(!git_succeeds(&repo, &["config", "branch.feature.remote"]));
     }
 
     #[test]
