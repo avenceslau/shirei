@@ -1337,6 +1337,22 @@ fn run_pr(action: PrCmd) -> Result<()> {
             "the review body has a `{heading}` heading; remove that section, {hint}"
         ));
     }
+    let cfg = config::load()?;
+    let host = remote_identity.split('/').next().unwrap_or_default();
+    if review::is_public_host(host, &cfg.review.private_hosts) {
+        let mut terms: Vec<String> = review::PUBLIC_DENYLIST
+            .iter()
+            .map(|term| term.to_string())
+            .collect();
+        terms.extend(cfg.review.extra_public_denylist.iter().cloned());
+        let hits = review::public_review_hits(title, body, &terms);
+        if !hits.is_empty() {
+            return Err(anyhow!(
+                "{host} is public; remove these internal names from the review:\n  {}",
+                hits.join("\n  ")
+            ));
+        }
+    }
 
     let mut stack_reviews = Vec::new();
     if stack_item.is_some() {

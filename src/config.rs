@@ -29,6 +29,28 @@ pub struct Config {
     /// non-cone sparse checkout.
     #[serde(default)]
     pub checkout_exclude: Vec<String>,
+    #[serde(default)]
+    pub review: ReviewConfig,
+}
+
+/// Rules `shirei pr create` applies to review titles and descriptions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReviewConfig {
+    /// Forge hosts whose reviews are private. Reviews on any other host are
+    /// public and are checked against the public denylist.
+    pub private_hosts: Vec<String>,
+    /// Terms added to the built-in public denylist.
+    pub extra_public_denylist: Vec<String>,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            private_hosts: vec!["gitlab.corp.example".into()],
+            extra_public_denylist: Vec::new(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -41,6 +63,7 @@ impl Default for Config {
             worktree_exclude_prefixes: default_worktree_exclude_prefixes(),
             run_install_on_create: default_run_install_on_create(),
             checkout_exclude: Vec::new(),
+            review: ReviewConfig::default(),
         }
     }
 }

@@ -33,6 +33,67 @@ pub fn stack_heading(body: &str) -> Option<String> {
     None
 }
 
+/// Internal names that must not appear in reviews on public hosts.
+pub const PUBLIC_DENYLIST: &[&str] = &[
+    "acme",
+    "acme-runner",
+    "runner",
+    "acme-loadtests",
+    "corp.example",
+    "preview.example.com",
+    "rocket",
+    "sprinkles",
+    "rocket",
+];
+
+pub fn is_public_host(host: &str, private_hosts: &[String]) -> bool {
+    !private_hosts
+        .iter()
+        .any(|private| private.eq_ignore_ascii_case(host))
+}
+
+/// The terms that occur in `text`, case-insensitive, where the characters
+/// around the match are not letters or digits.
+pub fn denylist_hits<'a>(text: &str, terms: &'a [String]) -> Vec<&'a str> {
+    let haystack = text.to_ascii_lowercase();
+    let bytes = haystack.as_bytes();
+    terms
+        .iter()
+        .filter(|term| {
+            let needle = term.to_ascii_lowercase();
+            haystack.match_indices(&needle).any(|(index, _)| {
+                let before = index.checked_sub(1).map(|i| bytes[i]);
+                let after = bytes.get(index + needle.len()).copied();
+                !before.is_some_and(|c| c.is_ascii_alphanumeric())
+                    && !after.is_some_and(|c| c.is_ascii_alphanumeric())
+            })
+        })
+        .map(String::as_str)
+        .collect()
+}
+
+/// Where each denylisted term occurs in a review, as `title: term` and
+/// `body line N: term`.
+pub fn public_review_hits(
+    title: Option<&str>,
+    body: Option<&str>,
+    terms: &[String],
+) -> Vec<String> {
+    let mut hits = Vec::new();
+    for term in title
+        .map(|title| denylist_hits(title, terms))
+        .unwrap_or_default()
+    {
+        hits.push(format!("title: {term}"));
+    }
+    for (index, line) in body.unwrap_or_default().lines().enumerate() {
+        for term in denylist_hits(line, terms) {
+            hits.push(format!("body line {}: {term}", index + 1));
+        }
+    }
+    hits
+}
+
 /// The `KEY-NNNN:` prefix of `title`, as `(key, number)`.
 fn ticket_prefix(title: &str) -> Option<(&str, &str)> {
     let (ticket, _) = title.split_once(':')?;
@@ -114,6 +175,34 @@ pub fn with_ticket(title: &str, key: &str, ticket: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_denylisted_terms_on_word_boundaries() {
+        let terms: Vec<String> = PUBLIC_DENYLIST
+            .iter()
+            .map(|term| term.to_string())
+            .collect();
+        assert_eq!(
+            public_review_hits(
+                Some("Fix Acme hook"),
+                Some("Runs in acme-runner\nrunners is fine\nsee x.corp.example"),
+                &terms
+            ),
+            [
+                "title: acme",
+                "body line 1: acme",
+                "body line 1: acme-runner",
+                "body line 1: runner",
+                "body line 3: corp.example"
+            ]
+        );
+        assert!(public_review_hits(Some("Rocketry"), None, &terms).is_empty());
+        assert!(!is_public_host(
+            "GitLab.corp.example",
+            &["gitlab.corp.example".into()]
+        ));
+        assert!(is_public_host("github.com", &["gitlab.corp.example".into()]));
+    }
 
     #[test]
     fn detects_the_ticket_key_used_by_most_titles() {

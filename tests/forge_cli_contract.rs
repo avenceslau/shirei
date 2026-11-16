@@ -469,6 +469,52 @@ fn pr_create_adds_the_ticket_prefix_recent_titles_use() {
 }
 
 #[test]
+fn pr_create_rejects_internal_names_only_on_public_hosts() {
+    let test = test_repo("git@github.com:owner/repo.git");
+    let args = [
+        "pr",
+        "create",
+        "--dry-run",
+        "--title",
+        "Fix Acme hook",
+        "--body",
+        "Found by acme-loadtests.\nNothing else.\nRuns on Rocket",
+    ];
+
+    let output = run_shirei(&test, &args);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("github.com is public"), "{stderr}");
+    assert!(stderr.contains("title: acme"), "{stderr}");
+    assert!(stderr.contains("body line 1: acme-loadtests"), "{stderr}");
+    assert!(stderr.contains("body line 3: rocket"), "{stderr}");
+
+    fs::write(
+        &test.config,
+        "[review]\nextra_public_denylist = [\"hook\"]\n",
+    )
+    .unwrap();
+    let extended = run_shirei(&test, &args);
+    assert!(String::from_utf8_lossy(&extended.stderr).contains("title: hook"));
+
+    git(
+        &test.repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@gitlab.corp.example:owner/repo.git",
+        ],
+    );
+    let private = run_shirei(&test, &args);
+    assert!(
+        private.status.success(),
+        "{}",
+        String::from_utf8_lossy(&private.stderr)
+    );
+}
+
+#[test]
 fn pr_create_rejects_a_hand_written_stack_section() {
     let test = test_repo("git@github.com:owner/repo.git");
     track_three_branch_stack(&test);
