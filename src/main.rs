@@ -1142,7 +1142,7 @@ fn run_pr(action: PrCmd) -> Result<()> {
             return Err(anyhow!("--base cannot be empty"));
         }
         Some(value) => value.trim().to_string(),
-        None => git::default_remote_branch(&repo, &remote)?,
+        None => default_review_base(&repo, &remote)?,
     };
     let title = match title.as_deref() {
         Some(value) if value.trim().is_empty() => {
@@ -1205,6 +1205,24 @@ fn run_pr(action: PrCmd) -> Result<()> {
         outcome.url().unwrap_or("-")
     );
     Ok(())
+}
+
+fn default_review_base(repo: &Path, remote: &str) -> Result<String> {
+    let local = git::default_remote_branch(repo, remote).ok();
+    let live = git::live_remote_head_branch(repo, remote, std::time::Duration::from_secs(5));
+    match (live, local) {
+        (Some(live), Some(local)) if live != local => {
+            eprintln!(
+                "warn: refs/remotes/{remote}/HEAD points to {local}, but {remote} now uses {live}; using {live}. Run `git remote set-head {remote} --auto` to update it."
+            );
+            Ok(live)
+        }
+        (Some(live), _) => Ok(live),
+        (None, Some(local)) => Ok(local),
+        (None, None) => Err(anyhow!(
+            "could not determine the default branch for {remote}; pass --base"
+        )),
+    }
 }
 
 fn run_stack_submit(

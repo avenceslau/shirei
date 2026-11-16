@@ -474,6 +474,53 @@ pub fn default_remote_branch(repo: &Path, remote: &str) -> Result<String> {
     Ok(resolved[prefix.len()..].to_string())
 }
 
+/// The branch that `remote`'s HEAD points to, asked from the remote itself
+/// because the local `refs/remotes/<remote>/HEAD` is only set at clone time.
+/// `None` when the remote cannot answer within `timeout`.
+pub fn live_remote_head_branch(
+    repo: &Path,
+    remote: &str,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-remote", "--symref", remote, "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let (reference, name) = line.strip_prefix("ref: ")?.split_once('\t')?;
+            if name != "HEAD" {
+                return None;
+            }
+            reference.strip_prefix("refs/heads/").map(str::to_string)
+        })
+}
+
 pub fn push_branch(repo_or_worktree: &Path, remote: &str, branch: &str) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")

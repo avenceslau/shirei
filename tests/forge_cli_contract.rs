@@ -208,7 +208,7 @@ fn test_repo(remote: &str) -> TestRepo {
     executable(
         &bin.join("git"),
         &format!(
-            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = push ]; then\n    printf '%s\\n' \"$*\" >> \"$SHIREI_GIT_LOG\"\n    exit 0\n  fi\ndone\nexec \"{}\" \"$@\"\n",
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = push ]; then\n    printf '%s\\n' \"$*\" >> \"$SHIREI_GIT_LOG\"\n    exit 0\n  fi\n  if [ \"$arg\" = ls-remote ]; then\n    [ -n \"$SHIREI_LS_REMOTE_OUTPUT\" ] || exit 128\n    printf '%b' \"$SHIREI_LS_REMOTE_OUTPUT\"\n    exit 0\n  fi\ndone\nexec \"{}\" \"$@\"\n",
             git_path.trim()
         ),
     );
@@ -243,12 +243,17 @@ fn track_review_branch_as_stack(test: &TestRepo) {
 }
 
 fn run_shirei(test: &TestRepo, args: &[&str]) -> Output {
+    shirei(test, args).output().unwrap()
+}
+
+fn shirei(test: &TestRepo, args: &[&str]) -> Command {
     let path = format!(
         "{}:{}",
         test.bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    Command::new(env!("CARGO_BIN_EXE_shirei"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shirei"));
+    command
         .args(args)
         .current_dir(&test.repo)
         .env("PATH", path)
@@ -256,8 +261,47 @@ fn run_shirei(test: &TestRepo, args: &[&str]) -> Output {
         .env("SHIREI_GIT_LOG", &test.git_log)
         .env("SHIREI_STATE_DIR", &test.state_dir)
         .env("SHIREI_CONFIG", &test.config)
+        .env_remove("SHIREI_LS_REMOTE_OUTPUT");
+    command
+}
+
+#[test]
+fn pr_create_prefers_the_remote_default_branch_over_a_stale_local_head() {
+    let test = test_repo("git@github.com:owner/repo.git");
+    git(
+        &test.repo,
+        &["update-ref", "refs/remotes/origin/staging", "main"],
+    );
+    git(
+        &test.repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/staging",
+        ],
+    );
+
+    let output = shirei(&test, &["pr", "create", "--dry-run"])
+        .env(
+            "SHIREI_LS_REMOTE_OUTPUT",
+            "ref: refs/heads/main\\tHEAD\\n0123456789012345678901234567890123456789\\tHEAD\\n",
+        )
         .output()
-        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\nbase=main\n"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refs/remotes/origin/HEAD points to staging, but origin now uses main"),
+        "{stderr}"
+    );
+
+    let offline = run_shirei(&test, &["pr", "create", "--dry-run"]);
+    assert!(String::from_utf8_lossy(&offline.stdout).contains("\nbase=staging\n"));
 }
 
 #[test]
