@@ -418,6 +418,91 @@ fn scan_keeps_entries_of_repos_that_fail_to_scan() {
 }
 
 #[test]
+fn prune_merged_previews_then_deletes_only_clean_merged_worktrees() {
+    let repo = setup();
+    let main_arg = repo.main.to_string_lossy().to_string();
+    git(&repo.main, &["remote", "add", "origin", &main_arg]);
+    let mut paths = Vec::new();
+    for name in ["merged", "dirty", "unmerged"] {
+        let stdout = assert_success(&run_shirei(
+            &repo,
+            &repo.main,
+            &[
+                "branch",
+                &format!("feat/{name}"),
+                "--base",
+                "main",
+                "--print-path",
+            ],
+        ));
+        let path = PathBuf::from(stdout.trim());
+        fs::write(path.join(format!("{name}.txt")), "work\n").unwrap();
+        git(&path, &["add", "-A"]);
+        git(&path, &["commit", "-m", name]);
+        paths.push(path);
+    }
+    // feat/merged and feat/dirty landed on the remote default branch.
+    git(
+        &repo.main,
+        &["merge", "--no-edit", "feat/merged", "feat/dirty"],
+    );
+    git(
+        &repo.main,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    git(
+        &repo.main,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    fs::write(paths[1].join("uncommitted.txt"), "wip\n").unwrap();
+
+    let preview = assert_success(&run_shirei(
+        &repo,
+        &repo.main,
+        &["worktrees", "prune", "--merged"],
+    ));
+    assert!(
+        preview.contains(&format!(
+            "would remove {}\tbranch=feat/merged",
+            paths[0].display()
+        )),
+        "{preview}"
+    );
+    assert!(preview.contains(&format!("skip {}\treason=dirty", paths[1].display())));
+    assert!(preview.contains(&format!("skip {}\treason=unmerged", paths[2].display())));
+    assert!(paths.iter().all(|path| path.is_dir()));
+
+    let only_unmerged = paths[2].to_string_lossy().to_string();
+    assert_success(&run_shirei(
+        &repo,
+        &repo.main,
+        &["worktrees", "prune", "--merged", "--yes", &only_unmerged],
+    ));
+    assert!(paths[0].is_dir());
+
+    let removed = assert_success(&run_shirei(
+        &repo,
+        &repo.main,
+        &["worktrees", "prune", "--merged", "--yes"],
+    ));
+    assert!(
+        removed.contains(&format!("removed {}", paths[0].display())),
+        "{removed}"
+    );
+    assert!(!paths[0].exists());
+    assert!(paths[1].is_dir() && paths[2].is_dir());
+    let branches = git(&repo.main, &["branch", "--format=%(refname:short)"]);
+    assert!(!branches.contains("feat/merged"), "{branches}");
+    assert!(branches.contains("feat/dirty") && branches.contains("feat/unmerged"));
+    let state = read_state(&repo);
+    assert_eq!(state["worktrees"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn untrack_accepts_the_path_of_a_deleted_repo() {
     let repo = setup();
     let deleted_repo = repo.root.join("deleted-repo");

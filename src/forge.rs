@@ -7,7 +7,10 @@ use std::sync::OnceLock;
 
 #[derive(Debug)]
 pub enum ReviewStatus {
-    Covered,
+    /// An open review contains the local HEAD.
+    Open,
+    /// A merged review contains the local HEAD.
+    Merged,
     Stale,
     NoneFound,
     Unknown(Vec<String>),
@@ -291,7 +294,11 @@ pub fn review_status(worktree: &Path, branch: &str) -> ReviewStatus {
                                     let review_to_local = is_ancestor(worktree, review_head, &head);
                                     let local_to_review = is_ancestor(worktree, &head, review_head);
                                     if (open || merged) && local_to_review == Some(true) {
-                                        return ReviewStatus::Covered;
+                                        return if merged {
+                                            ReviewStatus::Merged
+                                        } else {
+                                            ReviewStatus::Open
+                                        };
                                     }
                                     if review_to_local == Some(true) {
                                         stale_review = true;
@@ -380,7 +387,11 @@ pub fn review_status(worktree: &Path, branch: &str) -> ReviewStatus {
                                     let review_to_local = is_ancestor(worktree, review_head, &head);
                                     let local_to_review = is_ancestor(worktree, &head, review_head);
                                     if (open || merged) && local_to_review == Some(true) {
-                                        return ReviewStatus::Covered;
+                                        return if merged {
+                                            ReviewStatus::Merged
+                                        } else {
+                                            ReviewStatus::Open
+                                        };
                                     }
                                     if review_to_local == Some(true) {
                                         stale_review = true;

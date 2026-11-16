@@ -229,8 +229,18 @@ enum WorktreesCmd {
     /// Select tracked worktrees and permanently delete their directories and local branches.
     Prune {
         /// Remove registry entries whose paths no longer exist. Deletes nothing on disk.
-        #[arg(long = "missing")]
+        #[arg(long = "missing", conflicts_with = "merged")]
         missing: bool,
+        /// Without fzf, delete clean worktrees whose branches are merged, with
+        /// their local branches. Prints what would be removed unless --yes.
+        #[arg(long = "merged")]
+        merged: bool,
+        /// Delete instead of printing what --merged would remove.
+        #[arg(long = "yes", requires = "merged")]
+        yes: bool,
+        /// Limit --merged to these tracked worktrees.
+        #[arg(requires = "merged")]
+        paths: Vec<PathBuf>,
     },
     /// Walk configured roots and known repos, rebuild the worktree registry.
     Scan,
@@ -260,8 +270,20 @@ fn main() -> Result<()> {
         }
         Cmd::Worktrees { action } => match action {
             Some(WorktreesCmd::Unfinished) => run_worktrees_unfinished(),
-            Some(WorktreesCmd::Prune { missing: true }) => run_worktrees_prune_missing(),
-            Some(WorktreesCmd::Prune { missing: false }) => run_worktrees_prune(),
+            Some(WorktreesCmd::Prune {
+                missing,
+                merged,
+                yes,
+                paths,
+            }) => {
+                if missing {
+                    run_worktrees_prune_missing()
+                } else if merged {
+                    run_worktrees_prune_merged(yes, &paths)
+                } else {
+                    run_worktrees_prune()
+                }
+            }
             Some(WorktreesCmd::Scan) => run_worktrees_scan(),
             Some(WorktreesCmd::Add { path }) => run_worktrees_add(&path),
             None => run_worktrees_list(),
@@ -1675,7 +1697,7 @@ fn run_worktrees_unfinished() -> Result<()> {
 
         let (branch, review) = if let Some(branch) = status.branch {
             match forge::review_status(&worktree.path, &branch) {
-                forge::ReviewStatus::Covered => continue,
+                forge::ReviewStatus::Open | forge::ReviewStatus::Merged => continue,
                 forge::ReviewStatus::Stale => (branch, "stale"),
                 forge::ReviewStatus::NoneFound => (branch, "none"),
                 forge::ReviewStatus::Unknown(errors) => {
@@ -1703,6 +1725,163 @@ fn run_worktrees_unfinished() -> Result<()> {
         println!("(no potentially unfinished worktrees without active or merged reviews)");
     }
     Ok(())
+}
+
+/// Permanently delete a tracked worktree's directory, Git worktree metadata,
+/// local branch, and Shirei entries. The primary worktree is always refused.
+fn delete_tracked_worktree(
+    state: &mut State,
+    worktree: &Worktree,
+    repo_path: &Path,
+    fallback_branch: Option<String>,
+) -> Result<()> {
+    let canonical_worktree =
+        std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
+    let git_ref = git::list_worktrees(repo_path)?.into_iter().find(|item| {
+        std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
+            == canonical_worktree
+    });
+    if git_ref.as_ref().is_some_and(|item| item.is_main) {
+        return Err(anyhow!("refusing to remove the primary worktree"));
+    }
+    match &git_ref {
+        Some(item) => git::remove_worktree(repo_path, &item.path)?,
+        None if worktree.path.exists() => {
+            return Err(anyhow!("directory is not registered as a Git worktree"));
+        }
+        None => {}
+    }
+
+    let branch = git_ref.and_then(|item| item.branch).or(fallback_branch);
+    if let Some(branch_name) = branch.as_deref() {
+        if let Err(error) = git::delete_local_branch(repo_path, branch_name) {
+            // Keep a retryable entry now that the directory is gone.
+            if let Some(item) = state
+                .worktrees
+                .iter_mut()
+                .find(|item| item.path == worktree.path)
+            {
+                item.repo = repo_path.to_path_buf();
+                item.branch = branch_name.to_string();
+            }
+            state.recent.retain(|item| item.path != worktree.path);
+            state::save(state)?;
+            return Err(error);
+        }
+        state.untrack_stack_branch(repo_path, branch_name);
+    }
+
+    state.worktrees.retain(|item| item.path != worktree.path);
+    state.recent.retain(|item| item.path != worktree.path);
+    state::save(state)
+}
+
+fn run_worktrees_prune_merged(yes: bool, paths: &[PathBuf]) -> Result<()> {
+    let mut state = state::load()?;
+    let mut selected = Vec::new();
+    if paths.is_empty() {
+        selected = state.worktrees.clone();
+    }
+    for path in paths {
+        let canonical_path = std::fs::canonicalize(path)
+            .with_context(|| format!("resolve worktree path {}", path.display()))?;
+        let tracked = state
+            .worktrees
+            .iter()
+            .find(|worktree| {
+                std::fs::canonicalize(&worktree.path).ok().as_ref() == Some(&canonical_path)
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} is not tracked; run `shirei worktrees add {}` first",
+                    path.display(),
+                    path.display()
+                )
+            })?;
+        selected.push(tracked.clone());
+    }
+    selected.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let cwd = std::env::current_dir().context("could not read cwd")?;
+    let mut removable = Vec::new();
+    for worktree in selected {
+        match merged_worktree_branch(&worktree, &cwd) {
+            Ok(branch) => removable.push((worktree, branch)),
+            Err(reason) => println!("skip {}\treason={reason}", worktree.path.display()),
+        }
+    }
+
+    if !yes {
+        for (worktree, branch) in &removable {
+            println!("would remove {}\tbranch={branch}", worktree.path.display());
+        }
+        println!(
+            "dry run: pass --yes to delete {} worktree(s) and their local branches",
+            removable.len()
+        );
+        return Ok(());
+    }
+
+    let mut failures = Vec::new();
+    for (worktree, branch) in removable {
+        let repo_path = worktree.repo.clone();
+        match delete_tracked_worktree(&mut state, &worktree, &repo_path, Some(branch.clone())) {
+            Ok(()) => println!("removed {}\tbranch={branch}", worktree.path.display()),
+            Err(error) => failures.push(format!("{}: {error:#}", worktree.path.display())),
+        }
+    }
+    for failure in &failures {
+        eprintln!("warn: {failure}");
+    }
+    if !failures.is_empty() {
+        return Err(anyhow!(
+            "failed to fully remove {} worktree(s)",
+            failures.len()
+        ));
+    }
+    Ok(())
+}
+
+/// The branch of a worktree that is safe to delete: clean, not the primary or
+/// current worktree, and merged into a remote default branch or through a
+/// merged review. Otherwise the reason it is kept.
+fn merged_worktree_branch(worktree: &Worktree, cwd: &Path) -> std::result::Result<String, String> {
+    if !worktree.path.is_dir() {
+        return Err("missing (see --missing)".to_string());
+    }
+    let canonical_path =
+        std::fs::canonicalize(&worktree.path).map_err(|error| format!("unreadable: {error}"))?;
+    if cwd.starts_with(&canonical_path) {
+        return Err("current-directory".to_string());
+    }
+    let git_refs = git::list_worktrees(&worktree.repo).map_err(|error| error.to_string())?;
+    let git_ref = git_refs
+        .into_iter()
+        .find(|item| std::fs::canonicalize(&item.path).ok().as_ref() == Some(&canonical_path))
+        .ok_or_else(|| "not-a-git-worktree".to_string())?;
+    if git_ref.is_main {
+        return Err("primary".to_string());
+    }
+
+    let status = git::inspect_worktree(&worktree.path)
+        .map_err(|error| format!("inspection-error: {error}"))?;
+    if status.dirty {
+        return Err("dirty".to_string());
+    }
+    let Some(branch) = status.branch else {
+        return Err("detached".to_string());
+    };
+    if status.merge == git::MergeStatus::Merged {
+        return Ok(branch);
+    }
+    match forge::review_status(&worktree.path, &branch) {
+        forge::ReviewStatus::Merged => Ok(branch),
+        forge::ReviewStatus::Open => Err("open-review".to_string()),
+        forge::ReviewStatus::Unknown(_) if status.merge == git::MergeStatus::Unknown => {
+            Err("merge-unknown".to_string())
+        }
+        _ => Err("unmerged".to_string()),
+    }
 }
 
 fn run_worktrees_prune_missing() -> Result<()> {
@@ -1898,64 +2077,10 @@ fn run_worktrees_prune() -> Result<()> {
     let mut removed = 0usize;
     let mut failures = Vec::new();
     for (worktree, repo_path, fallback_branch, _) in selected {
-        let git_refs = match git::list_worktrees(&repo_path) {
-            Ok(refs) => refs,
-            Err(error) => {
-                failures.push(format!("{}: {error}", worktree.path.display()));
-                continue;
-            }
-        };
-        let canonical_worktree =
-            std::fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
-        let git_ref = git_refs.into_iter().find(|item| {
-            std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
-                == canonical_worktree
-        });
-        if git_ref.as_ref().is_some_and(|item| item.is_main) {
-            failures.push(format!(
-                "{}: refusing to remove the primary worktree",
-                worktree.path.display()
-            ));
-            continue;
+        match delete_tracked_worktree(&mut state, &worktree, &repo_path, fallback_branch) {
+            Ok(()) => removed += 1,
+            Err(error) => failures.push(format!("{}: {error:#}", worktree.path.display())),
         }
-        if let Some(item) = &git_ref {
-            if let Err(error) = git::remove_worktree(&repo_path, &item.path) {
-                failures.push(format!("{}: {error}", worktree.path.display()));
-                continue;
-            }
-        } else if worktree.path.exists() {
-            failures.push(format!(
-                "{}: directory is not registered as a Git worktree",
-                worktree.path.display()
-            ));
-            continue;
-        }
-
-        let branch = git_ref.and_then(|item| item.branch).or(fallback_branch);
-        if let Some(branch_name) = branch.as_deref() {
-            if let Err(error) = git::delete_local_branch(&repo_path, branch_name) {
-                if let Some(item) = state
-                    .worktrees
-                    .iter_mut()
-                    .find(|item| item.path == worktree.path)
-                {
-                    item.repo = repo_path.clone();
-                    item.branch = branch_name.to_string();
-                }
-                state.recent.retain(|item| item.path != worktree.path);
-                state::save(&state)?;
-                failures.push(format!("{}: {error}", worktree.path.display()));
-                continue;
-            }
-        }
-
-        if let Some(branch_name) = branch.as_deref() {
-            state.untrack_stack_branch(&repo_path, branch_name);
-        }
-        state.worktrees.retain(|item| item.path != worktree.path);
-        state.recent.retain(|item| item.path != worktree.path);
-        state::save(&state)?;
-        removed += 1;
     }
 
     println!("removed {removed} worktree(s)");
