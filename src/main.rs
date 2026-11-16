@@ -1105,8 +1105,14 @@ fn run_stack_submit(
         ));
     }
     forge::validate_review_cli(&repo, &remote)?;
-    let mut reviews = Vec::new();
+    // Stack branches are usually rebased before submit, so they are force
+    // pushed, but only over the remote commit seen before anything is pushed.
+    let mut expected_remote_oids = Vec::new();
     for step in &plan.steps {
+        expected_remote_oids.push(git::remote_tracking_oid(&repo, &remote, &step.branch)?);
+    }
+    let mut reviews = Vec::new();
+    for (step, expected_remote_oid) in plan.steps.iter().zip(&expected_remote_oids) {
         let worktree = step
             .worktree
             .as_ref()
@@ -1114,7 +1120,12 @@ fn run_stack_submit(
         if !git::worktree_is_clean(worktree)? {
             return Err(anyhow!("worktree is dirty: {}", worktree.display()));
         }
-        git::push_branch(worktree, &remote, &step.branch)?;
+        git::force_push_branch(
+            worktree,
+            &remote,
+            &step.branch,
+            expected_remote_oid.as_deref(),
+        )?;
         let outcome = forge::ensure_review(forge::ReviewRequest {
             worktree,
             branch: &step.branch,

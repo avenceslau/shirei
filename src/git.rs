@@ -471,6 +471,53 @@ pub fn push_branch(repo_or_worktree: &Path, remote: &str, branch: &str) -> Resul
     Ok(())
 }
 
+pub fn remote_tracking_oid(repo: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
+    let reference = format!("refs/remotes/{remote}/{branch}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", &reference])
+        .output()
+        .with_context(|| format!("failed to resolve {reference}"))?;
+    match output.status.code() {
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        )),
+        Some(1) => Ok(None),
+        _ => Err(anyhow!(
+            "git rev-parse failed for {reference}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// Push `branch`, replacing the remote branch only if it still points at
+/// `expected_remote_oid`. `None` means the remote branch must not exist yet.
+pub fn force_push_branch(
+    repo_or_worktree: &Path,
+    remote: &str,
+    branch: &str,
+    expected_remote_oid: Option<&str>,
+) -> Result<()> {
+    let lease = format!(
+        "--force-with-lease={branch}:{}",
+        expected_remote_oid.unwrap_or_default()
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_or_worktree)
+        .args(["push", "-u", &lease, remote, branch])
+        .output()
+        .context("failed to run git push")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git push --force-with-lease failed for {branch}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 pub fn worktree_is_clean(worktree: &Path) -> Result<bool> {
     let output = Command::new("git")
         .arg("-C")
@@ -773,6 +820,42 @@ mod tests {
         assert_eq!(current_branch(&target).unwrap(), "feature");
         assert!(!git_succeeds(&repo, &["config", "branch.feature.merge"]));
         assert!(!git_succeeds(&repo, &["config", "branch.feature.remote"]));
+    }
+
+    #[test]
+    fn force_push_replaces_only_the_expected_remote_branch() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let remote = temp.path().join("remote.git");
+        init_repo(&repo);
+        git(temp.path(), &["init", "--bare", "remote.git"]);
+        let remote_arg = remote.to_string_lossy().to_string();
+        git(&repo, &["remote", "add", "origin", &remote_arg]);
+        git(&repo, &["switch", "-c", "feature"]);
+        fs::write(repo.join("feature.txt"), "one\n").unwrap();
+        git(&repo, &["add", "feature.txt"]);
+        git(&repo, &["commit", "-m", "feature"]);
+
+        assert_eq!(
+            remote_tracking_oid(&repo, "origin", "feature").unwrap(),
+            None
+        );
+        force_push_branch(&repo, "origin", "feature", None).unwrap();
+        let pushed = remote_tracking_oid(&repo, "origin", "feature")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pushed, head_oid(&repo).unwrap());
+
+        git(&repo, &["commit", "--amend", "-m", "rewritten feature"]);
+        assert!(
+            force_push_branch(&repo, "origin", "feature", Some(&head_oid(&repo).unwrap())).is_err()
+        );
+        assert!(force_push_branch(&repo, "origin", "feature", None).is_err());
+        force_push_branch(&repo, "origin", "feature", Some(&pushed)).unwrap();
+        assert_eq!(
+            rev_parse_commit(&remote, "feature").unwrap(),
+            head_oid(&repo).unwrap()
+        );
     }
 
     #[test]

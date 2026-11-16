@@ -291,6 +291,48 @@ fn gitlab_stack_submit_updates_descriptions_with_supported_flags() {
 }
 
 #[test]
+fn stack_submit_force_pushes_with_a_lease_on_the_remote_commit_seen_first() {
+    let test = test_repo("git@gitlab.com:owner/repo.git");
+    track_review_branch_as_stack(&test);
+    git(
+        &test.repo,
+        &["update-ref", "refs/remotes/origin/feature/review", "main"],
+    );
+    let previously_pushed = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&test.repo)
+            .args(["rev-parse", "main"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    executable(
+        &test.bin.join("glab"),
+        &strict_fake_glab(
+            r#"{"iid":9,"web_url":"https://gitlab.com/owner/repo/-/merge_requests/9","description":""}"#,
+        ),
+    );
+
+    let output = run_shirei(&test, &["stack", "submit", "--branch", "feature/review"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let pushes = fs::read_to_string(&test.git_log).unwrap();
+    assert!(
+        pushes.contains(&format!(
+            "push -u --force-with-lease=feature/review:{} origin feature/review",
+            previously_pushed.trim()
+        )),
+        "{pushes}"
+    );
+}
+
+#[test]
 fn installed_glab_accepts_the_flags_shirei_uses() {
     let Ok(update_help) = Command::new("glab")
         .args(["mr", "update", "--help"])
