@@ -324,6 +324,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "shirei_stack_rebase_assist",
 		label: "Shirei Stack Rebase Assist",
+		// Each call opens a confirmation dialog; parallel calls would show two at once.
+		executionMode: "sequential",
 		description:
 			"Cascade rebase a Shirei stack and use Pi with the fastest available GPT-5.6 Luna/Terra/Sol model to fix conflicts. Requires interactive confirmation.",
 		promptSnippet: "Cascade rebase a Shirei stack with LLM conflict repair",
@@ -412,6 +414,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "shirei_pr_create",
 		label: "Shirei PR Create",
+		executionMode: "sequential",
 		description:
 			"Create or reuse a standalone GitHub pull request or GitLab merge request with an agent-authored title and description, preview, and confirmation.",
 		promptSnippet: "Author, preview, and confirm a standalone pull request or merge request",
@@ -535,6 +538,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "shirei_handoff",
 		label: "Shirei Handoff",
+		executionMode: "sequential",
 		description:
 			"Create or reuse a Shirei branch worktree and send an editable, agent-authored first prompt to Pi in that session. The repository must be an existing path. Uncommitted changes are not transferred.",
 		promptSnippet: "Hand work to Pi in another Shirei branch session",
