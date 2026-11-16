@@ -507,6 +507,23 @@ pub fn merge_base(repo: &Path, left: &str, right: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .context("failed to run git merge-base --is-ancestor")?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(anyhow!(
+            "git merge-base --is-ancestor failed for {ancestor} and {descendant}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
 pub fn default_remote_branch(repo: &Path, remote: &str) -> Result<String> {
     let reference = format!("refs/remotes/{remote}/HEAD");
     let output = Command::new("git")

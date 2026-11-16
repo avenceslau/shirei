@@ -597,21 +597,24 @@ fn run_stack_branch(name: &str, base: &str, options: &WorktreeOptions) -> Result
         false,
     )?;
     let now = OffsetDateTime::now_utc();
-    let created = state
-        .stack_branch(&repo, &result.branch)
-        .map(|item| item.created)
-        .unwrap_or(now);
+    let existing = state.stack_branch(&repo, &result.branch).cloned();
+    let base_oid = stack::base_oid(
+        &repo,
+        &result.branch,
+        base,
+        existing
+            .as_ref()
+            .filter(|item| item.base == base)
+            .and_then(|item| item.base_oid.as_deref()),
+    )?;
     state.upsert_stack_branch(StackBranch {
         repo: repo.clone(),
         branch: result.branch.clone(),
         base: base.to_string(),
-        review_url: state
-            .stack_branch(&repo, &result.branch)
-            .and_then(|item| item.review_url.clone()),
-        review_id: state
-            .stack_branch(&repo, &result.branch)
-            .and_then(|item| item.review_id.clone()),
-        created,
+        base_oid: Some(base_oid),
+        review_url: existing.as_ref().and_then(|item| item.review_url.clone()),
+        review_id: existing.as_ref().and_then(|item| item.review_id.clone()),
+        created: existing.map(|item| item.created).unwrap_or(now),
         updated: now,
     });
     state::save(&state)?;
@@ -627,10 +630,20 @@ fn run_stack_track(branch: &str, base: &str, repo_arg: Option<&Path>) -> Result<
     stack::validate_edge(&state, &repo, branch, base)?;
     let now = OffsetDateTime::now_utc();
     let existing = state.stack_branch(&repo, branch).cloned();
+    let base_oid = stack::base_oid(
+        &repo,
+        branch,
+        base,
+        existing
+            .as_ref()
+            .filter(|item| item.base == base)
+            .and_then(|item| item.base_oid.as_deref()),
+    )?;
     state.upsert_stack_branch(StackBranch {
         repo: repo.clone(),
         branch: branch.to_string(),
         base: base.to_string(),
+        base_oid: Some(base_oid),
         review_url: existing.as_ref().and_then(|item| item.review_url.clone()),
         review_id: existing.as_ref().and_then(|item| item.review_id.clone()),
         created: existing.map(|item| item.created).unwrap_or(now),
@@ -967,6 +980,9 @@ fn run_stack_rebase_continue(state: &mut State) -> Result<()> {
     match git::rebase_continue(&step.worktree)? {
         git::GitRebaseStatus::Clean => {
             let after_head_oid = git::head_oid(&step.worktree)?;
+            if let Some(item) = state.stack_branch_mut(&progress.repo, &step.branch) {
+                item.base_oid = Some(expected_onto_oid.clone());
+            }
             if let Some(progress) = state.rebase_progress.as_mut() {
                 progress.steps[progress.current].after_head_oid = Some(after_head_oid);
                 progress.steps[progress.current].status = RebaseStepStatus::Done;
@@ -1077,6 +1093,9 @@ fn run_rebase_progress(state: &mut State) -> Result<()> {
         match git::rebase_onto(&step.worktree, &onto_oid, old_base_oid)? {
             git::GitRebaseStatus::Clean => {
                 let after_head_oid = git::head_oid(&step.worktree)?;
+                if let Some(item) = state.stack_branch_mut(&progress.repo, &step.branch) {
+                    item.base_oid = Some(onto_oid.clone());
+                }
                 if let Some(progress) = state.rebase_progress.as_mut() {
                     progress.steps[progress.current].after_head_oid = Some(after_head_oid);
                     progress.steps[progress.current].status = RebaseStepStatus::Done;
@@ -1315,7 +1334,17 @@ fn run_stack_submit(
             draft,
         })?;
         let now = OffsetDateTime::now_utc();
+        let recorded_base_oid = state
+            .stack_branch(&repo, &step.branch)
+            .and_then(|item| item.base_oid.clone());
+        let base_oid = stack::base_oid(
+            worktree,
+            &step.branch,
+            &step.base,
+            recorded_base_oid.as_deref(),
+        )?;
         if let Some(item) = state.stack_branch_mut(&repo, &step.branch) {
+            item.base_oid = Some(base_oid);
             item.review_id = outcome.id().map(str::to_string);
             item.review_url = outcome.url().map(str::to_string);
             item.updated = now;

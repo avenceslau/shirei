@@ -211,7 +211,12 @@ pub fn plan_rebase(
             ));
         }
         let before_head_oid = crate::git::head_oid(&canonical_worktree)?;
-        let old_base_oid = crate::git::merge_base(&canonical_worktree, &branch, &item.base)?;
+        let old_base_oid = base_oid(
+            &canonical_worktree,
+            &branch,
+            &item.base,
+            item.base_oid.as_deref(),
+        )?;
         steps.push(RebaseStep {
             branch,
             base: item.base.clone(),
@@ -231,6 +236,26 @@ pub fn plan_rebase(
         root_onto_oid,
         steps,
     })
+}
+
+/// The commit of `base` that `branch` is built on. When `base` was rewritten
+/// after `recorded` was stored, merge-base finds an older commit and a rebase
+/// from it would replay the base's old commits, so the recorded commit wins
+/// while it is still in `branch`'s history and newer than the merge-base.
+pub fn base_oid(repo: &Path, branch: &str, base: &str, recorded: Option<&str>) -> Result<String> {
+    let merge_base = crate::git::merge_base(repo, branch, base)?;
+    let Some(recorded) = recorded else {
+        return Ok(merge_base);
+    };
+    if crate::git::rev_parse_commit(repo, recorded).is_err() {
+        return Ok(merge_base);
+    }
+    if crate::git::is_ancestor(repo, recorded, branch)?
+        && crate::git::is_ancestor(repo, &merge_base, recorded)?
+    {
+        return Ok(recorded.to_string());
+    }
+    Ok(merge_base)
 }
 
 pub fn find_conflicts(worktree: &Path, branch: &str, base: &str) -> Result<ConflictReport> {

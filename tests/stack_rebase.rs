@@ -286,6 +286,86 @@ fn cascade_rebase_uses_each_worktree_and_exact_oid_boundaries() {
 }
 
 #[test]
+fn rebase_uses_the_recorded_parent_commit_after_the_parent_is_rewritten() {
+    let stack = setup_stack(false, false);
+    let repo_arg = stack.repo.to_string_lossy().to_string();
+    let tracked = run_shirei(
+        &stack,
+        &[
+            "stack", "track", "feat/b", "--base", "feat/a", "--repo", &repo_arg,
+        ],
+    );
+    assert!(
+        tracked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tracked.stderr)
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(stack.state_dir.join("state.json")).unwrap()).unwrap();
+    let recorded = state["stack_branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["branch"] == "feat/b")
+        .unwrap()["base_oid"]
+        .clone();
+    assert_eq!(recorded, json!(stack.heads_before[0]));
+
+    // Rewrite feat/a outside Shirei, so merge-base(feat/b, feat/a) falls back
+    // to main and would replay the old A commit into feat/b.
+    fs::write(stack.worktrees[0].join("a.txt"), "a rewritten\n").unwrap();
+    git(
+        &stack.worktrees[0],
+        &["commit", "-a", "--amend", "-m", "A rewritten"],
+    );
+
+    let output = run_shirei(
+        &stack,
+        &["stack", "rebase", "--branch", "feat/c", "--repo", &repo_arg],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("completed stack rebase for feat/c"),
+        "{stdout}"
+    );
+    assert_eq!(
+        git(&stack.repo, &["rev-list", "--count", "feat/a..feat/b"]),
+        "1"
+    );
+    assert_eq!(
+        git(&stack.repo, &["log", "-1", "--format=%s", "feat/a"]),
+        "A rewritten"
+    );
+    assert_eq!(git(&stack.repo, &["show", "feat/c:a.txt"]), "a rewritten");
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(stack.state_dir.join("state.json")).unwrap()).unwrap();
+    let base_oid_of = |branch: &str| {
+        state["stack_branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["branch"] == branch)
+            .unwrap()["base_oid"]
+            .clone()
+    };
+    assert_eq!(base_oid_of("feat/a"), json!(stack.main_after));
+    assert_eq!(
+        base_oid_of("feat/b"),
+        json!(git(&stack.repo, &["rev-parse", "feat/a"]))
+    );
+    assert_eq!(
+        base_oid_of("feat/c"),
+        json!(git(&stack.repo, &["rev-parse", "feat/b"]))
+    );
+}
+
+#[test]
 fn conflict_continue_resumes_the_same_worktree_rebase() {
     let stack = setup_stack(true, false);
     let repo_arg = stack.repo.to_string_lossy().to_string();

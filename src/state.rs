@@ -41,6 +41,10 @@ pub struct StackBranch {
     pub repo: PathBuf,
     pub branch: String,
     pub base: String,
+    /// The commit of `base` this branch was last known to be built on. It is
+    /// the old base of the next stack rebase when `base` was rewritten since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_oid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -326,6 +330,7 @@ mod tests {
             repo: repo.to_path_buf(),
             branch: "feature-b".into(),
             base: base.into(),
+            base_oid: None,
             review_url: None,
             review_id: None,
             created: old,
@@ -368,6 +373,7 @@ mod tests {
             repo: repo.clone(),
             branch: "feature".into(),
             base: "main".into(),
+            base_oid: None,
             review_url: None,
             review_id: None,
             created: now,
@@ -377,6 +383,7 @@ mod tests {
             repo,
             branch: "feature".into(),
             base: "other".into(),
+            base_oid: None,
             review_url: None,
             review_id: None,
             created: now,
