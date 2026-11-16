@@ -143,7 +143,11 @@ impl State {
     }
 
     pub fn add_worktree(&mut self, wt: Worktree) {
-        self.worktrees.retain(|w| !path_eq(&w.path, &wt.path));
+        self.worktrees.retain(|existing| {
+            let same_path = path_eq(&existing.path, &wt.path);
+            let same_branch = path_eq(&existing.repo, &wt.repo) && existing.branch == wt.branch;
+            !(same_path || same_branch)
+        });
         self.worktrees.push(wt);
     }
 
@@ -233,6 +237,28 @@ mod tests {
         assert!(progress.steps[0].before_head_oid.is_none());
         assert!(progress.steps[0].old_base_oid.is_none());
         assert!(progress.steps[0].after_head_oid.is_none());
+    }
+
+    #[test]
+    fn replaces_worktree_for_the_same_repo_and_branch() {
+        let repo = PathBuf::from("/repo");
+        let now = OffsetDateTime::now_utc();
+        let mut state = State::default();
+        state.add_worktree(Worktree {
+            path: PathBuf::from("/old-worktree"),
+            repo: repo.clone(),
+            branch: "feature".into(),
+            created: now,
+        });
+        state.add_worktree(Worktree {
+            path: PathBuf::from("/new-worktree"),
+            repo,
+            branch: "feature".into(),
+            created: now,
+        });
+
+        assert_eq!(state.worktrees.len(), 1);
+        assert_eq!(state.worktrees[0].path, PathBuf::from("/new-worktree"));
     }
 
     #[test]

@@ -364,17 +364,32 @@ fn open_branch_worktree(
         None
     };
 
-    let repo_slug = session::sanitize_name(
-        &repo
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "repo".to_string()),
-    );
-    let branch_slug = session::sanitize_name(&selected.local_name);
-    let worktree_root = expand_tilde(&cfg.worktree_root);
-    let target = worktree_root.join(&repo_slug).join(&branch_slug);
-    let outcome = git::create_worktree(repo, &selected, &target, start_point.as_deref())?;
+    let existing_worktree = git::find_worktree_for_branch(repo, &selected.local_name)?;
+    let (target, outcome) = match existing_worktree {
+        Some(worktree) => (worktree.path, git::WorktreeOutcome::Existed),
+        None => {
+            let repo_slug = session::sanitize_name(
+                &repo
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "repo".to_string()),
+            );
+            let branch_slug = session::sanitize_name(&selected.local_name);
+            let worktree_root = expand_tilde(&cfg.worktree_root);
+            let target = worktree_root.join(&repo_slug).join(&branch_slug);
+            let outcome = git::create_worktree(repo, &selected, &target, start_point.as_deref())?;
+            (target, outcome)
+        }
+    };
 
+    let repo_common_dir = git::common_dir(repo)?;
+    // State may identify one repository through different linked-worktree roots.
+    state.worktrees.retain(|existing| {
+        existing.branch != selected.local_name
+            || git::common_dir(&existing.repo)
+                .map(|common_dir| common_dir != repo_common_dir)
+                .unwrap_or(true)
+    });
     state.add_worktree(Worktree {
         path: target.clone(),
         repo: repo.to_path_buf(),

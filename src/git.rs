@@ -166,7 +166,7 @@ pub fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeRef>> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("worktree ") {
-            cur_path = Some(PathBuf::from(rest.trim()));
+            cur_path = Some(PathBuf::from(rest));
         } else if let Some(rest) = line.strip_prefix("branch ") {
             cur_branch = Some(
                 rest.trim()
@@ -187,6 +187,12 @@ pub fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeRef>> {
         });
     }
     Ok(refs)
+}
+
+pub fn find_worktree_for_branch(repo: &Path, branch: &str) -> Result<Option<WorktreeRef>> {
+    Ok(list_worktrees(repo)?.into_iter().find(|worktree| {
+        !worktree.prunable && worktree.path.exists() && worktree.branch.as_deref() == Some(branch)
+    }))
 }
 
 pub fn inspect_worktree(worktree: &Path) -> Result<WorktreeStatus> {
@@ -606,7 +612,28 @@ pub fn create_worktree(
     base: Option<&str>,
 ) -> Result<WorktreeOutcome> {
     if target.exists() {
-        return Ok(WorktreeOutcome::Existed);
+        let canonical_target = target
+            .canonicalize()
+            .with_context(|| format!("resolve worktree target {}", target.display()))?;
+        let existing = list_worktrees(repo)?.into_iter().find(|worktree| {
+            !worktree.prunable
+                && worktree.path.canonicalize().ok().as_ref() == Some(&canonical_target)
+        });
+
+        return match existing {
+            Some(worktree) if worktree.branch.as_deref() == Some(&branch.local_name) => {
+                Ok(WorktreeOutcome::Existed)
+            }
+            Some(worktree) => Err(anyhow!(
+                "worktree target {} is registered for branch {}",
+                target.display(),
+                worktree.branch.as_deref().unwrap_or("<detached>")
+            )),
+            None => Err(anyhow!(
+                "worktree target exists but is not a registered git worktree: {}",
+                target.display()
+            )),
+        };
     }
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
@@ -700,7 +727,7 @@ mod tests {
     fn inspects_dirty_and_unmerged_worktrees() {
         let temp = tempdir().unwrap();
         let repo = temp.path().join("repo");
-        let worktree = temp.path().join("feature");
+        let worktree = temp.path().join("feature ");
         fs::create_dir(&repo).unwrap();
         git(&repo, &["init", "--initial-branch=main"]);
         git(&repo, &["config", "user.email", "test@example.com"]);
@@ -732,6 +759,33 @@ mod tests {
             &repo,
             &["worktree", "add", "-b", "feature/test", &worktree_arg],
         );
+
+        let existing = find_worktree_for_branch(&repo, "feature/test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            existing.path.canonicalize().unwrap(),
+            worktree.canonicalize().unwrap()
+        );
+        assert_eq!(common_dir(&repo).unwrap(), common_dir(&worktree).unwrap());
+        let branch = Branch {
+            display: "feature/test".to_string(),
+            local_name: "feature/test".to_string(),
+            local: true,
+            remote: None,
+        };
+        assert_eq!(
+            create_worktree(&repo, &branch, &worktree, None).unwrap(),
+            WorktreeOutcome::Existed
+        );
+
+        let stale_target = temp.path().join("stale-target");
+        fs::create_dir(&stale_target).unwrap();
+        fs::write(stale_target.join("partial-checkout"), "stale\n").unwrap();
+        let error = create_worktree(&repo, &branch, &stale_target, None).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("exists but is not a registered git worktree"));
 
         let clean = inspect_worktree(&worktree).unwrap();
         assert_eq!(current_branch(&worktree).unwrap(), "feature/test");
