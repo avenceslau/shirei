@@ -90,6 +90,20 @@ struct WorktreeOptions {
     /// Check out only these directories (cone-mode sparse checkout) in a new worktree.
     #[arg(long = "sparse", value_name = "DIR", num_args = 1..)]
     sparse: Vec<String>,
+    /// How to run the detected setup command in a new worktree. Defaults to
+    /// background when run_install_on_create is true, otherwise none.
+    #[arg(long = "install", value_enum)]
+    install: Option<InstallMode>,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallMode {
+    /// Run in the foreground and report its exit status.
+    Sync,
+    /// Run in a separate tmux window or Herdr tab of the new session.
+    Background,
+    /// Do not run it.
+    None,
 }
 
 impl WorktreeOptions {
@@ -368,24 +382,64 @@ fn finish_branch(
         git::WorktreeOutcome::Created => "created",
         git::WorktreeOutcome::Existed => "existing",
     };
+    let install_mode = options.install.unwrap_or(if cfg.run_install_on_create {
+        InstallMode::Background
+    } else {
+        InstallMode::None
+    });
+    let install_cmd = match result.outcome {
+        git::WorktreeOutcome::Created => install::detect(&result.path),
+        git::WorktreeOutcome::Existed => None,
+    };
+    let open = options.should_open();
+
     if options.print_path {
         println!("{}", result.path.display());
-    }
-    if options.should_open() {
-        return open_branch_result(backend, result, cfg);
-    }
-
-    if !options.print_path {
+    } else if !open {
         println!(
             "{outcome}\tpath={}\tbranch={}",
             result.path.display(),
             result.branch
         );
     }
-    if cfg.run_install_on_create && result.outcome == git::WorktreeOutcome::Created {
-        if let Some(cmd) = install::detect(&result.path) {
-            eprintln!("note: skipped `{cmd}` because no session was opened");
-        }
+
+    let install_result = match (&install_cmd, install_mode) {
+        (Some(cmd), InstallMode::Sync) => run_install(&result.path, cmd),
+        _ => Ok(()),
+    };
+    let background_cmd = match install_mode {
+        InstallMode::Background => install_cmd.as_deref(),
+        InstallMode::Sync | InstallMode::None => None,
+    };
+    if open {
+        open_branch_result(backend, result, background_cmd)?;
+    } else if let Some(cmd) = background_cmd {
+        eprintln!(
+            "note: skipped `{cmd}` because no session was opened; pass --install=sync to run it"
+        );
+    }
+    install_result
+}
+
+fn run_install(worktree: &Path, cmd: &str) -> Result<()> {
+    eprintln!("install: running `{cmd}` in {}", worktree.display());
+    // The setup output goes to stderr so `--print-path` stays the only stdout.
+    let status = std::process::Command::new("sh")
+        .args(["-c", cmd])
+        .current_dir(worktree)
+        .stdout(std::io::stderr())
+        .status()
+        .with_context(|| format!("failed to run `{cmd}`"))?;
+    let code = status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    eprintln!("install: `{cmd}` exited with status {code}");
+    if !status.success() {
+        return Err(anyhow!(
+            "`{cmd}` failed with status {code}; the worktree remains at {}",
+            worktree.display()
+        ));
     }
     Ok(())
 }
@@ -493,7 +547,11 @@ fn open_branch_worktree(
     })
 }
 
-fn open_branch_result(backend: Backend, result: &BranchOpenResult, cfg: &Config) -> Result<()> {
+fn open_branch_result(
+    backend: Backend,
+    result: &BranchOpenResult,
+    install_cmd: Option<&str>,
+) -> Result<()> {
     let repo_slug = session::sanitize_name(
         &result
             .repo
@@ -502,14 +560,8 @@ fn open_branch_result(backend: Backend, result: &BranchOpenResult, cfg: &Config)
             .unwrap_or_else(|| "repo".to_string()),
     );
     let branch_slug = session::sanitize_name(&result.branch);
-    let install_cmd =
-        if cfg.run_install_on_create && matches!(result.outcome, git::WorktreeOutcome::Created) {
-            install::detect(&result.path)
-        } else {
-            None
-        };
     let name_hint = format!("{repo_slug}-{branch_slug}");
-    open_session(backend, &result.path, &name_hint, install_cmd.as_deref())
+    open_session(backend, &result.path, &name_hint, install_cmd)
 }
 
 fn run_stack_branch(name: &str, base: &str, options: &WorktreeOptions) -> Result<()> {

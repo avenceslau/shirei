@@ -296,6 +296,66 @@ fn sparse_and_checkout_exclude_limit_the_new_worktree() {
 }
 
 #[test]
+fn install_sync_runs_setup_in_the_foreground_and_reports_its_status() {
+    let repo = setup();
+    fs::write(
+        repo.main.join("Makefile"),
+        "install:\n\t@echo setup-output\n\t@test ! -e fail-install\n\t@touch installed\n",
+    )
+    .unwrap();
+    git(&repo.main, &["add", "Makefile"]);
+    git(&repo.main, &["commit", "-m", "makefile"]);
+
+    let output = run_shirei(
+        &repo,
+        &repo.main,
+        &[
+            "branch",
+            "feat/setup",
+            "--base",
+            "main",
+            "--no-open",
+            "--print-path",
+            "--install=sync",
+        ],
+    );
+    let stdout = assert_success(&output);
+    let worktree = PathBuf::from(stdout.trim());
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(worktree.join("installed").exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("setup-output"), "{stderr}");
+    assert!(
+        stderr.contains("`make install` exited with status 0"),
+        "{stderr}"
+    );
+
+    fs::write(repo.main.join("fail-install"), "").unwrap();
+    git(&repo.main, &["add", "fail-install"]);
+    git(&repo.main, &["commit", "-m", "fail install"]);
+    let failed = run_shirei(
+        &repo,
+        &repo.main,
+        &[
+            "branch",
+            "feat/broken-setup",
+            "--base",
+            "main",
+            "--no-open",
+            "--print-path",
+            "--install=sync",
+        ],
+    );
+    assert!(!failed.status.success());
+    let worktree = PathBuf::from(String::from_utf8_lossy(&failed.stdout).trim());
+    assert!(worktree.is_dir());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("failed with status"));
+    let state = read_state(&repo);
+    assert_eq!(state["worktrees"].as_array().unwrap().len(), 2);
+    assert_eq!(backend_calls(&repo), "");
+}
+
+#[test]
 fn worktrees_add_registers_one_worktree_created_with_git() {
     let repo = setup();
     let manual = repo.root.join("manual");
