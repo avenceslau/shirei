@@ -25,6 +25,10 @@ pub struct Config {
     pub worktree_exclude_prefixes: Vec<String>,
     #[serde(default = "default_run_install_on_create")]
     pub run_install_on_create: bool,
+    /// gitignore-style patterns that new worktrees never check out, through a
+    /// non-cone sparse checkout.
+    #[serde(default)]
+    pub checkout_exclude: Vec<String>,
 }
 
 impl Default for Config {
@@ -36,6 +40,7 @@ impl Default for Config {
             worktree_root: default_worktree_root(),
             worktree_exclude_prefixes: default_worktree_exclude_prefixes(),
             run_install_on_create: default_run_install_on_create(),
+            checkout_exclude: Vec::new(),
         }
     }
 }

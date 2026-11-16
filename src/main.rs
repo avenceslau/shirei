@@ -87,6 +87,9 @@ struct WorktreeOptions {
     /// Print only the worktree path on stdout.
     #[arg(long = "print-path")]
     print_path: bool,
+    /// Check out only these directories (cone-mode sparse checkout) in a new worktree.
+    #[arg(long = "sparse", value_name = "DIR", num_args = 1..)]
+    sparse: Vec<String>,
 }
 
 impl WorktreeOptions {
@@ -345,11 +348,12 @@ fn run_branch(name: Option<&str>, base: Option<&str>, options: &WorktreeOptions)
     let backend = Backend::from(cfg.backend);
     let mut state = state::load()?;
     let repo = resolve_repo(None)?;
-    let result = match open_branch_worktree(&cfg, backend, &mut state, &repo, name, base, true) {
-        Ok(result) => result,
-        Err(error) if error.to_string().ends_with("selection cancelled") => return Ok(()),
-        Err(error) => return Err(error),
-    };
+    let result =
+        match open_branch_worktree(&cfg, &mut state, &repo, name, base, &options.sparse, true) {
+            Ok(result) => result,
+            Err(error) if error.to_string().ends_with("selection cancelled") => return Ok(()),
+            Err(error) => return Err(error),
+        };
     state::save(&state)?;
     finish_branch(backend, &result, &cfg, options)
 }
@@ -388,11 +392,11 @@ fn finish_branch(
 
 fn open_branch_worktree(
     cfg: &Config,
-    backend: Backend,
     state: &mut State,
     repo: &Path,
     name: Option<&str>,
     base: Option<&str>,
+    sparse_directories: &[String],
     allow_interactive: bool,
 ) -> Result<BranchOpenResult> {
     let branches = git::list_branches(repo)?;
@@ -443,7 +447,16 @@ fn open_branch_worktree(
 
     let existing_worktree = git::find_worktree_for_branch(repo, &selected.local_name)?;
     let (target, outcome) = match existing_worktree {
-        Some(worktree) => (worktree.path, git::WorktreeOutcome::Existed),
+        Some(worktree) => {
+            if !sparse_directories.is_empty() {
+                eprintln!(
+                    "warn: --sparse ignored; {} is already checked out at {}",
+                    selected.local_name,
+                    worktree.path.display()
+                );
+            }
+            (worktree.path, git::WorktreeOutcome::Existed)
+        }
         None => {
             let repo_slug = session::sanitize_name(
                 &repo
@@ -454,7 +467,12 @@ fn open_branch_worktree(
             let branch_slug = session::sanitize_name(&selected.local_name);
             let worktree_root = expand_tilde(&cfg.worktree_root);
             let target = worktree_root.join(&repo_slug).join(&branch_slug);
-            let outcome = git::create_worktree(repo, &selected, &target, start_point.as_deref())?;
+            let scope = git::CheckoutScope {
+                directories: sparse_directories.to_vec(),
+                exclude: cfg.checkout_exclude.clone(),
+            };
+            let outcome =
+                git::create_worktree(repo, &selected, &target, start_point.as_deref(), &scope)?;
             (target, outcome)
         }
     };
@@ -467,7 +485,6 @@ fn open_branch_worktree(
     });
     state.touch_recent(&target, cfg.recent_cap);
 
-    let _ = backend;
     Ok(BranchOpenResult {
         repo: repo.to_path_buf(),
         branch: selected.local_name,
@@ -505,11 +522,11 @@ fn run_stack_branch(name: &str, base: &str, options: &WorktreeOptions) -> Result
     stack::validate_edge(&state, &repo, name, base)?;
     let result = open_branch_worktree(
         &cfg,
-        backend,
         &mut state,
         &repo,
         Some(name),
         Some(base),
+        &options.sparse,
         false,
     )?;
     let now = OffsetDateTime::now_utc();

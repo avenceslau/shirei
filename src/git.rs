@@ -671,11 +671,73 @@ fn run_rebase_command(worktree: &Path, args: &[&str]) -> Result<GitRebaseStatus>
     }))
 }
 
+/// Which files a new worktree checks out.
+#[derive(Debug, Clone, Default)]
+pub struct CheckoutScope {
+    /// Directories to check out, as in `git sparse-checkout set --cone`.
+    /// Empty means the whole tree.
+    pub directories: Vec<String>,
+    /// gitignore-style patterns that are never written to the worktree.
+    pub exclude: Vec<String>,
+}
+
+/// The `git sparse-checkout set` arguments for `scope`, or `None` for a full
+/// checkout. Exclusions need non-cone mode, so directories combined with
+/// exclusions are written as the non-cone patterns that cone mode implies:
+/// top-level files, the files directly inside each parent directory, and
+/// everything inside each listed directory.
+pub fn sparse_checkout_args(scope: &CheckoutScope) -> Result<Option<Vec<String>>> {
+    let mut directories = Vec::new();
+    for directory in &scope.directories {
+        let trimmed = directory.trim_matches('/');
+        if trimmed.is_empty() || trimmed.split('/').any(|part| part == ".." || part == ".") {
+            return Err(anyhow!(
+                "sparse directory must be a relative path inside the repository: {directory}"
+            ));
+        }
+        directories.push(trimmed.to_string());
+    }
+    if directories.is_empty() && scope.exclude.is_empty() {
+        return Ok(None);
+    }
+    if scope.exclude.is_empty() {
+        let mut args = vec!["--cone".to_string()];
+        args.extend(directories);
+        return Ok(Some(args));
+    }
+
+    let mut patterns = vec!["--no-cone".to_string(), "/*".to_string()];
+    if !directories.is_empty() {
+        patterns.push("!/*/".to_string());
+    }
+    // Parent patterns come first so a later `!/parent/*/` cannot hide a
+    // listed directory.
+    for directory in &directories {
+        let parts: Vec<&str> = directory.split('/').collect();
+        for depth in 1..parts.len() {
+            let parent = parts[..depth].join("/");
+            for pattern in [format!("/{parent}/*"), format!("!/{parent}/*/")] {
+                if !patterns.contains(&pattern) {
+                    patterns.push(pattern);
+                }
+            }
+        }
+    }
+    for directory in &directories {
+        patterns.push(format!("/{directory}/"));
+    }
+    for pattern in &scope.exclude {
+        patterns.push(format!("!{pattern}"));
+    }
+    Ok(Some(patterns))
+}
+
 pub fn create_worktree(
     repo: &Path,
     branch: &Branch,
     target: &Path,
     base: Option<&str>,
+    scope: &CheckoutScope,
 ) -> Result<WorktreeOutcome> {
     if target.exists() {
         let canonical_target = target
@@ -701,60 +763,97 @@ pub fn create_worktree(
             )),
         };
     }
+    let sparse_args = sparse_checkout_args(scope)?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create worktree parent {}", parent.display()))?;
     }
 
-    let args: Vec<String> = if branch.local {
-        vec![
-            "worktree".into(),
-            "add".into(),
-            target.display().to_string(),
-            branch.local_name.clone(),
-        ]
+    let mut args: Vec<String> = vec!["worktree".into(), "add".into()];
+    if sparse_args.is_some() {
+        args.push("--no-checkout".into());
+    }
+    if branch.local {
+        args.push(target.display().to_string());
+        args.push(branch.local_name.clone());
     } else if let Some(remote) = &branch.remote {
-        vec![
-            "worktree".into(),
-            "add".into(),
-            target.display().to_string(),
-            "-b".into(),
-            branch.local_name.clone(),
-            remote.clone(),
-        ]
+        args.push(target.display().to_string());
+        args.extend(["-b".into(), branch.local_name.clone(), remote.clone()]);
     } else {
         // A new branch must not track its base (for example origin/main), or a
         // later `git push` would target the base branch.
-        let mut args = vec![
-            "worktree".into(),
-            "add".into(),
-            "--no-track".into(),
-            target.display().to_string(),
-            "-b".into(),
-            branch.local_name.clone(),
-        ];
+        args.push("--no-track".into());
+        args.push(target.display().to_string());
+        args.extend(["-b".into(), branch.local_name.clone()]);
         // start-point; without one git forks off current HEAD
         if let Some(base) = base {
             args.push(base.to_string());
         }
-        args
-    };
+    }
+    let created_branch = (!branch.local).then_some(branch.local_name.as_str());
 
+    let checkout = run_checkout_step(repo, &args).and_then(|()| {
+        let Some(sparse_args) = &sparse_args else {
+            return Ok(());
+        };
+        let mut set_args = vec!["sparse-checkout".to_string(), "set".to_string()];
+        set_args.extend(sparse_args.iter().cloned());
+        run_checkout_step(target, &set_args)?;
+        run_checkout_step(target, &["checkout".to_string()])
+    });
+    if let Err(error) = checkout {
+        remove_failed_worktree(repo, target, created_branch);
+        let removed = match created_branch {
+            Some(name) => format!("removed the partial worktree and branch {name}"),
+            None => "removed the partial worktree".to_string(),
+        };
+        return Err(error.context(format!(
+            "could not check out {}; {removed}",
+            target.display()
+        )));
+    }
+    Ok(WorktreeOutcome::Created)
+}
+
+fn run_checkout_step(directory: &Path, args: &[String]) -> Result<()> {
     // Keep stdout for `--print-path`; git's progress belongs on stderr.
     let status = Command::new("git")
         .arg("-C")
-        .arg(repo)
-        .args(&args)
+        .arg(directory)
+        .args(args)
         .stdout(std::io::stderr())
         .status()
-        .context("failed to run git worktree add")?;
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
     if !status.success() {
         return Err(anyhow!(
-            "git worktree add failed (status {})",
+            "git {} failed (status {})",
+            args.iter().take(2).cloned().collect::<Vec<_>>().join(" "),
             status.code().unwrap_or(-1)
         ));
     }
-    Ok(WorktreeOutcome::Created)
+    Ok(())
+}
+
+/// Undo a failed `create_worktree`, so a rerun does not find a half-created
+/// branch or directory. `target` did not exist before, so it is safe to delete.
+fn remove_failed_worktree(repo: &Path, target: &Path, created_branch: Option<&str>) {
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "remove", "--force", "--force", "--"])
+        .arg(target)
+        .output();
+    if target.exists() {
+        let _ = std::fs::remove_dir_all(target);
+    }
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "prune"])
+        .output();
+    if let Some(name) = created_branch {
+        let _ = delete_local_branch(repo, name);
+    }
 }
 
 fn run_git_lines(repo: &Path, args: &[&str]) -> Result<Vec<String>> {
@@ -834,13 +933,211 @@ mod tests {
         git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         let target = temp.path().join("worktrees").join("feature");
 
-        let outcome =
-            create_worktree(&repo, &new_branch("feature"), &target, Some("origin/main")).unwrap();
+        let outcome = create_worktree(
+            &repo,
+            &new_branch("feature"),
+            &target,
+            Some("origin/main"),
+            &CheckoutScope::default(),
+        )
+        .unwrap();
 
         assert_eq!(outcome, WorktreeOutcome::Created);
         assert_eq!(current_branch(&target).unwrap(), "feature");
         assert!(!git_succeeds(&repo, &["config", "branch.feature.merge"]));
         assert!(!git_succeeds(&repo, &["config", "branch.feature.remote"]));
+    }
+
+    fn files_in(worktree: &Path) -> Vec<String> {
+        let mut files = Vec::new();
+        let mut pending = vec![worktree.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).unwrap().flatten() {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| name == ".git") {
+                    continue;
+                }
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let relative = path.strip_prefix(worktree).unwrap();
+                    files.push(relative.to_string_lossy().to_string());
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    fn init_tree_repo(repo: &Path) {
+        init_repo(repo);
+        fs::create_dir_all(repo.join("packages/app/src")).unwrap();
+        fs::create_dir_all(repo.join("tools")).unwrap();
+        fs::write(repo.join("packages/app/src/main.ts"), "app\n").unwrap();
+        fs::write(repo.join("packages/app/.dev.vars.example"), "KEY=\n").unwrap();
+        fs::write(repo.join("packages/package.json"), "{}\n").unwrap();
+        fs::write(repo.join("tools/build.sh"), "build\n").unwrap();
+        fs::write(repo.join(".env.example"), "KEY=\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-m", "tree"]);
+    }
+
+    #[test]
+    fn sparse_args_express_cone_directories_with_exclusions() {
+        let cone = CheckoutScope {
+            directories: vec!["packages/app/".into()],
+            exclude: Vec::new(),
+        };
+        assert_eq!(
+            sparse_checkout_args(&cone).unwrap().unwrap(),
+            ["--cone", "packages/app"]
+        );
+
+        let combined = CheckoutScope {
+            directories: vec!["packages/app".into(), "packages".into()],
+            exclude: vec![".dev.vars*".into()],
+        };
+        assert_eq!(
+            sparse_checkout_args(&combined).unwrap().unwrap(),
+            [
+                "--no-cone",
+                "/*",
+                "!/*/",
+                "/packages/*",
+                "!/packages/*/",
+                "/packages/app/",
+                "/packages/",
+                "!.dev.vars*"
+            ]
+        );
+
+        assert!(sparse_checkout_args(&CheckoutScope::default())
+            .unwrap()
+            .is_none());
+        let escaping = CheckoutScope {
+            directories: vec!["../outside".into()],
+            exclude: Vec::new(),
+        };
+        assert!(sparse_checkout_args(&escaping).is_err());
+    }
+
+    #[test]
+    fn checkout_exclude_and_sparse_directories_limit_written_files() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        init_tree_repo(&repo);
+
+        let excluded = temp.path().join("excluded");
+        let scope = CheckoutScope {
+            directories: Vec::new(),
+            exclude: vec![".dev.vars*".into(), ".env*".into()],
+        };
+        create_worktree(
+            &repo,
+            &new_branch("excluded"),
+            &excluded,
+            Some("main"),
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(
+            files_in(&excluded),
+            [
+                "README.md",
+                "packages/app/src/main.ts",
+                "packages/package.json",
+                "tools/build.sh"
+            ]
+        );
+        assert!(worktree_is_clean(&excluded).unwrap());
+
+        let cone = temp.path().join("cone");
+        let scope = CheckoutScope {
+            directories: vec!["packages/app/src".into()],
+            exclude: Vec::new(),
+        };
+        create_worktree(&repo, &new_branch("cone"), &cone, Some("main"), &scope).unwrap();
+        assert_eq!(
+            files_in(&cone),
+            [
+                ".env.example",
+                "README.md",
+                "packages/app/.dev.vars.example",
+                "packages/app/src/main.ts",
+                "packages/package.json"
+            ]
+        );
+
+        let combined = temp.path().join("combined");
+        let scope = CheckoutScope {
+            directories: vec!["packages/app/src".into()],
+            exclude: vec![".dev.vars*".into(), ".env*".into()],
+        };
+        create_worktree(
+            &repo,
+            &new_branch("combined"),
+            &combined,
+            Some("main"),
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(
+            files_in(&combined),
+            [
+                "README.md",
+                "packages/app/src/main.ts",
+                "packages/package.json"
+            ]
+        );
+        assert!(worktree_is_clean(&combined).unwrap());
+    }
+
+    #[test]
+    fn failed_checkout_removes_the_new_branch_and_directory() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
+        fs::write(repo.join(".gitattributes"), "*.secret filter=blocked\n").unwrap();
+        fs::write(repo.join("key.secret"), "secret\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-m", "secret"]);
+        // A required filter that fails stands in for a sandbox that refuses
+        // to write a file.
+        git(&repo, &["config", "filter.blocked.smudge", "false"]);
+        git(&repo, &["config", "filter.blocked.required", "true"]);
+
+        for scope in [
+            CheckoutScope::default(),
+            CheckoutScope {
+                directories: Vec::new(),
+                exclude: vec![".env*".into()],
+            },
+        ] {
+            let target = temp.path().join("blocked");
+            let error =
+                create_worktree(&repo, &new_branch("blocked"), &target, Some("main"), &scope)
+                    .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("removed the partial worktree and branch blocked"),
+                "{error:#}"
+            );
+            assert!(!target.exists());
+            assert!(!git_succeeds(
+                &repo,
+                &["show-ref", "--verify", "--quiet", "refs/heads/blocked"]
+            ));
+            assert_eq!(list_worktrees(&repo).unwrap().len(), 1);
+        }
+
+        let target = temp.path().join("blocked");
+        let scope = CheckoutScope {
+            directories: Vec::new(),
+            exclude: vec!["*.secret".into()],
+        };
+        let outcome =
+            create_worktree(&repo, &new_branch("blocked"), &target, Some("main"), &scope).unwrap();
+        assert_eq!(outcome, WorktreeOutcome::Created);
+        assert!(!target.join("key.secret").exists());
     }
 
     #[test]
@@ -931,14 +1228,21 @@ mod tests {
             remote: None,
         };
         assert_eq!(
-            create_worktree(&repo, &branch, &worktree, None).unwrap(),
+            create_worktree(&repo, &branch, &worktree, None, &CheckoutScope::default()).unwrap(),
             WorktreeOutcome::Existed
         );
 
         let stale_target = temp.path().join("stale-target");
         fs::create_dir(&stale_target).unwrap();
         fs::write(stale_target.join("partial-checkout"), "stale\n").unwrap();
-        let error = create_worktree(&repo, &branch, &stale_target, None).unwrap_err();
+        let error = create_worktree(
+            &repo,
+            &branch,
+            &stale_target,
+            None,
+            &CheckoutScope::default(),
+        )
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("exists but is not a registered git worktree"));

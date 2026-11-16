@@ -259,6 +259,43 @@ fn stack_branch_from_a_linked_worktree_is_recorded_under_the_main_checkout() {
 }
 
 #[test]
+fn sparse_and_checkout_exclude_limit_the_new_worktree() {
+    let repo = setup();
+    fs::create_dir_all(repo.main.join("docs")).unwrap();
+    fs::create_dir_all(repo.main.join("src")).unwrap();
+    fs::write(repo.main.join("docs/guide.md"), "guide\n").unwrap();
+    fs::write(repo.main.join("docs/.dev.vars.example"), "KEY=\n").unwrap();
+    fs::write(repo.main.join("src/lib.rs"), "\n").unwrap();
+    git(&repo.main, &["add", "-A"]);
+    git(&repo.main, &["commit", "-m", "tree"]);
+    let mut config = fs::read_to_string(&repo.config).unwrap();
+    config.push_str("checkout_exclude = [\".dev.vars*\"]\n");
+    fs::write(&repo.config, config).unwrap();
+
+    let stdout = assert_success(&run_shirei(
+        &repo,
+        &repo.main,
+        &[
+            "branch",
+            "feat/docs",
+            "--base",
+            "main",
+            "--no-open",
+            "--print-path",
+            "--sparse",
+            "docs",
+        ],
+    ));
+
+    let worktree = PathBuf::from(stdout.trim());
+    assert!(worktree.join("README.md").exists());
+    assert!(worktree.join("docs/guide.md").exists());
+    assert!(!worktree.join("docs/.dev.vars.example").exists());
+    assert!(!worktree.join("src").exists());
+    assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
+}
+
+#[test]
 fn worktrees_add_registers_one_worktree_created_with_git() {
     let repo = setup();
     let manual = repo.root.join("manual");
