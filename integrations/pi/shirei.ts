@@ -423,6 +423,7 @@ export default function (pi: ExtensionAPI) {
 			"Use shirei_pr_create instead of calling gh pr create or glab mr create directly for standalone reviews.",
 			"Write a concise review title and a polished body that explains motivation, key decisions, system impact, testing, and stack position when applicable; omit empty sections and placeholders.",
 			"Use Shirei stack submission instead when the branch belongs to a tracked Shirei stack.",
+			"Without an interactive session (for example in a subagent), shirei_pr_create validates the review and returns it instead of creating it; return that prepared review to your parent and never create it with gh, glab, or git push.",
 		],
 		parameters: Type.Object({
 			repository: Type.Optional(
@@ -437,10 +438,6 @@ export default function (pi: ExtensionAPI) {
 			draft: Type.Optional(Type.Boolean({ description: "Create the review as a draft" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (ctx.mode !== "tui") {
-				throw new Error("shirei_pr_create requires Pi interactive mode so review creation can be confirmed");
-			}
-
 			const requestedRepository = repositoryInput(params.repository, ctx.cwd);
 			const rootResult = await pi.exec("git", ["-C", requestedRepository, "rev-parse", "--show-toplevel"], {
 				timeout: 10_000,
@@ -485,6 +482,40 @@ export default function (pi: ExtensionAPI) {
 			if (!branch || !head || !base || !remote || !remoteTarget) {
 				throw new Error("shirei pr create --dry-run returned an incomplete review plan");
 			}
+
+			// Subagents have no dialog to confirm with. Hand the validated review
+			// back instead of creating it, so nobody falls back to gh or glab.
+			if (ctx.mode !== "tui") {
+				const preparedReview = {
+					repository,
+					base: params.base ?? base,
+					title,
+					body,
+					draft: params.draft === true,
+				};
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: [
+								"Review not created: shirei_pr_create needs an interactive Pi session so the user can confirm it.",
+								"Do not create it with gh, glab, or git push. Return this prepared review to your parent agent or the user, who can pass it to shirei_pr_create:",
+								JSON.stringify(preparedReview, null, 2),
+								"",
+								"Validated plan:",
+								previewText,
+							].join("\n"),
+						},
+					],
+					details: {
+						status: "needs-confirmation",
+						preparedReview,
+						preview: previewText,
+					},
+					isError: true,
+				};
+			}
+
 			const confirmed = await ctx.ui.confirm(
 				"Create pull request or merge request?",
 				previewText,
