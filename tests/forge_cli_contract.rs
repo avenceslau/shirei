@@ -12,6 +12,134 @@ struct TestRepo {
     bin: PathBuf,
     log: PathBuf,
     git_log: PathBuf,
+    state_dir: PathBuf,
+    config: PathBuf,
+}
+
+// Flags listed by `glab mr update --help` and `glab mr create --help` in glab 1.108.0.
+const GLAB_MR_UPDATE_FLAGS: &[&str] = &[
+    "-a",
+    "--assignee",
+    "-d",
+    "--description",
+    "--draft",
+    "-f",
+    "--fill",
+    "--fill-commit-body",
+    "-l",
+    "--label",
+    "--lock-discussion",
+    "-m",
+    "--milestone",
+    "-r",
+    "--ready",
+    "--remove-source-branch",
+    "-R",
+    "--repo",
+    "--reviewer",
+    "--squash-before-merge",
+    "--target-branch",
+    "-t",
+    "--title",
+    "--unassign",
+    "-u",
+    "--unlabel",
+    "--unlock-discussion",
+    "--wip",
+    "-y",
+    "--yes",
+];
+
+const GLAB_MR_CREATE_FLAGS: &[&str] = &[
+    "--allow-collaboration",
+    "-a",
+    "--assignee",
+    "--auto-merge",
+    "--copy-issue-labels",
+    "--create-source-branch",
+    "-d",
+    "--description",
+    "--draft",
+    "-f",
+    "--fill",
+    "--fill-commit-body",
+    "-H",
+    "--head",
+    "-l",
+    "--label",
+    "-m",
+    "--milestone",
+    "--no-editor",
+    "--push",
+    "--recover",
+    "-i",
+    "--related-issue",
+    "--remove-source-branch",
+    "-R",
+    "--repo",
+    "--reviewer",
+    "--signoff",
+    "-s",
+    "--source-branch",
+    "--squash-before-merge",
+    "-b",
+    "--target-branch",
+    "--template",
+    "-t",
+    "--title",
+    "-w",
+    "--web",
+    "--wip",
+    "-y",
+    "--yes",
+];
+
+/// A fake glab that rejects flags the real glab 1.108.0 does not accept, the
+/// way glab reports `Unknown flag: --description-file`.
+fn strict_fake_glab(view_json: &str) -> String {
+    let flag_case = |flags: &[&str]| {
+        flags
+            .iter()
+            .map(|flag| format!("{flag}|{flag}=*"))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$SHIREI_TEST_LOG"
+check_flags() {{
+  allowed="$1"
+  shift
+  for arg in "$@"; do
+    case "$arg" in
+      -*)
+        if ! printf '%s' "$arg" | grep -Eq "^($allowed)$"; then
+          printf 'Unknown flag: %s\n' "${{arg%%=*}}" >&2
+          exit 1
+        fi
+        ;;
+    esac
+  done
+}}
+case "$1 $2" in
+  "--version ") printf 'glab 1.108.0\n' ;;
+  "mr list") printf '[]\n' ;;
+  "mr create")
+    shift 2
+    check_flags '{create}' "$@"
+    printf 'https://gitlab.com/owner/repo/-/merge_requests/9\n'
+    ;;
+  "mr view") printf '%s\n' '{view_json}' ;;
+  "mr update")
+    shift 3
+    check_flags '{update}' "$@"
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+        create = flag_case(GLAB_MR_CREATE_FLAGS).replace('*', ".*"),
+        update = flag_case(GLAB_MR_UPDATE_FLAGS).replace('*', ".*"),
+    )
 }
 
 fn git(repo: &Path, args: &[&str]) {
@@ -42,8 +170,12 @@ fn test_repo(remote: &str) -> TestRepo {
     let bin = temp.path().join("bin");
     let log = temp.path().join("forge.log");
     let git_log = temp.path().join("git.log");
+    let state_dir = temp.path().join("state");
+    let config = temp.path().join("config.toml");
     fs::create_dir(&repo).unwrap();
     fs::create_dir(&bin).unwrap();
+    fs::create_dir(&state_dir).unwrap();
+    fs::write(&config, "").unwrap();
 
     git(&repo, &["init", "--initial-branch=main"]);
     git(&repo, &["config", "user.email", "test@example.com"]);
@@ -83,11 +215,31 @@ fn test_repo(remote: &str) -> TestRepo {
 
     TestRepo {
         _temp: temp,
-        repo,
+        repo: fs::canonicalize(repo).unwrap(),
         bin,
         log,
         git_log,
+        state_dir,
+        config,
     }
+}
+
+fn track_review_branch_as_stack(test: &TestRepo) {
+    let timestamp = "2026-01-01T00:00:00Z";
+    let state = serde_json::json!({
+        "recent": [],
+        "worktrees": [
+            {"path": test.repo, "repo": test.repo, "branch": "feature/review", "created": timestamp}
+        ],
+        "stack_branches": [
+            {"repo": test.repo, "branch": "feature/review", "base": "main", "created": timestamp, "updated": timestamp}
+        ]
+    });
+    fs::write(
+        test.state_dir.join("state.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
 }
 
 fn run_shirei(test: &TestRepo, args: &[&str]) -> Output {
@@ -102,8 +254,75 @@ fn run_shirei(test: &TestRepo, args: &[&str]) -> Output {
         .env("PATH", path)
         .env("SHIREI_TEST_LOG", &test.log)
         .env("SHIREI_GIT_LOG", &test.git_log)
+        .env("SHIREI_STATE_DIR", &test.state_dir)
+        .env("SHIREI_CONFIG", &test.config)
         .output()
         .unwrap()
+}
+
+#[test]
+fn gitlab_stack_submit_updates_descriptions_with_supported_flags() {
+    let test = test_repo("git@gitlab.com:owner/repo.git");
+    track_review_branch_as_stack(&test);
+    executable(
+        &test.bin.join("glab"),
+        &strict_fake_glab(
+            r#"{"iid":9,"web_url":"https://gitlab.com/owner/repo/-/merge_requests/9","description":"- starts like a flag"}"#,
+        ),
+    );
+
+    let output = run_shirei(&test, &["stack", "submit", "--branch", "feature/review"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("submitted feature/review"));
+
+    let log = fs::read_to_string(&test.log).unwrap();
+    assert!(
+        log.contains(
+            "mr update 9 --description=- starts like a flag\n\n<!-- shirei-stack-links:start -->"
+        ),
+        "{log}"
+    );
+    assert!(log.contains("--repo ssh://git@gitlab.com/owner/repo"));
+    assert!(!log.contains("--description-file"));
+}
+
+#[test]
+fn installed_glab_accepts_the_flags_shirei_uses() {
+    let Ok(update_help) = Command::new("glab")
+        .args(["mr", "update", "--help"])
+        .output()
+    else {
+        eprintln!("glab is not installed; skipping");
+        return;
+    };
+    let create_help = Command::new("glab")
+        .args(["mr", "create", "--help"])
+        .output()
+        .unwrap();
+    let update_help = String::from_utf8_lossy(&update_help.stdout).to_string()
+        + &String::from_utf8_lossy(&update_help.stderr);
+    let create_help = String::from_utf8_lossy(&create_help.stdout).to_string()
+        + &String::from_utf8_lossy(&create_help.stderr);
+
+    for flag in ["--description", "--repo"] {
+        assert!(update_help.contains(flag), "glab mr update lacks {flag}");
+    }
+    for flag in [
+        "--source-branch",
+        "--target-branch",
+        "--title",
+        "--description",
+        "--yes",
+        "--repo",
+        "--draft",
+    ] {
+        assert!(create_help.contains(flag), "glab mr create lacks {flag}");
+    }
+    assert!(!update_help.contains("--description-file"));
 }
 
 #[test]

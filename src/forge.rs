@@ -977,18 +977,13 @@ fn update_gitlab_review_body(
     body: &str,
     repository: &str,
 ) -> Result<()> {
-    let path = std::env::temp_dir().join(format!(
-        "shirei-mr-body-{}-{}.md",
-        std::process::id(),
-        review_id.replace('/', "-")
-    ));
-    fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    // glab has no --description-file. The body goes in one `--description=`
+    // argument so a body that starts with `-` is not parsed as a flag.
     let output = Command::new("glab")
         .arg("mr")
         .arg("update")
         .arg(review_id)
-        .arg("--description-file")
-        .arg(&path)
+        .arg(format!("--description={body}"))
         .arg("--repo")
         .arg(repository)
         .current_dir(worktree)
@@ -996,11 +991,10 @@ fn update_gitlab_review_body(
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .output()
-        .context("failed to run glab mr update --description-file")?;
-    let _ = fs::remove_file(&path);
+        .context("failed to run glab mr update --description")?;
     if !output.status.success() {
         return Err(anyhow!(
-            "glab mr update --description-file failed: {}",
+            "glab mr update --description failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
