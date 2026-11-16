@@ -227,7 +227,11 @@ enum WorktreesCmd {
     /// Print potentially unfinished worktrees without an active or merged PR or MR.
     Unfinished,
     /// Select tracked worktrees and permanently delete their directories and local branches.
-    Prune,
+    Prune {
+        /// Remove registry entries whose paths no longer exist. Deletes nothing on disk.
+        #[arg(long = "missing")]
+        missing: bool,
+    },
     /// Walk configured roots and known repos, rebuild the worktree registry.
     Scan,
     /// Register one existing linked worktree without scanning.
@@ -256,7 +260,8 @@ fn main() -> Result<()> {
         }
         Cmd::Worktrees { action } => match action {
             Some(WorktreesCmd::Unfinished) => run_worktrees_unfinished(),
-            Some(WorktreesCmd::Prune) => run_worktrees_prune(),
+            Some(WorktreesCmd::Prune { missing: true }) => run_worktrees_prune_missing(),
+            Some(WorktreesCmd::Prune { missing: false }) => run_worktrees_prune(),
             Some(WorktreesCmd::Scan) => run_worktrees_scan(),
             Some(WorktreesCmd::Add { path }) => run_worktrees_add(&path),
             None => run_worktrees_list(),
@@ -655,7 +660,14 @@ fn run_stack_track(branch: &str, base: &str, repo_arg: Option<&Path>) -> Result<
 }
 
 fn run_stack_untrack(branch: &str, repo_arg: Option<&Path>) -> Result<()> {
-    let repo = resolve_repo(repo_arg)?;
+    // Metadata for a repository that was deleted can still be removed by
+    // naming its old path.
+    let repo = match (resolve_repo(repo_arg), repo_arg) {
+        (Ok(repo), _) => repo,
+        (Err(_), Some(path)) if !path.exists() => std::path::absolute(path)
+            .with_context(|| format!("resolve repository path {}", path.display()))?,
+        (Err(error), _) => return Err(error),
+    };
     let mut state = state::load()?;
     let removed = state.untrack_stack_branch(&repo, branch);
     state::save(&state)?;
@@ -1693,6 +1705,36 @@ fn run_worktrees_unfinished() -> Result<()> {
     Ok(())
 }
 
+fn run_worktrees_prune_missing() -> Result<()> {
+    let mut state = state::load()?;
+    let (missing, present): (Vec<Worktree>, Vec<Worktree>) = state
+        .worktrees
+        .drain(..)
+        .partition(|worktree| !worktree.path.exists());
+    state.worktrees = present;
+    state
+        .recent
+        .retain(|recent| !missing.iter().any(|worktree| worktree.path == recent.path));
+    state::save(&state)?;
+    for worktree in &missing {
+        println!(
+            "removed {}\tbranch={}\trepo={}",
+            worktree.path.display(),
+            if worktree.branch.is_empty() {
+                "-"
+            } else {
+                &worktree.branch
+            },
+            worktree.repo.display()
+        );
+    }
+    println!(
+        "removed {} registry entries for missing worktrees",
+        missing.len()
+    );
+    Ok(())
+}
+
 fn run_worktrees_prune() -> Result<()> {
     use std::io::{self, Write};
     use std::process::{Command, Stdio};
@@ -2072,14 +2114,27 @@ fn run_worktrees_scan() -> Result<()> {
         }
     }
 
+    // A repository that could not be scanned keeps its previous entries;
+    // `worktrees prune --missing` removes the ones whose paths are gone.
+    let mut kept = 0usize;
+    for worktree in previous.into_values() {
+        let repo_failed = errors.iter().any(|(repo, _)| *repo == worktree.repo);
+        if !repo_failed || by_path.contains_key(&worktree.path) {
+            continue;
+        }
+        by_path.insert(worktree.path.clone(), worktree);
+        kept += 1;
+    }
+
     state.worktrees = by_path.into_values().collect();
     state::save(&state)?;
 
     println!(
-        "scanned {} repo(s), indexed {} linked worktree(s) (excluded {} by prefix)",
+        "scanned {} repo(s), indexed {} linked worktree(s) (excluded {} by prefix, kept {} from repos that failed to scan)",
         repos.len(),
         state.worktrees.len(),
-        excluded
+        excluded,
+        kept
     );
     for (repo, err) in &errors {
         eprintln!("warn: {} -> {}", repo.display(), err);

@@ -355,6 +355,99 @@ fn install_sync_runs_setup_in_the_foreground_and_reports_its_status() {
     assert_eq!(backend_calls(&repo), "");
 }
 
+fn write_state(repo: &Repo, state: Value) {
+    fs::write(
+        repo.state_dir.join("state.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn scan_keeps_entries_of_repos_that_fail_to_scan() {
+    let repo = setup();
+    let live = repo.root.join("live");
+    let live_arg = live.to_string_lossy().to_string();
+    git(
+        &repo.main,
+        &["worktree", "add", "-b", "feat/live", &live_arg],
+    );
+    let deleted_repo = repo.root.join("deleted-repo");
+    let orphan = repo.root.join("orphan");
+    let timestamp = "2026-01-01T00:00:00Z";
+    write_state(
+        &repo,
+        json!({
+            "repos_keyed_by_main_worktree": true,
+            "worktrees": [
+                {"path": live, "repo": repo.main, "branch": "feat/live", "created": timestamp},
+                {"path": orphan, "repo": deleted_repo, "branch": "feat/orphan", "created": timestamp}
+            ]
+        }),
+    );
+
+    let output = run_shirei(&repo, &repo.main, &["worktrees", "scan"]);
+    let stdout = assert_success(&output);
+    assert!(
+        stdout.contains("kept 1 from repos that failed to scan"),
+        "{stdout}"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("deleted-repo"));
+    let paths: Vec<Value> = read_state(&repo)["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|worktree| worktree["path"].clone())
+        .collect();
+    assert!(paths.contains(&json!(live)));
+    assert!(paths.contains(&json!(orphan)));
+
+    let pruned = assert_success(&run_shirei(
+        &repo,
+        &repo.main,
+        &["worktrees", "prune", "--missing"],
+    ));
+    assert!(
+        pruned.contains(&format!("removed {}", orphan.display())),
+        "{pruned}"
+    );
+    let state = read_state(&repo);
+    assert_eq!(state["worktrees"].as_array().unwrap().len(), 1);
+    assert_eq!(state["worktrees"][0]["path"], json!(live));
+    assert!(live.is_dir());
+}
+
+#[test]
+fn untrack_accepts_the_path_of_a_deleted_repo() {
+    let repo = setup();
+    let deleted_repo = repo.root.join("deleted-repo");
+    let timestamp = "2026-01-01T00:00:00Z";
+    write_state(
+        &repo,
+        json!({
+            "repos_keyed_by_main_worktree": true,
+            "stack_branches": [
+                {"repo": deleted_repo, "branch": "feat/gone", "base": "main", "created": timestamp, "updated": timestamp}
+            ]
+        }),
+    );
+
+    let deleted_arg = deleted_repo.to_string_lossy().to_string();
+    let stdout = assert_success(&run_shirei(
+        &repo,
+        &repo.root,
+        &["stack", "untrack", "feat/gone", "--repo", &deleted_arg],
+    ));
+    assert!(stdout.starts_with("untracked feat/gone"), "{stdout}");
+    assert_eq!(
+        read_state(&repo)["stack_branches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
 #[test]
 fn worktrees_add_registers_one_worktree_created_with_git() {
     let repo = setup();
