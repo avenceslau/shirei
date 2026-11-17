@@ -1359,8 +1359,13 @@ fn run_pr(action: PrCmd) -> Result<()> {
     };
 
     let mut stack_reviews = Vec::new();
-    if stack_item.is_some() {
-        for member in stack::review_chain(&state, &stack_repo, &branch)? {
+    let chain = match stack_item {
+        Some(_) => stack::review_chain(&state, &stack_repo, &branch)?,
+        None => Vec::new(),
+    };
+    // A lone tracked branch has no neighbours to link.
+    if chain.len() > 1 {
+        for member in chain {
             let item = state
                 .stack_branch(&stack_repo, &member)
                 .ok_or_else(|| anyhow!("no stack metadata for {member}"))?;

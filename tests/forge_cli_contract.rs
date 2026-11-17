@@ -554,6 +554,33 @@ fn pr_create_enforces_the_word_budget_for_the_change_size() {
 }
 
 #[test]
+fn pr_create_adds_no_stack_links_for_a_lone_tracked_branch() {
+    let test = test_repo("git@github.com:owner/repo.git");
+    track_review_branch_as_stack(&test);
+
+    let output = run_shirei(
+        &test,
+        &[
+            "pr",
+            "create",
+            "--dry-run",
+            "--title",
+            "Add feature",
+            "--body",
+            "Why.",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\nbody=\"Why.\"\n"), "{stdout}");
+    assert!(!stdout.contains("stack="), "{stdout}");
+}
+
+#[test]
 fn pr_create_rejects_a_hand_written_stack_section() {
     let test = test_repo("git@github.com:owner/repo.git");
     track_three_branch_stack(&test);
