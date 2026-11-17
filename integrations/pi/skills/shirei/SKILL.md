@@ -10,14 +10,13 @@ Shirei is a terminal session manager with worktree-aware directory tracking. It 
 
 ## Retrieve Current Behavior First
 
-Shirei may evolve. Before acting, inspect the installed version and relevant help:
+Shirei may evolve. When a flag below is rejected, or the version matters, ask the installed binary once instead of reading `--help` pages:
 
 ```bash
-command -v shirei
-shirei --version
-shirei --help
-shirei <command> --help
+shirei capabilities --json   # version, git SHA, every subcommand and flag
 ```
+
+Older binaries without `capabilities` predate everything in this skill marked as needing it; fall back to `shirei --version` and `shirei <command> --help`.
 
 When working in the Shirei source repository, read `README.md` and the relevant source:
 
@@ -28,6 +27,8 @@ When working in the Shirei source repository, read `README.md` and the relevant 
 | State | `src/state.rs` |
 | Git branches/worktrees | `src/git.rs` |
 | Forge review detection | `src/forge.rs` |
+| Review title/body rules | `src/review.rs` |
+| Stack graph and links | `src/stack.rs` |
 | Picker behavior | `src/picker.rs` |
 | Backend abstraction | `src/session.rs` |
 | tmux | `src/tmux.rs` |
@@ -42,23 +43,29 @@ Prefer installed help and source over remembered flags or stale documentation.
 | Intent | Command | Notes |
 |---|---|---|
 | Open the main picker | `shirei` or `shirei pick` | Interactive; selecting a directory opens or reuses a backend session. |
+| Create a worktree as an agent | `shirei branch NAME --base BASE --no-open --print-path [--sparse DIR...] [--install=sync]` | Prints only the path; no session or terminal switch. Use this instead of `git worktree add`. |
 | Open a branch worktree | `shirei branch [NAME] [-b BASE]` | Interactive unless enough information is supplied. |
+| Register a worktree made with git | `shirei worktrees add PATH` | Upserts one entry; no full scan. |
 | List recent directories | `shirei recent` | Read-only; prints timestamp and path. |
 | List live sessions | `shirei sessions` | Read-only; uses the configured backend. |
 | Close sessions | `shirei kill` | Interactive multi-select and destructive. |
 | List tracked worktrees | `shirei worktrees` | Reads Shirei's registry, not live Git state. |
 | Find unfinished work | `shirei worktrees unfinished` | Read-only; consults Git and available forge CLIs. |
 | Delete worktrees | `shirei worktrees prune` | Interactive, confirmed, and destructive. |
-| Rebuild the registry | `shirei worktrees scan` | Replaces the registry from discovered Git worktrees. |
+| Preview merged-worktree cleanup | `shirei worktrees prune --merged [PATH...]` | Read-only without `--yes`; prints `would remove` and `skip ... reason=`. |
+| Delete merged worktrees | `shirei worktrees prune --merged --yes [PATH...]` | Destructive; only clean, merged, non-primary worktrees. |
+| Drop entries for deleted paths | `shirei worktrees prune --missing` | Registry only; deletes nothing on disk. |
+| Rebuild the registry | `shirei worktrees scan` | Rebuilds the registry; keeps entries of repos that fail to scan. |
 | Create standalone review | `shirei pr create [--base BASE] [--draft]` | Pushes the current branch and creates or reuses its PR/MR. |
 | Preview standalone review | `shirei pr create --dry-run` | Validates and previews without pushing or contacting the forge. |
-| Create stacked PR branch | `shirei stack branch NAME --base BASE` | Creates/opens worktree and records review base. |
+| Create stacked PR branch | `shirei stack branch NAME --base BASE [--no-open --print-path]` | Creates the worktree and records review base and base commit. |
 | List stacked PRs | `shirei stack list` | Read-only stack metadata report. |
 | Cascade rebase stack | `shirei stack rebase --branch LEAF [--dry-run]` | Mutating unless `--dry-run`; stops on conflicts. |
-| Submit stacked PRs | `shirei stack submit --branch LEAF [--dry-run]` | Pushes and edits GitHub PRs or GitLab MRs unless `--dry-run`. |
+| Submit stacked PRs | `shirei stack submit --branch LEAF [--dry-run] [--remote R]` | Force-pushes with a lease and edits GitHub PRs or GitLab MRs unless `--dry-run`. |
+| List commands and flags | `shirei capabilities --json` | Read-only; version, git SHA, subcommands, flags. |
 | Generate completions | `shirei completions <shell>` | Supports Bash, Elvish, Fish, PowerShell, and Zsh. |
 
-Shirei has no JSON output, noninteractive picker mode, or command that changes the parent shell's directory.
+Shirei has no noninteractive picker mode or command that changes the parent shell's directory. Commands work the same from the main checkout or any linked worktree: repositories are keyed by their main worktree.
 
 ## Main Picker
 
@@ -88,7 +95,7 @@ Run `shirei branch` from anywhere inside the target Git repository.
 shirei branch feature/name
 ```
 
-If the branch exists only as `origin/feature/name`, Shirei creates a local branch tracking that remote ref in a linked worktree.
+If the branch exists only as `origin/feature/name`, Shirei creates a local branch tracking that remote ref in a linked worktree. If the branch is already checked out in another worktree, Shirei reuses that worktree and registers its real path.
 
 ### New branch from a known base
 
@@ -96,7 +103,24 @@ If the branch exists only as `origin/feature/name`, Shirei creates a local branc
 shirei branch feature/name --base main
 ```
 
-Supplying both name and base avoids fzf for a new branch. If the branch already exists, `--base` is ignored with a warning.
+Supplying both name and base avoids fzf for a new branch. If the branch already exists, `--base` is ignored with a warning. A new branch never tracks its base (`--no-track`), so the first `git push -u` sets its upstream.
+
+### As an agent
+
+Always create worktrees with Shirei, never with raw `git worktree add`:
+
+```bash
+W=$(shirei branch feature/name --base origin/main --no-open --print-path)
+W=$(shirei branch feature/name --base origin/main --no-open --print-path --install=sync --sparse packages/api)
+```
+
+- `--no-open` creates and registers the worktree without creating a session or switching the user's terminal. It is the default when stdin is not a terminal or `PI_CODING_AGENT` is set; pass it anyway to be explicit.
+- `--print-path` prints only the worktree path on stdout; git progress and notes go to stderr.
+- `--install=sync` runs the detected setup command (`pnpm install`, `make install`, `cargo build`, ...) in the foreground and exits non-zero when it fails; the worktree remains. `--install=none` skips it. Without a session, background setup is skipped.
+- `--sparse DIR...` checks out only those directories (cone mode). Put it last; it takes every following value.
+- `checkout_exclude` in the config keeps files such as `.dev.vars*` from being written, which avoids sandbox `Operation not permitted` failures. A failed checkout removes the partial directory and the new branch, so rerunning is safe.
+
+If a worktree was already created with git, register it with `shirei worktrees add PATH` instead of running `shirei worktrees scan`.
 
 Without `NAME`, Shirei opens a branch picker. For a new named branch without `--base`, it may open a second picker for the base.
 
@@ -107,9 +131,9 @@ Without `NAME`, Shirei opens a branch picker. For a new named branch without `--
 - Create a Git branch and linked worktree
 - Create directories below `worktree_root`
 - Update Shirei worktree and recent state
-- Create or reuse a tmux session or Herdr workspace
-- Switch or attach the user's terminal client
-- Run repository-controlled setup commands when `run_install_on_create = true`
+- Create or reuse a tmux session or Herdr workspace (not with `--no-open`)
+- Switch or attach the user's terminal client (not with `--no-open`)
+- Run repository-controlled setup commands when `run_install_on_create = true` or `--install=sync`
 
 Automatic setup detects, in order:
 
@@ -117,7 +141,7 @@ Automatic setup detects, in order:
 2. `package.json` -> `bun`, `pnpm`, `yarn`, or `npm install`
 3. `Cargo.toml` -> `cargo build`
 
-Before an agent runs `shirei branch`, get explicit user intent and inspect configuration. Prefer `run_install_on_create = false` unless the user wants setup scripts executed.
+Pass `--install=none` unless the user wants setup scripts executed. Run `shirei branch` without `--no-open` only when the user wants their terminal switched.
 
 Shirei computes the target as:
 
@@ -191,7 +215,9 @@ For every confirmed selection, Shirei attempts to remove:
 
 Remote branches are never deleted. The primary worktree is always refused. If branch deletion fails after directory removal, Shirei retains a retryable state entry.
 
-Never invoke prune unattended or pipe an automatic confirmation into it. Require explicit user intent and an interactive terminal.
+Never invoke the interactive prune unattended or pipe an automatic confirmation into it. Require explicit user intent and an interactive terminal.
+
+When the user asks to clean up worktrees, use the non-interactive form instead: run `shirei worktrees prune --merged [PATH...]` first, show the `would remove` and `skip` lines, then rerun with `--yes` after the user agrees. It only deletes clean worktrees whose HEAD is in a remote default branch or a merged review, and never the primary or current worktree. `shirei worktrees prune --missing` drops registry entries for deleted directories without touching the disk.
 
 ### Rebuild the registry
 
@@ -199,7 +225,7 @@ Never invoke prune unattended or pipe an automatic confirmation into it. Require
 shirei worktrees scan
 ```
 
-`scan` discovers repositories from known entries and configured roots, runs `git worktree list --porcelain`, and replaces the saved registry. A scan error for one repository can cause that repository's previous entries to disappear. Back up state first when registry continuity matters.
+`scan` discovers repositories from known entries and configured roots, resolves each to its main worktree, runs `git worktree list --porcelain`, and replaces the saved registry. A repository that fails to scan keeps its previous entries. To register one worktree, use `shirei worktrees add PATH` instead.
 
 Configured roots support literal paths and a final `/*` for direct children only. They are not general recursive globs.
 
@@ -207,15 +233,22 @@ Configured roots support literal paths and a final `/*` for direct children only
 
 Prefer `shirei pr create` over calling `gh pr create` or `glab mr create` directly. Shirei selects the forge from Git remotes and uses the authenticated host CLI underneath.
 
-The command operates on the current branch and requires a clean worktree. It pushes to `origin`, or the first configured remote when `origin` is absent. `--base` selects the target; otherwise Shirei resolves the selected remote's HEAD branch and fails with guidance when that ref is unavailable. `--title` and either `--body` or `--body-file` override commit-derived text, while `--draft` creates a new review as a draft.
+The command operates on the current branch and requires a clean worktree. It pushes to `--remote`, else the branch's push or upstream remote, else `git config shirei.remote`, else `origin`. `--base` selects the target; otherwise a tracked stack branch targets its stack base, and other branches target the remote's live default branch (`git ls-remote --symref`, with a warning when the local `origin/HEAD` is stale). `--title` and either `--body` or `--body-file` override commit-derived text, while `--draft` creates a new review as a draft.
+
+Shirei writes the deterministic parts of a review and rejects bodies that break the rules, so do not do these by hand:
+
+- Stack navigation: on a tracked stack branch Shirei adds the managed links block (position, previous, next, merge order) and refreshes it on every open review in the stack. A body with its own `Stack` or `Stack position` heading is rejected.
+- Ticket prefix: when recent titles use `KEY-NNNN:` (for example `ABC-1725:`), Shirei prepends the ticket from the branch name or commits and replaces `ABC-000`.
+- Public scrub: on hosts other than `gitlab.corp.example`, titles and bodies naming internal systems are rejected with the hits listed.
+- Word budget: bodies over 80/200/350 prose words for small/medium/large changes are rejected with the count and budget.
 
 An existing open review targeting the selected base is reused without overwriting its title, body, or draft state. Reviews targeting other branches are left untouched, and closed or merged reviews do not block a new review.
 
-Always run `shirei pr create --dry-run` before mutation. Dry-run validates the Git state and prints the planned branch, commit, remote, push, and review without pushing or invoking `gh` or `glab`. In Pi, use `shirei_pr_create` rather than a shell command. Before calling it, inspect the branch diff and commits against the review base, then author a concise title and polished body covering motivation, key decisions, system impact, testing, and stack position when relevant. The tool requires both fields, previews them for confirmation, and rejects the operation if the confirmed branch, commit, or remote changes before mutation.
+Always run `shirei pr create --dry-run` before mutation. Dry-run validates the Git state and the rules above and prints the planned branch, commit, remote, push, final title and body, word count, and stack position without pushing or invoking `gh` or `glab`. In Pi, use `shirei_pr_create` rather than a shell command. Before calling it, inspect the branch diff and commits against the review base, then write a short title and description following the `pr-description` skill: why, what changed in behaviour, and how it was tested. The tool requires both fields, previews them, offers Create, Create as draft, or Cancel with a note, and rejects the operation if the confirmed branch, commit, or remote changes before mutation. A returned note is the user's feedback: revise and call the tool again. In a subagent the tool returns the validated review instead of creating it; hand that back to the parent and never fall back to `gh`, `glab`, or `git push`.
 
 ## Stacked PRs
 
-`shirei stack branch NAME --base BASE` creates or reuses a worktree/session and records `NAME -> BASE` as stack metadata. Use it when the user wants stacked PR/MR workflows instead of a standalone branch.
+`shirei stack branch NAME --base BASE` creates or reuses a worktree (and a session unless `--no-open`) and records `NAME -> BASE` and the base commit as stack metadata. It accepts the same agent flags as `shirei branch`. Use it when the user wants stacked PR/MR workflows instead of a standalone branch.
 
 Common commands:
 
@@ -226,11 +259,11 @@ shirei stack list
 shirei stack rebase --branch feature/ui --dry-run
 ```
 
-`shirei stack rebase --branch LEAF` validates every registered branch worktree and snapshots branch-head and merge-base OIDs before mutation. It cascades from the root through `LEAF` with `git rebase --onto <new-parent-oid> <old-parent-oid>` inside each branch's own worktree, so rewritten parent commits are not replayed into children. It requires clean worktrees. On conflict it stops, records OID-aware progress, prints conflicted files, and expects the user to resolve/stage files before `shirei stack rebase --continue`; `--abort` aborts the active cascade rebase.
+`shirei stack rebase --branch LEAF` validates every registered branch worktree and snapshots branch-head and old-base OIDs before mutation. The old base is the parent commit Shirei recorded when the parent was rewritten since (so a parent amended or rebased outside Shirei is handled), otherwise the merge-base; do not run `git rebase --onto` by hand. It cascades from the root through `LEAF` with `git rebase --onto <new-parent-oid> <old-parent-oid>` inside each branch's own worktree, so rewritten parent commits are not replayed into children. It requires clean worktrees. On conflict it stops, records OID-aware progress, prints conflicted files, and expects the user to resolve/stage files before `shirei stack rebase --continue`; `--abort` aborts the active cascade rebase.
 
-In Pi, use the `shirei_stack_rebase_assist` tool only when the user explicitly asks for LLM-assisted conflict repair. The tool confirms, switches to the fastest available model in the default order `openai/gpt-5.6-luna`, `openai/gpt-5.6-terra`, `openai/gpt-5.6-sol`, sends focused conflict prompts, verifies markers/unmerged paths are gone, stages resolved files, continues the rebase, and restores the previous model.
+In Pi, use the `shirei_stack_rebase_assist` tool only when the user explicitly asks for LLM-assisted conflict repair. The tool confirms, switches to the first available model in `SHIREI_REBASE_MODEL_ORDER` (or keeps the current model when it is unset), sends focused conflict prompts, verifies markers/unmerged paths are gone, stages resolved files, continues the rebase, and restores the previous model.
 
-`shirei stack submit --branch LEAF` pushes stack branches and uses `gh` for GitHub PRs or `glab` for GitLab MRs. It updates descriptions only by appending or replacing the managed block between `<!-- shirei-stack-links:start -->` and `<!-- shirei-stack-links:end -->`; user-authored description text outside that block must be preserved exactly. Use `--dry-run` before non-dry-run submit.
+`shirei stack submit --branch LEAF` force-pushes stack branches with `--force-with-lease` on the remote commit seen before the first push, so rebased branches push without a manual force push, and uses `gh` for GitHub PRs or `glab` for GitLab MRs. It updates descriptions only by appending or replacing the managed block between `<!-- shirei-stack-links:start -->` and `<!-- shirei-stack-links:end -->`; user-authored description text outside that block must be preserved exactly. Use `--dry-run` before non-dry-run submit.
 
 ## Shell Completions
 
@@ -263,11 +296,11 @@ Supported examples:
 /shirei stack submit --branch feature/ui --dry-run
 ```
 
-`/shirei branch` and `/shirei stack branch` require Pi to run inside tmux or Herdr. `/shirei worktrees prune` is intentionally blocked because prune requires an interactive terminal. Non-dry-run `/shirei stack submit` is blocked in Pi for now; run it in a terminal. For LLM-assisted cascade rebases, use the `shirei_stack_rebase_assist` tool rather than a plain `/shirei stack rebase` command.
+`/shirei branch` and `/shirei stack branch` require Pi to run inside tmux or Herdr and open the session (`--open`). `/shirei worktrees prune` is intentionally blocked because prune requires an interactive terminal. Only the `/shirei stack submit` slash command requires `--dry-run`; Pi does not block running `shirei stack submit` through bash. For LLM-assisted cascade rebases, use the `shirei_stack_rebase_assist` tool rather than a plain `/shirei stack rebase` command.
 
-The extension also registers `shirei_pr_create`. Use it for standalone PR/MR creation instead of invoking forge CLIs directly. It requires an agent-authored title and body, accepts an optional repository, base, and draft flag, runs `shirei pr create --dry-run`, shows the complete authored review in the preview, and requires confirmation before pushing or creating it.
+The extension also registers `shirei_pr_create`. Use it for standalone PR/MR creation instead of invoking forge CLIs directly. It requires a short title and body that follow the `pr-description` skill, accepts an optional repository, base, and draft flag, runs `shirei pr create --dry-run`, shows the final review in the preview, and offers Create, Create as draft, or Cancel with a note before pushing or creating it. Calls run one at a time.
 
-The extension also registers the `shirei_stack_rebase_assist` tool. Use it only when the user explicitly asks the current agent to cascade rebase a stack with LLM conflict repair. It requires a leaf branch and optionally accepts a repository, root `--onto` target, model order, and retry limit. It confirms before mutating, chooses the first available/authenticated model from Luna -> Terra -> Sol by default, and restores the previous model on completion/failure.
+The extension also registers the `shirei_stack_rebase_assist` tool. Use it only when the user explicitly asks the current agent to cascade rebase a stack with LLM conflict repair. It requires a leaf branch and optionally accepts a repository, root `--onto` target, model order, and retry limit. It confirms before mutating, chooses the first available/authenticated model from `modelOrder` or `SHIREI_REBASE_MODEL_ORDER`, else the current model, and restores the previous model on completion/failure.
 
 The extension also registers the `shirei_handoff` tool. Use it only when the user explicitly asks the current agent to delegate work to another Shirei/Pi session. The tool requires:
 
@@ -295,7 +328,17 @@ recent_cap = 20
 worktree_root = "~/.local/share/shirei/worktrees"
 worktree_exclude_prefixes = ["~/Library/Caches"]
 run_install_on_create = true
+checkout_exclude = [".dev.vars*", ".env*"]
+
+[review]
+private_hosts = ["gitlab.corp.example"]
+extra_public_denylist = []
+small_max_words = 80
+medium_max_words = 200
+large_max_words = 350
 ```
+
+Per-repository Git config: `shirei.remote` (review remote when the branch has no upstream) and `shirei.ticketPrefix` (`ABC`, or `none`).
 
 State lookup order:
 
@@ -326,17 +369,17 @@ Inside tmux, Shirei switches clients; outside tmux, it attaches and may block un
 
 ## Agent Safety Rules
 
-1. Retrieve installed help before relying on flags.
-2. Treat `shirei`, `pick`, bare `branch`, `kill`, and `worktrees prune` as interactive commands.
-3. Never run `worktrees prune` unattended or provide its `delete` confirmation automatically.
-4. Treat `branch` and `stack branch` as high-impact because they change Git, state, sessions, and may execute repository code.
-5. Use `shirei branch NAME --base REF` or `shirei stack branch NAME --base REF` only after confirming branch, base, and side effects.
+1. When a flag is rejected, check `shirei capabilities --json` once instead of reading `--help` pages.
+2. Treat `shirei`, `pick`, bare `branch`, `kill`, and the bare `worktrees prune` as interactive commands.
+3. Never run the interactive `worktrees prune` unattended or provide its `delete` confirmation automatically; use `worktrees prune --merged` and add `--yes` only after the user agrees.
+4. Create worktrees with `shirei branch NAME --base BASE --no-open --print-path [--sparse DIR...] [--install=sync]` (or `shirei stack branch` for stacks), never with `git worktree add`. Register any worktree made with git through `shirei worktrees add PATH`.
+5. Run `branch` or `stack branch` without `--no-open` only when the user wants their terminal switched; pass `--install=none` unless the user wants setup scripts run.
 6. Prefer `shirei pr create` over direct `gh pr create` or `glab mr create` for standalone reviews.
-7. In Pi, inspect the branch and provide a non-empty authored title and body to `shirei_pr_create` so standalone review creation is reviewed and confirmed.
-8. Treat non-dry-run `pr create`, `stack rebase`, and `stack submit` as high-impact; prefer `--dry-run` first.
-9. Never let stack submit rewrite a whole PR description. Only the managed previous/next block may be appended or replaced.
+7. In Pi, inspect the branch and give `shirei_pr_create` a short title and body following the `pr-description` skill. Leave stack navigation, ticket prefixes, and internal-name checks to Shirei.
+8. Treat non-dry-run `pr create`, `stack rebase`, and `stack submit` as high-impact; prefer `--dry-run` first. Pi does not block `shirei stack submit` through bash.
+9. Never let stack submit rewrite a whole PR description. Only the managed stack links block may be appended or replaced.
 10. Require explicit intent before `kill`; it terminates live processes.
-11. Back up state before `worktrees scan` when registry continuity matters.
+11. Do not force-push or `git rebase --onto` stack branches by hand; `stack rebase` and `stack submit` handle both.
 12. Do not infer success from fzf cancellation; cancellation normally exits successfully.
 13. Do not assume a saved path or branch is still valid.
-14. Do not invent commands or flags; verify them against current help.
+14. Do not invent commands or flags; verify them with `shirei capabilities --json`.

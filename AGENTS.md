@@ -19,6 +19,11 @@ No daemon, no database, no network. State is one JSON file under
 - `src/state.rs` — JSON state load/save, MRU touch, worktree dedup,
   dead-worktree prune
 - `src/config.rs` — TOML config load + tilde expansion
+- `src/stack.rs` — stack graph, rebase/submit plans, managed stack links block
+- `src/forge.rs` — every `gh` and `glab` call
+- `src/review.rs` — review title/body rules (ticket prefix, public denylist,
+  word budget, hand-written stack sections)
+- `build.rs` — embeds the git SHA shown by `--version` and `capabilities`
 
 ## Conventions
 
@@ -39,5 +44,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-`cargo test` only covers `sanitize_name`. Interactive flows (picker,
-branch picker) are smoke-tested by hand via `prefix + f` in tmux.
+Integration tests in `tests/` run the built binary against temp git repos with
+`SHIREI_STATE_DIR` and `SHIREI_CONFIG` pointing at temp paths, and fake `gh`,
+`glab`, `git push`, `tmux`, and `herdr` executables on `PATH`. Never point a test
+at the real state or config. Interactive flows (picker, branch picker) are
+smoke-tested by hand via `prefix + f` in tmux.
