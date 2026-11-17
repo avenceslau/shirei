@@ -106,9 +106,9 @@ enter LLM context. Interactive prune remains terminal-only. Only the
 `shirei stack submit` through bash works.
 
 For a standalone review, ask Pi to use `shirei_pr_create`. The agent writes a
-short title and description following the `pr-description` skill: one to three
-sentences of why, a few behaviour bullets, and a line or two of testing, within
-the word budget for the change size. Shirei adds everything deterministic itself
+short title and description following the `pr-description` skill: why the
+change exists, a usage example for every API surface it changes (internal or
+external), and how it was validated, within the word budget for the change size. Shirei adds everything deterministic itself
 (the ticket prefix, stack links) and rejects bodies that break the rules (see
 [Standalone PRs and MRs](#standalone-prs-and-mrs)). The tool previews the push
 and review, then offers Create, Create as draft, or Cancel with a note; the note
