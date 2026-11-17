@@ -36,7 +36,10 @@ interface PendingStackRebase {
 	currentFiles?: string[];
 }
 
-const DEFAULT_REBASE_MODEL_ORDER = ["openai/gpt-5.6-luna", "openai/gpt-5.6-terra", "openai/gpt-5.6-sol"];
+const DEFAULT_REBASE_MODEL_ORDER = (process.env.SHIREI_REBASE_MODEL_ORDER ?? "")
+	.split(",")
+	.map((value) => value.trim())
+	.filter(Boolean);
 
 function parseConflictHeader(output: string) {
 	const line = output.split("\n").find((value) => value.startsWith("status=conflict "));
@@ -214,7 +217,14 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus("shirei-stack-rebase", undefined);
 	});
 
-	const selectFastestRebaseModel = async (ctx: any, order: string[]) => {
+	const selectRebaseModel = async (ctx: any, order: string[]) => {
+		if (order.length === 0 && ctx.model) {
+			return {
+				model: ctx.model,
+				label: `${ctx.model.provider}/${ctx.model.id}`,
+			};
+		}
+
 		for (const value of order) {
 			const [provider, ...rest] = value.split("/");
 			const id = rest.join("/");
@@ -327,7 +337,7 @@ export default function (pi: ExtensionAPI) {
 		// Each call opens a confirmation dialog; parallel calls would show two at once.
 		executionMode: "sequential",
 		description:
-			"Cascade rebase a Shirei stack and use Pi with the fastest available GPT-5.6 Luna/Terra/Sol model to fix conflicts. Requires interactive confirmation.",
+			"Cascade rebase a Shirei stack and use Pi with the first available preferred model to fix conflicts. Requires interactive confirmation.",
 		promptSnippet: "Cascade rebase a Shirei stack with LLM conflict repair",
 		promptGuidelines: [
 			"Use shirei_stack_rebase_assist only when the user explicitly asks for an LLM-assisted cascade rebase.",
@@ -340,7 +350,7 @@ export default function (pi: ExtensionAPI) {
 			modelOrder: Type.Optional(
 				Type.Array(Type.String(), {
 					description:
-						"Optional speed-first model IDs; defaults to openai/gpt-5.6-luna, openai/gpt-5.6-terra, openai/gpt-5.6-sol",
+						"Optional preferred model IDs; defaults to SHIREI_REBASE_MODEL_ORDER or the current model",
 				}),
 			),
 			maxConflictAttempts: Type.Optional(Type.Number({ description: "Retry limit per conflict stop; default 2" })),
@@ -383,9 +393,12 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text" as const, text: "Shirei stack rebase assist cancelled." }], details: { cancelled: true } };
 			}
 			const previousModel = ctx.model;
-			const selected = await selectFastestRebaseModel(ctx, params.modelOrder?.length ? params.modelOrder : DEFAULT_REBASE_MODEL_ORDER);
+			const selected = await selectRebaseModel(
+				ctx,
+				params.modelOrder?.length ? params.modelOrder : DEFAULT_REBASE_MODEL_ORDER,
+			);
 			if (!selected) {
-				throw new Error("No configured/authenticated GPT-5.6 Luna, Terra, or Sol model is available");
+				throw new Error("No configured or authenticated rebase model is available");
 			}
 			pendingStackRebase = {
 				repository,
@@ -421,7 +434,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Before using shirei_pr_create, inspect the branch diff and commits against its review base.",
 			"Use shirei_pr_create instead of calling gh pr create or glab mr create directly for standalone reviews.",
-			"Write a concise review title and a polished body that explains motivation, key decisions, system impact, testing, and stack position when applicable; omit empty sections and placeholders.",
+			"Follow the pr-description skill: title in the repo's convention (such as `ABC-NNNN: Imperative` with the real ticket); body of 1-3 sentences of why, 2-5 behaviour bullets, and 1-3 lines of testing, within 80/200/350 words for small/medium/large changes; no headings on small changes, no transcripts, file tables, commit narration, stack sections, or internal names in public repos. Preview medium and larger bodies in chat first.",
 			"Use Shirei stack submission instead when the branch belongs to a tracked Shirei stack.",
 			"Without an interactive session (for example in a subagent), shirei_pr_create validates the review and returns it instead of creating it; return that prepared review to your parent and never create it with gh, glab, or git push.",
 		],
@@ -430,12 +443,12 @@ export default function (pi: ExtensionAPI) {
 				Type.String({ description: "Target repository path; defaults to the current repository" }),
 			),
 			base: Type.Optional(Type.String({ description: "Target branch; defaults to the remote's HEAD branch" })),
-			title: Type.String({ description: "Concise agent-authored review title based on the branch diff" }),
+			title: Type.String({ description: "Title in the repository's convention (see recent merged titles), at most 72 characters, imperative" }),
 			body: Type.String({
 				description:
-					"Polished agent-authored review description covering motivation, decisions, impact, testing, and stack position when relevant",
+					"Short reviewer-facing description: why, what changed in behaviour, and how it was tested. Shirei adds the stack links; never include your own.",
 			}),
-			draft: Type.Optional(Type.Boolean({ description: "Create the review as a draft" })),
+			draft: Type.Optional(Type.Boolean({ description: "Create as a draft only when the user asks, or for red-test PRs, experiments, or work blocked on an unmerged dependency" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const requestedRepository = repositoryInput(params.repository, ctx.cwd);
