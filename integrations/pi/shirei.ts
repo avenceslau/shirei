@@ -36,7 +36,10 @@ interface PendingStackRebase {
 	currentFiles?: string[];
 }
 
-const DEFAULT_REBASE_MODEL_ORDER = ["openai/gpt-5.6-luna", "openai/gpt-5.6-terra", "openai/gpt-5.6-sol"];
+const DEFAULT_REBASE_MODEL_ORDER = (process.env.SHIREI_REBASE_MODEL_ORDER ?? "")
+	.split(",")
+	.map((value) => value.trim())
+	.filter(Boolean);
 
 function parseConflictHeader(output: string) {
 	const line = output.split("\n").find((value) => value.startsWith("status=conflict "));
@@ -102,6 +105,19 @@ Requirements:
 3. Run focused checks if practical.
 4. Stage only the resolved conflict files.
 5. Do not continue or abort the rebase; Shirei will run \`shirei stack rebase --continue\` after verification.`;
+}
+
+function repositoryInput(value: string | undefined, cwd: string): string {
+	if (!value) {
+		return cwd;
+	}
+	if (value === "~") {
+		return homedir();
+	}
+	if (value.startsWith("~/")) {
+		return join(homedir(), value.slice(2));
+	}
+	return isAbsolute(value) ? value : resolve(cwd, value);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -201,7 +217,14 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus("shirei-stack-rebase", undefined);
 	});
 
-	const selectFastestRebaseModel = async (ctx: any, order: string[]) => {
+	const selectRebaseModel = async (ctx: any, order: string[]) => {
+		if (order.length === 0 && ctx.model) {
+			return {
+				model: ctx.model,
+				label: `${ctx.model.provider}/${ctx.model.id}`,
+			};
+		}
+
 		for (const value of order) {
 			const [provider, ...rest] = value.split("/");
 			const id = rest.join("/");
@@ -311,8 +334,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "shirei_stack_rebase_assist",
 		label: "Shirei Stack Rebase Assist",
+		// Each call opens a confirmation dialog; parallel calls would show two at once.
+		executionMode: "sequential",
 		description:
-			"Cascade rebase a Shirei stack and use Pi with the fastest available GPT-5.6 Luna/Terra/Sol model to fix conflicts. Requires interactive confirmation.",
+			"Cascade rebase a Shirei stack and use Pi with the first available preferred model to fix conflicts. Requires interactive confirmation.",
 		promptSnippet: "Cascade rebase a Shirei stack with LLM conflict repair",
 		promptGuidelines: [
 			"Use shirei_stack_rebase_assist only when the user explicitly asks for an LLM-assisted cascade rebase.",
@@ -325,7 +350,7 @@ export default function (pi: ExtensionAPI) {
 			modelOrder: Type.Optional(
 				Type.Array(Type.String(), {
 					description:
-						"Optional speed-first model IDs; defaults to openai/gpt-5.6-luna, openai/gpt-5.6-terra, openai/gpt-5.6-sol",
+						"Optional preferred model IDs; defaults to SHIREI_REBASE_MODEL_ORDER or the current model",
 				}),
 			),
 			maxConflictAttempts: Type.Optional(Type.Number({ description: "Retry limit per conflict stop; default 2" })),
@@ -337,20 +362,12 @@ export default function (pi: ExtensionAPI) {
 			if (pendingStackRebase) {
 				throw new Error("A Shirei stack rebase assist is already in progress");
 			}
-			const repositoryInput = params.repository
-				? params.repository.startsWith("~/")
-					? join(homedir(), params.repository.slice(2))
-					: params.repository === "~"
-						? homedir()
-						: isAbsolute(params.repository)
-							? params.repository
-							: resolve(ctx.cwd, params.repository)
-				: ctx.cwd;
-			const rootResult = await pi.exec("git", ["-C", repositoryInput, "rev-parse", "--show-toplevel"], {
+			const requestedRepository = repositoryInput(params.repository, ctx.cwd);
+			const rootResult = await pi.exec("git", ["-C", requestedRepository, "rev-parse", "--show-toplevel"], {
 				timeout: 10_000,
 			});
 			if (rootResult.code !== 0) {
-				throw new Error(rootResult.stderr.trim() || `${repositoryInput} is not inside a Git repository`);
+				throw new Error(rootResult.stderr.trim() || `${requestedRepository} is not inside a Git repository`);
 			}
 			const repository = await realpath(rootResult.stdout.trim()).catch(() => resolve(rootResult.stdout.trim()));
 			const branch = params.branch.trim();
@@ -376,9 +393,12 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text" as const, text: "Shirei stack rebase assist cancelled." }], details: { cancelled: true } };
 			}
 			const previousModel = ctx.model;
-			const selected = await selectFastestRebaseModel(ctx, params.modelOrder?.length ? params.modelOrder : DEFAULT_REBASE_MODEL_ORDER);
+			const selected = await selectRebaseModel(
+				ctx,
+				params.modelOrder?.length ? params.modelOrder : DEFAULT_REBASE_MODEL_ORDER,
+			);
 			if (!selected) {
-				throw new Error("No configured/authenticated GPT-5.6 Luna, Terra, or Sol model is available");
+				throw new Error("No configured or authenticated rebase model is available");
 			}
 			pendingStackRebase = {
 				repository,
@@ -405,8 +425,174 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "shirei_pr_create",
+		label: "Shirei PR Create",
+		executionMode: "sequential",
+		description:
+			"Create or reuse a standalone GitHub pull request or GitLab merge request with an agent-authored title and description, preview, and confirmation.",
+		promptSnippet: "Author, preview, and confirm a standalone pull request or merge request",
+		promptGuidelines: [
+			"Before using shirei_pr_create, inspect the branch diff and commits against its review base.",
+			"Use shirei_pr_create instead of calling gh pr create or glab mr create directly for standalone reviews.",
+			"Follow the pr-description skill: title in the repo's convention (such as `ABC-NNNN: Imperative` with the real ticket); body of 1-3 sentences of why, 2-5 behaviour bullets, and 1-3 lines of testing, within 80/200/350 words for small/medium/large changes; no headings on small changes, no transcripts, file tables, commit narration, stack sections, or internal names in public repos. Preview medium and larger bodies in chat first.",
+			"Use Shirei stack submission instead when the branch belongs to a tracked Shirei stack.",
+			"Without an interactive session (for example in a subagent), shirei_pr_create validates the review and returns it instead of creating it; return that prepared review to your parent and never create it with gh, glab, or git push.",
+		],
+		parameters: Type.Object({
+			repository: Type.Optional(
+				Type.String({ description: "Target repository path; defaults to the current repository" }),
+			),
+			base: Type.Optional(Type.String({ description: "Target branch; defaults to the remote's HEAD branch" })),
+			title: Type.String({ description: "Title in the repository's convention (see recent merged titles), at most 72 characters, imperative" }),
+			body: Type.String({
+				description:
+					"Short reviewer-facing description: why, what changed in behaviour, and how it was tested. Shirei adds the stack links; never include your own.",
+			}),
+			draft: Type.Optional(Type.Boolean({ description: "Create as a draft only when the user asks, or for red-test PRs, experiments, or work blocked on an unmerged dependency" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const requestedRepository = repositoryInput(params.repository, ctx.cwd);
+			const rootResult = await pi.exec("git", ["-C", requestedRepository, "rev-parse", "--show-toplevel"], {
+				timeout: 10_000,
+			});
+			if (rootResult.code !== 0) {
+				throw new Error(rootResult.stderr.trim() || `${requestedRepository} is not inside a Git repository`);
+			}
+			const repository = await realpath(rootResult.stdout.trim()).catch(() => resolve(rootResult.stdout.trim()));
+			const title = params.title.trim();
+			const body = params.body.trim();
+			if (!title || !body) {
+				throw new Error("shirei_pr_create requires a non-empty agent-authored title and body");
+			}
+			const args = ["pr", "create", "--title", title, "--body", body];
+			if (params.base !== undefined) {
+				args.push("--base", params.base);
+			}
+			const draftArgs = params.draft === true ? ["--draft"] : [];
+
+			const preview = await pi.exec("shirei", [...args, ...draftArgs, "--dry-run"], {
+				cwd: repository,
+				timeout: 60_000,
+			});
+			if (preview.code !== 0 || preview.killed) {
+				throw new Error(preview.stderr.trim() || `shirei pr create --dry-run exited with ${preview.code}`);
+			}
+			const previewText = preview.stdout.trim();
+			const plan = new Map<string, string>();
+			for (const line of previewText.split("\n")) {
+				const separator = line.indexOf("=");
+				if (separator > 0) {
+					plan.set(line.slice(0, separator), line.slice(separator + 1));
+				}
+			}
+			const branch = plan.get("branch");
+			const head = plan.get("head");
+			const base = plan.get("base");
+			const remote = plan.get("remote");
+			const remoteTarget = plan.get("remote_target");
+			if (!branch || !head || !base || !remote || !remoteTarget) {
+				throw new Error("shirei pr create --dry-run returned an incomplete review plan");
+			}
+
+			// Subagents have no dialog to confirm with. Hand the validated review
+			// back instead of creating it, so nobody falls back to gh or glab.
+			if (ctx.mode !== "tui") {
+				const preparedReview = {
+					repository,
+					base: params.base ?? base,
+					title,
+					body,
+					draft: params.draft === true,
+				};
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: [
+								"Review not created: shirei_pr_create needs an interactive Pi session so the user can confirm it.",
+								"Do not create it with gh, glab, or git push. Return this prepared review to your parent agent or the user, who can pass it to shirei_pr_create:",
+								JSON.stringify(preparedReview, null, 2),
+								"",
+								"Validated plan:",
+								previewText,
+							].join("\n"),
+						},
+					],
+					details: {
+						status: "needs-confirmation",
+						preparedReview,
+						preview: previewText,
+					},
+					isError: true,
+				};
+			}
+
+			const createReady = params.draft === true ? "Create ready for review" : "Create";
+			const createDraft = "Create as draft";
+			const cancelWithNote = "Cancel with a note";
+			const options =
+				params.draft === true ? [createDraft, createReady, cancelWithNote] : [createReady, createDraft, cancelWithNote];
+			const choice = await ctx.ui.select(`Create pull request or merge request?\n${previewText}`, options);
+			if (choice === undefined || choice === cancelWithNote) {
+				const note =
+					choice === cancelWithNote
+						? (await ctx.ui.input("Note for the agent", "What should change in the review?"))?.trim()
+						: undefined;
+				const text = note
+					? `The user cancelled review creation with this note:\n${note}\n\nRevise the review accordingly and call shirei_pr_create again.`
+					: "Shirei review creation cancelled.";
+				return {
+					content: [{ type: "text" as const, text }],
+					details: {
+						repository,
+						preview: previewText,
+						cancelled: true,
+						note,
+					},
+				};
+			}
+
+			const confirmedArgs = [
+				...args,
+				...(choice === createDraft ? ["--draft"] : []),
+				...(params.base === undefined ? ["--base", base] : []),
+				"--remote",
+				remote,
+				"--expected-branch",
+				branch,
+				"--expected-head",
+				head,
+				"--expected-remote",
+				remoteTarget,
+			];
+			const result = await pi.exec("shirei", confirmedArgs, {
+				cwd: repository,
+				timeout: 180_000,
+			});
+			if (result.code !== 0 || result.killed) {
+				throw new Error(result.stderr.trim() || `shirei pr create exited with ${result.code}`);
+			}
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: result.stdout.trim() || "Shirei created the review.",
+					},
+				],
+				details: {
+					repository,
+					preview: previewText,
+					cancelled: false,
+					draft: choice === createDraft,
+				},
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "shirei_handoff",
 		label: "Shirei Handoff",
+		executionMode: "sequential",
 		description:
 			"Create or reuse a Shirei branch worktree and send an editable, agent-authored first prompt to Pi in that session. The repository must be an existing path. Uncommitted changes are not transferred.",
 		promptSnippet: "Hand work to Pi in another Shirei branch session",
@@ -425,18 +611,12 @@ export default function (pi: ExtensionAPI) {
 				throw new Error("shirei_handoff requires Pi interactive mode so the prompt can be reviewed");
 			}
 
-			const repositoryInput = params.repository.startsWith("~/")
-				? join(homedir(), params.repository.slice(2))
-				: params.repository === "~"
-					? homedir()
-					: isAbsolute(params.repository)
-						? params.repository
-						: resolve(ctx.cwd, params.repository);
-			const rootResult = await pi.exec("git", ["-C", repositoryInput, "rev-parse", "--show-toplevel"], {
+			const requestedRepository = repositoryInput(params.repository, ctx.cwd);
+			const rootResult = await pi.exec("git", ["-C", requestedRepository, "rev-parse", "--show-toplevel"], {
 				timeout: 10_000,
 			});
 			if (rootResult.code !== 0) {
-				throw new Error(rootResult.stderr.trim() || `${repositoryInput} is not inside a Git repository`);
+				throw new Error(rootResult.stderr.trim() || `${requestedRepository} is not inside a Git repository`);
 			}
 			const repository = await realpath(rootResult.stdout.trim()).catch(() => resolve(rootResult.stdout.trim()));
 			const branch = params.branch.trim();
@@ -532,7 +712,7 @@ export default function (pi: ExtensionAPI) {
 
 			let branchResult;
 			try {
-				branchResult = await pi.exec("shirei", ["branch", branch, "--base", base], {
+				branchResult = await pi.exec("shirei", ["branch", branch, "--base", base, "--open"], {
 					cwd: repository,
 					timeout: 180_000,
 				});
@@ -758,7 +938,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(baseCheck.stderr.trim() || `Unknown base ref: ${base}`, "error");
 					return;
 				}
-				commandArgs = ["branch", branch, "--base", base];
+				commandArgs = ["branch", branch, "--base", base, "--open"];
 			} else if (parts[0] === "stack") {
 				if (parts[1] === "branch") {
 					if (!process.env.TMUX && !process.env.HERDR_ENV) {
@@ -769,7 +949,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify("Usage: /shirei stack branch <name> --base <branch>", "warning");
 						return;
 					}
-					commandArgs = ["stack", "branch", parts[2], "--base", parts[4]];
+					commandArgs = ["stack", "branch", parts[2], "--base", parts[4], "--open"];
 				} else if (parts[1] === "track") {
 					if (parts.length !== 5 || !(parts[3] === "--base" || parts[3] === "-b")) {
 						ctx.ui.notify("Usage: /shirei stack track <branch> --base <branch>", "warning");
