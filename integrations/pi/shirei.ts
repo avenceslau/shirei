@@ -455,11 +455,9 @@ export default function (pi: ExtensionAPI) {
 			if (params.base !== undefined) {
 				args.push("--base", params.base);
 			}
-			if (params.draft === true) {
-				args.push("--draft");
-			}
+			const draftArgs = params.draft === true ? ["--draft"] : [];
 
-			const preview = await pi.exec("shirei", [...args, "--dry-run"], {
+			const preview = await pi.exec("shirei", [...args, ...draftArgs, "--dry-run"], {
 				cwd: repository,
 				timeout: 60_000,
 			});
@@ -516,23 +514,34 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const confirmed = await ctx.ui.confirm(
-				"Create pull request or merge request?",
-				previewText,
-			);
-			if (!confirmed) {
+			const createReady = params.draft === true ? "Create ready for review" : "Create";
+			const createDraft = "Create as draft";
+			const cancelWithNote = "Cancel with a note";
+			const options =
+				params.draft === true ? [createDraft, createReady, cancelWithNote] : [createReady, createDraft, cancelWithNote];
+			const choice = await ctx.ui.select(`Create pull request or merge request?\n${previewText}`, options);
+			if (choice === undefined || choice === cancelWithNote) {
+				const note =
+					choice === cancelWithNote
+						? (await ctx.ui.input("Note for the agent", "What should change in the review?"))?.trim()
+						: undefined;
+				const text = note
+					? `The user cancelled review creation with this note:\n${note}\n\nRevise the review accordingly and call shirei_pr_create again.`
+					: "Shirei review creation cancelled.";
 				return {
-					content: [{ type: "text" as const, text: "Shirei review creation cancelled." }],
+					content: [{ type: "text" as const, text }],
 					details: {
 						repository,
 						preview: previewText,
 						cancelled: true,
+						note,
 					},
 				};
 			}
 
 			const confirmedArgs = [
 				...args,
+				...(choice === createDraft ? ["--draft"] : []),
 				...(params.base === undefined ? ["--base", base] : []),
 				"--remote",
 				remote,
@@ -561,6 +570,7 @@ export default function (pi: ExtensionAPI) {
 					repository,
 					preview: previewText,
 					cancelled: false,
+					draft: choice === createDraft,
 				},
 			};
 		},
