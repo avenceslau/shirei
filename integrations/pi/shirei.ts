@@ -434,7 +434,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Before using shirei_pr_create, inspect the branch diff and commits against its review base.",
 			"Use shirei_pr_create instead of calling gh pr create or glab mr create directly for standalone reviews.",
-			"Follow the pr-description skill: title in the repo's convention (such as `ABC-NNNN: Imperative` with the real ticket); body of 1-3 sentences of why, 2-5 behaviour bullets, and 1-3 lines of testing, within 80/200/350 words for small/medium/large changes; no headings on small changes, no transcripts, file tables, commit narration, stack sections, or internal names in public repos. Preview medium and larger bodies in chat first.",
+			"Follow the pr-description skill: title in the repo's convention (such as `ABC-NNNN: Imperative` with the real ticket); body with a short Why, an API changes section with a usage example in a code block for every changed API surface (internal or external; omit when none), and 1-3 lines of Validation, within 80/200/350 words for small/medium/large changes; no headings on small changes, no transcripts, file tables, commit narration, stack sections, or internal names in public repos. Preview medium and larger bodies in chat first.",
 			"Use Shirei stack submission instead when the branch belongs to a tracked Shirei stack.",
 			"Without an interactive session (for example in a subagent), shirei_pr_create validates the review and returns it instead of creating it; return that prepared review to your parent and never create it with gh, glab, or git push.",
 		],
@@ -446,7 +446,7 @@ export default function (pi: ExtensionAPI) {
 			title: Type.String({ description: "Title in the repository's convention (see recent merged titles), at most 72 characters, imperative" }),
 			body: Type.String({
 				description:
-					"Short reviewer-facing description: why, what changed in behaviour, and how it was tested. Shirei adds the stack links; never include your own.",
+					"Reviewer-facing description: why, a usage example for every changed API surface, and how it was validated. Shirei adds the stack links; never include your own.",
 			}),
 			draft: Type.Optional(Type.Boolean({ description: "Create as a draft only when the user asks, or for red-test PRs, experiments, or work blocked on an unmerged dependency" })),
 		}),
