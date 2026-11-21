@@ -77,16 +77,14 @@ source <(shirei completions bash)
 
 ## Pi Integration
 
-The repository includes a Pi extension and Shirei skill:
+The repository is a Pi package holding a Pi extension and Shirei skill:
 
 ```bash
-mkdir -p ~/.pi/agent/extensions ~/.agents/skills/shirei
-cp integrations/pi/shirei.ts ~/.pi/agent/extensions/shirei.ts
-cp integrations/pi/skills/shirei/SKILL.md ~/.agents/skills/shirei/SKILL.md
+pi install git:github.com/avenceslau/shirei
 ```
 
-Copy the extension again whenever you install a new `shirei`: the extension and
-the binary change together (for example, the extension passes `--open` to
+Run `pi update` whenever you install a new `shirei`: the extension and the
+binary change together (for example, the extension passes `--open` to
 `shirei branch`, which older binaries reject).
 
 Run `/reload` in Pi, then use commands such as:
