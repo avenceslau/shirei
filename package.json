@@ -1,0 +1,9 @@
+{
+  "name": "shirei-pi",
+  "private": true,
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./integrations/pi/shirei.ts"],
+    "skills": ["./integrations/pi/skills"]
+  }
+}
