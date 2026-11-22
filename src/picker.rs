@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::config::{expand_tilde, Config};
+use crate::rex::SplitDirection;
 use crate::session::{self, Backend, Session};
 use crate::state::{StackBranch, State};
 
@@ -227,7 +228,13 @@ fn push_dir_row(
     true
 }
 
-pub fn pick(rows: &[Row]) -> Result<Option<usize>> {
+pub struct Selection {
+    pub index: usize,
+    /// Enter opens a split to the right; Alt+Enter opens one below.
+    pub split_direction: SplitDirection,
+}
+
+pub fn pick(rows: &[Row]) -> Result<Option<Selection>> {
     if rows.is_empty() {
         return Ok(None);
     }
@@ -247,6 +254,8 @@ pub fn pick(rows: &[Row]) -> Result<Option<usize>> {
             "2..",
             "--tiebreak",
             "begin,index",
+            "--expect",
+            "alt-enter",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -271,7 +280,17 @@ pub fn pick(rows: &[Row]) -> Result<Option<usize>> {
         return Ok(None);
     }
     let selected = String::from_utf8(output.stdout).context("fzf returned invalid utf-8")?;
-    let Some(first) = selected.split('\t').next().map(str::trim) else {
+    // --expect prints the accepting key (empty for Enter) on the line before the row.
+    let mut lines = selected.lines();
+    let split_direction = match lines.next() {
+        Some("alt-enter") => SplitDirection::Below,
+        _ => SplitDirection::Right,
+    };
+    let Some(first) = lines
+        .next()
+        .and_then(|row| row.split('\t').next())
+        .map(str::trim)
+    else {
         return Ok(None);
     };
     let Ok(idx) = first.parse::<usize>() else {
@@ -280,5 +299,8 @@ pub fn pick(rows: &[Row]) -> Result<Option<usize>> {
     if idx >= rows.len() {
         return Err(anyhow!("fzf returned out-of-range row id: {idx}"));
     }
-    Ok(Some(idx))
+    Ok(Some(Selection {
+        index: idx,
+        split_direction,
+    }))
 }
