@@ -414,8 +414,8 @@ run_install_on_create = true
 checkout_exclude = [".dev.vars*", ".env*"]
 
 [review]
-private_hosts = ["gitlab.corp.example"]
-extra_public_denylist = []
+private_hosts = ["gitlab.example.com"]
+public_denylist = ["acme-internal"]
 small_max_changed_lines = 100
 large_above_changed_lines = 800
 large_min_top_level_dirs = 3
@@ -436,8 +436,8 @@ Settings:
 | `worktree_exclude_prefixes` | Paths ignored by `shirei worktrees scan`. |
 | `run_install_on_create` | Run a detected install/build command when a worktree is created. |
 | `checkout_exclude` | gitignore-style patterns never written to new worktrees, through a non-cone sparse checkout. Useful when a sandbox refuses to write files such as `.dev.vars.example`. |
-| `review.private_hosts` | Forge hosts whose reviews are private. Reviews on other hosts are checked against the public denylist. |
-| `review.extra_public_denylist` | Terms added to the built-in public denylist. |
+| `review.private_hosts` | Forge hosts whose reviews are private. Reviews on other hosts are checked against `review.public_denylist`. |
+| `review.public_denylist` | Internal names rejected in review titles and bodies on public hosts (default empty). |
 | `review.*_changed_lines`, `review.large_min_top_level_dirs` | How `pr create` sizes a change as small, medium, or large. |
 | `review.*_max_words` | Prose word budgets of review bodies by change size. |
 
@@ -514,7 +514,7 @@ Shirei produces the deterministic parts of a review and checks the rest, in the 
 
 - **Stack links.** On a tracked stack branch, the body gets the managed links block (position such as `2 of 4`, previous, next, and merge order), and the same block is refreshed on every open review in the stack. A body with its own `Stack` or `Stack position` heading is rejected rather than edited, so the author learns to leave it out and no prose is removed silently.
 - **Ticket prefix.** When at least half of the last 20 titles on the remote's default branch start with `KEY-NNNN:` (or `shirei.ticketPrefix` names the key), the ticket from the branch name or the commits is prepended to the title, and an all-zero placeholder such as `ABC-000` is replaced.
-- **Public scrub.** On hosts outside `review.private_hosts`, a title or body containing a denylisted internal name is rejected with every hit listed.
+- **Public scrub.** On hosts outside `review.private_hosts`, a title or body containing a term from `review.public_denylist` is rejected with every hit listed.
 - **Word budget.** The change against the base is small (at most 100 changed lines), large (over 800 lines or 3 or more top-level directories), or medium; bodies over 80, 200, or 350 prose words are rejected. Fenced code and the stack links block do not count.
 
 Run `shirei pr create --dry-run` to validate and print the planned branch, commit, remote, push, final title and body, word count, and stack position without pushing or contacting `gh` or `glab`. The terminal command keeps title and body optional. In Pi, `shirei_pr_create` asks the agent for a short title and description following the `pr-description` skill, previews them, and rejects the operation if the confirmed branch, commit, or remote changes before creation.
