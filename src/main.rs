@@ -443,8 +443,11 @@ fn run_picker(split_beside: Option<&str>) -> Result<()> {
     let Some(selection) = picker::pick(&rows)? else {
         return Ok(());
     };
+    let row = rows
+        .get(selection.index)
+        .context("picker returned an out-of-range row index")?;
     apply_selection(
-        &rows[selection.index],
+        row,
         selection.split_direction,
         split_beside,
         &cfg,

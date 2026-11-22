@@ -230,7 +230,6 @@ fn push_dir_row(
 
 pub struct Selection {
     pub index: usize,
-    /// Enter opens a split to the right; Alt+Enter opens one below.
     pub split_direction: SplitDirection,
 }
 
