@@ -240,7 +240,7 @@ Shirei writes the deterministic parts of a review and rejects bodies that break 
 
 - Stack navigation: on a tracked stack branch Shirei adds the managed links block (position, previous, next, merge order) and refreshes it on every open review in the stack. A body with its own `Stack` or `Stack position` heading is rejected.
 - Ticket prefix: when recent titles use `KEY-NNNN:` (for example `ABC-1725:`), Shirei prepends the ticket from the branch name or commits and replaces `ABC-000`.
-- Public scrub: on hosts other than `gitlab.corp.example`, titles and bodies naming internal systems are rejected with the hits listed.
+- Public scrub: on hosts outside `review.private_hosts`, titles and bodies containing a `review.public_denylist` term are rejected with the hits listed.
 - Word budget: bodies over 80/200/350 prose words for small/medium/large changes are rejected with the count and budget.
 
 An existing open review targeting the selected base is reused without overwriting its title, body, or draft state. Reviews targeting other branches are left untouched, and closed or merged reviews do not block a new review.
@@ -332,8 +332,8 @@ run_install_on_create = true
 checkout_exclude = [".dev.vars*", ".env*"]
 
 [review]
-private_hosts = ["gitlab.corp.example"]
-extra_public_denylist = []
+private_hosts = ["gitlab.example.com"]
+public_denylist = ["acme-internal"]
 small_max_words = 80
 medium_max_words = 200
 large_max_words = 350

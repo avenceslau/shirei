@@ -105,19 +105,6 @@ pub fn prose_word_count(body: &str) -> usize {
 const STACK_LINKS_START: &str = "<!-- shirei-stack-links:start -->";
 const STACK_LINKS_END: &str = "<!-- shirei-stack-links:end -->";
 
-/// Internal names that must not appear in reviews on public hosts.
-pub const PUBLIC_DENYLIST: &[&str] = &[
-    "acme",
-    "acme-runner",
-    "runner",
-    "acme-loadtests",
-    "corp.example",
-    "preview.example.com",
-    "rocket",
-    "sprinkles",
-    "rocket",
-];
-
 pub fn is_public_host(host: &str, private_hosts: &[String]) -> bool {
     !private_hosts
         .iter()
@@ -264,14 +251,14 @@ mod tests {
 
     #[test]
     fn finds_denylisted_terms_on_word_boundaries() {
-        let terms: Vec<String> = PUBLIC_DENYLIST
+        let terms: Vec<String> = ["acme", "acme-runner", "runner", "corp.example", "rocket"]
             .iter()
             .map(|term| term.to_string())
             .collect();
         assert_eq!(
             public_review_hits(
                 Some("Fix Acme hook"),
-                Some("Runs in acme-runner\nrunners is fine\nsee x.corp.example"),
+                Some("Runs in acme-runner\nrunners are fine\nsee x.corp.example"),
                 &terms
             ),
             [
@@ -287,7 +274,10 @@ mod tests {
             "GitLab.corp.example",
             &["gitlab.corp.example".into()]
         ));
-        assert!(is_public_host("github.com", &["gitlab.corp.example".into()]));
+        assert!(is_public_host(
+            "github.com",
+            &["gitlab.corp.example".into()]
+        ));
     }
 
     #[test]

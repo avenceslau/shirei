@@ -481,6 +481,18 @@ fn pr_create_rejects_internal_names_only_on_public_hosts() {
         "Found by acme-loadtests.\nNothing else.\nRuns on Rocket",
     ];
 
+    let unconfigured = run_shirei(&test, &args);
+    assert!(
+        unconfigured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unconfigured.stderr)
+    );
+
+    fs::write(
+        &test.config,
+        "[review]\nprivate_hosts = [\"gitlab.corp.example\"]\npublic_denylist = [\"acme\", \"acme-loadtests\", \"rocket\"]\n",
+    )
+    .unwrap();
     let output = run_shirei(&test, &args);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -488,14 +500,6 @@ fn pr_create_rejects_internal_names_only_on_public_hosts() {
     assert!(stderr.contains("title: acme"), "{stderr}");
     assert!(stderr.contains("body line 1: acme-loadtests"), "{stderr}");
     assert!(stderr.contains("body line 3: rocket"), "{stderr}");
-
-    fs::write(
-        &test.config,
-        "[review]\nextra_public_denylist = [\"hook\"]\n",
-    )
-    .unwrap();
-    let extended = run_shirei(&test, &args);
-    assert!(String::from_utf8_lossy(&extended.stderr).contains("title: hook"));
 
     git(
         &test.repo,
