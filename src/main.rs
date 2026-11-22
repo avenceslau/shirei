@@ -40,7 +40,12 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Open the picker (default when no subcommand is given).
-    Pick,
+    Pick {
+        /// With `rex_picker_split`, open splits beside this Rex block instead of
+        /// the picker's own, such as the block that opened a floating picker.
+        #[arg(long, value_name = "BLOCK")]
+        split_beside: Option<String>,
+    },
     /// Create or attach a git worktree for a branch and open a session.
     Branch {
         /// Branch name. If omitted, opens an fzf picker over local + remote branches.
@@ -263,8 +268,8 @@ enum WorktreesCmd {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    match args.cmd.unwrap_or(Cmd::Pick) {
-        Cmd::Pick => run_picker(),
+    match args.cmd.unwrap_or(Cmd::Pick { split_beside: None }) {
+        Cmd::Pick { split_beside } => run_picker(split_beside.as_deref()),
         Cmd::Branch {
             name,
             base,
@@ -426,7 +431,7 @@ fn collect_command_capabilities(
     }
 }
 
-fn run_picker() -> Result<()> {
+fn run_picker(split_beside: Option<&str>) -> Result<()> {
     let cfg = config::load()?;
     let backend = Backend::from(cfg.backend);
     let mut state = state::load()?;
@@ -435,20 +440,37 @@ fn run_picker() -> Result<()> {
         eprintln!("Nothing to show. Try `shirei branch <name>` to create a worktree session.");
         return Ok(());
     }
-    let Some(idx) = picker::pick(&rows)? else {
+    let Some(selection) = picker::pick(&rows)? else {
         return Ok(());
     };
-    apply_selection(&rows[idx], &cfg, backend, &mut state)
+    let row = rows
+        .get(selection.index)
+        .context("picker returned an out-of-range row index")?;
+    apply_selection(
+        row,
+        selection.split_direction,
+        split_beside,
+        &cfg,
+        backend,
+        &mut state,
+    )
 }
 
-fn apply_selection(row: &Row, cfg: &Config, backend: Backend, state: &mut State) -> Result<()> {
+fn apply_selection(
+    row: &Row,
+    split_direction: rex::SplitDirection,
+    split_beside: Option<&str>,
+    cfg: &Config,
+    backend: Backend,
+    state: &mut State,
+) -> Result<()> {
     match &row.target {
         Target::ActivateSession(id) => {
             backend.activate(id)?;
         }
         Target::OpenDir { path, name_hint } => {
             if matches!(backend, Backend::Rex) && cfg.rex_picker_split {
-                rex::open_directory_split(path)?;
+                rex::open_directory_split(path, split_beside, split_direction)?;
             } else {
                 open_session(backend, path, name_hint, None)?;
             }

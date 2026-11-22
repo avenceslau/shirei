@@ -192,10 +192,46 @@ backend = "rex"
 rex_picker_split = true
 ```
 
-In this mode the picker shows directories, not live sessions. Selecting a
-folder opens a focused split beside the picker; the temporary picker pane can
-then close. It requires running inside Rex but does not need Remote Control.
-Branch commands and `shirei sessions` keep their normal session-based behavior.
+In this mode the picker shows directories, not live sessions. Enter opens a
+focused split to the right of the picker and Alt+Enter opens one below it; the
+temporary picker pane can then close. It requires running inside Rex but does
+not need Remote Control. Branch commands and `shirei sessions` keep their
+normal session-based behavior.
+
+To run the picker in a floating layer, open the split beside the block that
+launched it with `shirei pick --split-beside BLOCK`. This `init.lua` binds
+`ctrl+a>f` to a floating picker, and makes Shift+Enter in that picker act as
+Alt+Enter, because fzf cannot tell Shift+Enter from Enter:
+
+```lua
+rex.action{
+  name = "shirei_float",
+  title = "Shirei in Floating Layer",
+  run = function(ctx)
+    local layer, err = rex.session.new_layer{
+      bounds = { 0.15, 0.1, 0.7, 0.8 },
+      focus = true,
+      layout = rex.layout.block{
+        flavor = "com.superlogical.terminal.shell",
+        label = "shirei",
+        options = { command = { "shirei", "pick", "--split-beside", ctx.block_id } },
+      },
+    }
+    if err ~= nil then error(err, 0) end
+    return layer
+  end,
+}
+rex.bind("ctrl+a>f", "shirei_float")
+
+rex.bind("shift+enter", function(ctx)
+  local described = rex.session.describe_block{ block_id = ctx.block_id }
+  if described == nil or described.block.label ~= "shirei" then
+    return false
+  end
+  rex.block.call("com.superlogical.terminal", "write", { block_id = ctx.block_id, data = "\27\r" })
+  return true
+end)
+```
 
 ## Common Workflows
 

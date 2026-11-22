@@ -47,7 +47,8 @@ impl Picker {
         );
         executable(
             &bin.join("fzf"),
-            "#!/bin/sh\nif [ \"${SHIREI_TEST_CANCEL:-0}\" = 1 ]; then exit 130; fi\nhead -n 1\n",
+            // Mimics `--expect`: the accepting key, empty for Enter, precedes the row.
+            "#!/bin/sh\nif [ \"${SHIREI_TEST_CANCEL:-0}\" = 1 ]; then exit 130; fi\nprintf '%s\\n' \"$SHIREI_TEST_KEY\"\nhead -n 1\n",
         );
         Self {
             _temp: temp,
@@ -70,6 +71,7 @@ impl Picker {
             .env("SHIREI_TEST_REX_LOG", &self.log)
             .env("SHIREI_TEST_REX_EXIT", "0")
             .env("SHIREI_TEST_CANCEL", "0")
+            .env("SHIREI_TEST_KEY", "")
             .env("REX_SESSION", "session:test")
             .env("REX_BLOCK", "block:picker")
             .env(
@@ -100,13 +102,32 @@ fn folder_selection_opens_a_split_without_switching_or_creating_sessions() {
     assert_eq!(
         fs::read_to_string(&picker.log).unwrap(),
         format!(
-            "split\n--session\nsession:test\n--block\nblock:picker\n--cwd\n{}\n--json\n",
+            "split\n--session\nsession:test\n--block\nblock:picker\n--split\nright\n--cwd\n{}\n--json\n",
             picker.folder.display()
         )
     );
     let state: serde_json::Value =
         serde_json::from_slice(&fs::read(picker.state.join("state.json")).unwrap()).unwrap();
     assert_eq!(state["recent"][0]["path"], picker.folder.to_str().unwrap());
+}
+
+#[test]
+fn alt_enter_opens_the_split_below_the_given_block() {
+    let picker = Picker::new();
+    let output = picker
+        .command()
+        .args(["--split-beside", "block:origin"])
+        .env("SHIREI_TEST_KEY", "alt-enter")
+        .output()
+        .unwrap();
+    picker.assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(&picker.log).unwrap(),
+        format!(
+            "split\n--session\nsession:test\n--block\nblock:origin\n--split\nbelow\n--cwd\n{}\n--json\n",
+            picker.folder.display()
+        )
+    );
 }
 
 #[test]

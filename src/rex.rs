@@ -105,20 +105,44 @@ pub fn create_session(name: &str, path: &Path) -> Result<String> {
     Ok(response.session_id)
 }
 
-/// Open a shell beside the picker; no Rex.app action or Remote Control is needed.
-pub fn open_directory_split(path: &Path) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitDirection {
+    Right,
+    Below,
+}
+
+impl SplitDirection {
+    fn as_arg(self) -> &'static str {
+        match self {
+            SplitDirection::Right => "right",
+            SplitDirection::Below => "below",
+        }
+    }
+}
+
+/// Open a shell in a split; no Rex.app action or Remote Control is needed.
+pub fn open_directory_split(
+    path: &Path,
+    anchor_block: Option<&str>,
+    direction: SplitDirection,
+) -> Result<()> {
     let session = std::env::var("REX_SESSION")
         .ok()
         .filter(|id| !id.is_empty())
         .context("rex_picker_split requires running Shirei inside a Rex terminal")?;
+    let anchor_block = anchor_block
+        .filter(|block| !block.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("REX_BLOCK").ok())
+        .filter(|block| !block.is_empty());
+
     let mut command = Command::new("rex");
     command.args(["split", "--session", &session]);
-    if let Ok(block) = std::env::var("REX_BLOCK") {
-        if !block.is_empty() {
-            command.args(["--block", &block]);
-        }
+    if let Some(block) = &anchor_block {
+        command.args(["--block", block]);
     }
     let output = command
+        .args(["--split", direction.as_arg()])
         .arg("--cwd")
         .arg(path)
         .arg("--json")
