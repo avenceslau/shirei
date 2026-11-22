@@ -120,8 +120,7 @@ impl SplitDirection {
     }
 }
 
-/// Open a shell beside `anchor_block`, or beside the picker's own block when it
-/// is `None`; no Rex.app action or Remote Control is needed.
+/// Open a shell in a split; no Rex.app action or Remote Control is needed.
 pub fn open_directory_split(
     path: &Path,
     anchor_block: Option<&str>,
@@ -134,11 +133,8 @@ pub fn open_directory_split(
     let anchor_block = anchor_block
         .filter(|block| !block.is_empty())
         .map(str::to_string)
-        .or_else(|| {
-            std::env::var("REX_BLOCK")
-                .ok()
-                .filter(|block| !block.is_empty())
-        });
+        .or_else(|| std::env::var("REX_BLOCK").ok())
+        .filter(|block| !block.is_empty());
 
     let mut command = Command::new("rex");
     command.args(["split", "--session", &session]);
