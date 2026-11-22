@@ -57,7 +57,14 @@ pub fn build_rows(state: &State, cfg: &Config, backend: Backend) -> Result<Vec<R
     let mut seen_session_names: HashSet<String> = HashSet::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
 
-    for session in backend.list()? {
+    // Split mode is a directory picker: live sessions would still switch Rex.app
+    // and hide their directories from the later sections.
+    let sessions = if matches!(backend, Backend::Rex) && cfg.rex_picker_split {
+        Vec::new()
+    } else {
+        backend.list()?
+    };
+    for session in sessions {
         let Session { id, name, path, .. } = &session;
         rows.push(Row {
             section: Section::Session,

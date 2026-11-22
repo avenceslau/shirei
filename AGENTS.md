@@ -1,6 +1,6 @@
 # AGENTS
 
-shirei is a single-crate Rust CLI that drives `tmux` or `herdr`, plus `git` and `fzf`.
+shirei is a single-crate Rust CLI that drives `tmux`, `herdr`, or `rex`, plus `git` and `fzf`.
 No daemon, no database, no network. State is one JSON file under
 `~/.local/share/shirei/`.
 
@@ -13,7 +13,8 @@ No daemon, no database, no network. State is one JSON file under
 - `src/tmux.rs` — `list-sessions`, `new-session -d`,
   `switch-client` / `attach-session`, session-name sanitization
 - `src/herdr.rs` — workspace listing, creation, focus, close, and setup tabs
-- `src/session.rs` — backend-neutral session model and tmux/Herdr dispatch
+- `src/rex.rs` — session listing, creation, app selection, close, and setup windows
+- `src/session.rs` — backend-neutral session model and backend dispatch
 - `src/git.rs` — `repo_root`, `list_branches`, `create_worktree`
   (shells out to `git`)
 - `src/state.rs` — JSON state load/save, MRU touch, worktree dedup,
@@ -47,5 +48,6 @@ cargo test
 Integration tests in `tests/` run the built binary against temp git repos with
 `SHIREI_STATE_DIR` and `SHIREI_CONFIG` pointing at temp paths, and fake `gh`,
 `glab`, `git push`, `tmux`, and `herdr` executables on `PATH`. Never point a test
-at the real state or config. Interactive flows (picker, branch picker) are
-smoke-tested by hand via `prefix + f` in tmux.
+at the real state or config. Backend JSON contracts have unit coverage.
+Interactive flows (picker and branch picker) are smoke-tested by hand in the
+configured terminal backend.
