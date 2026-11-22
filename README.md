@@ -1,7 +1,8 @@
 # shirei
 
 `shirei` is a small terminal session switcher for people who jump between many
-projects and git worktrees. It supports tmux sessions and Herdr workspaces.
+projects and git worktrees. It supports tmux sessions, Herdr workspaces, and Rex
+sessions.
 
 It gives you one `fzf` picker for:
 
@@ -17,7 +18,7 @@ new session in that directory.
 
 `shirei` shells out to existing tools. Install these first:
 
-- `tmux` or `herdr`
+- `tmux`, `herdr`, or `rex`
 - `git`
 - `fzf`
 
@@ -144,8 +145,9 @@ press Enter, then select its base branch.
 ## Herdr Binding
 
 With Herdr, set `backend = "herdr"` and run `shirei` from a Herdr pane or a
-normal shell. Shirei maps projects to Herdr workspaces. From a normal shell it
-starts the Herdr server when needed and attaches after selecting a workspace.
+normal shell. Shirei maps projects to Herdr workspaces and names new workspaces
+after the final directory component. From a normal shell it starts the Herdr
+server when needed and attaches after selecting a workspace.
 
 Add a command binding to `~/.config/herdr/config.toml`:
 
@@ -170,6 +172,30 @@ the command bindings:
 [keys]
 prefix = "ctrl+a"
 ```
+
+## Rex
+
+With Rex, set `backend = "rex"` and run `shirei` from a Rex terminal. Shirei
+maps directories to Rex sessions, creates new sessions with a terminal window,
+and switches Rex.app to the selected session. Enable **Remote Control** under
+Rex Server in Rex.app's settings so the CLI can perform `session.select`.
+
+Shirei targets the Rex.app client that owns the current terminal. When run from
+a normal shell, Rex must have exactly one app client available for automatic
+selection. Setup commands run in an unfocused `install` window.
+
+To use the picker as a directory chooser that opens a shell in a split in the
+current Rex session instead, configure:
+
+```toml
+backend = "rex"
+rex_picker_split = true
+```
+
+In this mode the picker shows directories, not live sessions. Selecting a
+folder opens a focused split beside the picker; the temporary picker pane can
+then close. It requires running inside Rex but does not need Remote Control.
+Branch commands and `shirei sessions` keep their normal session-based behavior.
 
 ## Common Workflows
 
@@ -322,7 +348,8 @@ shirei worktrees unfinished
 
 Rows are grouped in this order:
 
-1. `SESSION`: live tmux sessions or Herdr workspaces. Tmux sessions are sorted by recent activity; Herdr preserves workspace order.
+1. `SESSION`: live tmux sessions, Herdr workspaces, or Rex sessions. Tmux
+   sessions are sorted by recent activity; Herdr and Rex preserve backend order.
 2. `STACK`: tracked stack branches that have registered worktrees, displayed as `branch base=<base>`.
 3. `RECENT`: directories opened recently through shirei.
 4. `WORKTREE`: tracked git worktrees.
@@ -365,7 +392,8 @@ Settings:
 
 | Setting | Description |
 | --- | --- |
-| `backend` | Session backend: `"tmux"` (default) or `"herdr"`. |
+| `backend` | Session backend: `"tmux"` (default), `"herdr"`, or `"rex"`. |
+| `rex_picker_split` | Open picker directories in a split in the current Rex session instead of switching sessions (default `false`). |
 | `roots` | Directory globs shown in the `ROOT` picker section. |
 | `recent_cap` | Maximum number of recent directories to keep. |
 | `worktree_root` | Parent directory for worktrees created by `shirei branch`. |
@@ -394,11 +422,11 @@ Override paths with environment variables:
 ## Worktree Setup Commands
 
 When `run_install_on_create` is `true`, a new worktree gets a detached tmux
-window or an unfocused Herdr tab named `install`. `--install=sync` runs the
-command in the foreground instead, sends its output to stderr, and exits non-zero
-when it fails (the worktree stays). `--install=none` skips it. Without a session
-(`--no-open`), background setup is skipped with a note. shirei runs the first
-matching command:
+window, an unfocused Herdr tab, or an unfocused Rex window named `install`.
+`--install=sync` runs the command in the foreground instead, sends its output to
+stderr, and exits non-zero when it fails (the worktree stays). `--install=none`
+skips it. Without a session (`--no-open`), background setup is skipped with a
+note. shirei runs the first matching command:
 
 1. `Makefile` with an `install:` target: `make install`
 2. `package.json`: package-manager-specific `install`

@@ -36,6 +36,53 @@ interface PendingStackRebase {
 	currentFiles?: string[];
 }
 
+async function rexClientForBlock(pi: ExtensionAPI) {
+	if (!process.env.REX_BLOCK) return undefined;
+	const result = await pi.exec("rex", ["block", "inspect", process.env.REX_BLOCK, "--json"], { timeout: 10_000 });
+	if (result.code !== 0) return undefined;
+	const value = JSON.parse(result.stdout) as { block?: { owner?: string } };
+	return value.block?.owner;
+}
+
+async function selectRexSession(pi: ExtensionAPI, session: string, client?: string) {
+	const args = client ? ["--client", client] : [];
+	args.push("do", "session.select", `session_id=${session}`);
+	return pi.exec("rex", args, { timeout: 10_000 });
+}
+
+async function findRexSessionByPath(pi: ExtensionAPI, target: string) {
+	const listed = await pi.exec("rex", ["ls", "--json"], { timeout: 10_000 });
+	if (listed.code !== 0) return undefined;
+	const value = JSON.parse(listed.stdout) as { sessions?: Array<{ session_id?: string }> };
+	for (const item of value.sessions ?? []) {
+		if (!item.session_id) continue;
+		const inspected = await pi.exec("rex", ["session", "inspect", item.session_id, "--json"], { timeout: 10_000 });
+		if (inspected.code !== 0) continue;
+		const view = JSON.parse(inspected.stdout) as {
+			windows?: Array<{ layers?: Array<{ blocks?: Array<{ block_id?: string; creator_name?: string }> }> }>;
+		};
+		const blocks = (view.windows ?? []).flatMap((window) =>
+			(window.layers ?? []).flatMap((layer) => layer.blocks ?? []),
+		);
+		for (const block of blocks) {
+			if (!block.block_id || block.creator_name !== "com.superlogical.terminal") continue;
+			const called = await pi.exec(
+				"rex",
+				["block", "call", "--session", item.session_id, "--block", block.block_id, "process"],
+				{ timeout: 10_000 },
+			);
+			if (called.code !== 0) continue;
+			const processValue = JSON.parse(called.stdout) as {
+				foreground?: { cwd?: string };
+				child?: { cwd?: string };
+			};
+			const cwd = processValue.foreground?.cwd ?? processValue.child?.cwd;
+			if (cwd && resolve(cwd) === target) return item.session_id;
+		}
+	}
+	return undefined;
+}
+
 const DEFAULT_REBASE_MODEL_ORDER = (process.env.SHIREI_REBASE_MODEL_ORDER ?? "")
 	.split(",")
 	.map((value) => value.trim())
@@ -695,19 +742,29 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			const backend = process.env.HERDR_WORKSPACE_ID ? "herdr" : process.env.TMUX ? "tmux" : undefined;
+			const backend = process.env.HERDR_WORKSPACE_ID
+				? "herdr"
+				: process.env.TMUX
+					? "tmux"
+					: process.env.REX_SESSION
+						? "rex"
+						: undefined;
 			if (!backend) {
-				throw new Error("shirei_handoff requires Pi to be running inside tmux or Herdr");
+				throw new Error("shirei_handoff requires Pi to be running inside tmux, Herdr, or Rex");
 			}
 			let sourceSession: string | undefined;
+			let sourceRexClient: string | undefined;
 			if (backend === "tmux") {
 				const current = await pi.exec("tmux", ["display-message", "-p", "#{session_name}"], { timeout: 10_000 });
 				if (current.code !== 0) {
 					throw new Error(current.stderr.trim() || "Unable to determine the current tmux session");
 				}
 				sourceSession = current.stdout.trim();
-			} else {
+			} else if (backend === "herdr") {
 				sourceSession = process.env.HERDR_WORKSPACE_ID;
+			} else {
+				sourceSession = process.env.REX_SESSION;
+				sourceRexClient = await rexClientForBlock(pi);
 			}
 
 			let branchResult;
@@ -720,8 +777,10 @@ export default function (pi: ExtensionAPI) {
 				if (sourceSession) {
 					if (backend === "tmux") {
 						await pi.exec("tmux", ["switch-client", "-t", sourceSession], { timeout: 10_000 }).catch(() => undefined);
-					} else {
+					} else if (backend === "herdr") {
 						await pi.exec("herdr", ["workspace", "focus", sourceSession], { timeout: 10_000 }).catch(() => undefined);
+					} else {
+						await selectRexSession(pi, sourceSession, sourceRexClient).catch(() => undefined);
 					}
 				}
 			}
@@ -823,7 +882,7 @@ export default function (pi: ExtensionAPI) {
 					);
 					if (launched.code !== 0) launchError = launched.stderr.trim() || "Unable to start Pi in tmux";
 				}
-			} else {
+			} else if (backend === "herdr") {
 				const snapshot = await pi.exec("herdr", ["api", "snapshot"], { timeout: 10_000 });
 				if (snapshot.code !== 0) {
 					launchError = snapshot.stderr.trim() || "Unable to read Herdr workspaces";
@@ -859,6 +918,18 @@ export default function (pi: ExtensionAPI) {
 							}
 						}
 					}
+				}
+			} else {
+				const destination = await findRexSessionByPath(pi, target);
+				if (!destination) {
+					launchError = `Unable to find the Rex session for ${target}`;
+				} else {
+					const launched = await pi.exec(
+						"rex",
+						["window", "new", "--session", destination, "--cwd", target, "--focus=false", "pi", "--", "pi"],
+						{ timeout: 10_000 },
+					);
+					if (launched.code !== 0) launchError = launched.stderr.trim() || "Unable to start Pi in Rex";
 				}
 			}
 
@@ -916,8 +987,8 @@ export default function (pi: ExtensionAPI) {
 			let commandArgs: string[];
 
 			if (parts[0] === "branch") {
-				if (!process.env.TMUX && !process.env.HERDR_ENV) {
-					ctx.ui.notify("/shirei branch requires Pi to be running inside tmux or Herdr", "warning");
+				if (!process.env.TMUX && !process.env.HERDR_ENV && !process.env.REX_SESSION) {
+					ctx.ui.notify("/shirei branch requires Pi to be running inside tmux, Herdr, or Rex", "warning");
 					return;
 				}
 				if (parts.length !== 2 && !(parts.length === 4 && (parts[2] === "--base" || parts[2] === "-b"))) {
@@ -941,8 +1012,8 @@ export default function (pi: ExtensionAPI) {
 				commandArgs = ["branch", branch, "--base", base, "--open"];
 			} else if (parts[0] === "stack") {
 				if (parts[1] === "branch") {
-					if (!process.env.TMUX && !process.env.HERDR_ENV) {
-						ctx.ui.notify("/shirei stack branch requires Pi to be running inside tmux or Herdr", "warning");
+					if (!process.env.TMUX && !process.env.HERDR_ENV && !process.env.REX_SESSION) {
+						ctx.ui.notify("/shirei stack branch requires Pi to be running inside tmux, Herdr, or Rex", "warning");
 						return;
 					}
 					if (parts.length !== 5 || !(parts[3] === "--base" || parts[3] === "-b")) {

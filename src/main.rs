@@ -5,6 +5,7 @@ mod herdr;
 mod install;
 mod picker;
 mod review;
+mod rex;
 mod session;
 mod stack;
 mod state;
@@ -446,7 +447,11 @@ fn apply_selection(row: &Row, cfg: &Config, backend: Backend, state: &mut State)
             backend.activate(id)?;
         }
         Target::OpenDir { path, name_hint } => {
-            open_session(backend, path, name_hint, None)?;
+            if matches!(backend, Backend::Rex) && cfg.rex_picker_split {
+                rex::open_directory_split(path)?;
+            } else {
+                open_session(backend, path, name_hint, None)?;
+            }
             state.touch_recent(path, cfg.recent_cap);
             state::save(state)?;
         }

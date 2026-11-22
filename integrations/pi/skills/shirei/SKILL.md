@@ -1,12 +1,12 @@
 ---
 name: shirei
-description: Use the Shirei terminal session manager and its worktree-aware project switching and review workflows. Load when opening or listing Shirei sessions, creating branch worktrees, creating standalone PRs or MRs, managing stacked PRs, cascade rebasing stack branches, finding unfinished worktrees, interactively deleting worktrees, scanning Shirei state, generating shell completions, configuring tmux or Herdr, or troubleshooting the shirei CLI.
-compatibility: Requires shirei and one configured backend (tmux or Herdr); interactive commands also require fzf. Review creation, unfinished-review detection, and stack submit require authenticated gh >= 2.40.0 or glab >= 1.50.0.
+description: Use the Shirei terminal session manager and its worktree-aware project switching and review workflows. Load when opening or listing Shirei sessions, creating branch worktrees, creating standalone PRs or MRs, managing stacked PRs, cascade rebasing stack branches, finding unfinished worktrees, interactively deleting worktrees, scanning Shirei state, generating shell completions, configuring tmux, Herdr, or Rex, or troubleshooting the shirei CLI.
+compatibility: Requires shirei and one configured backend (tmux, Herdr, or Rex); interactive commands also require fzf. Review creation, unfinished-review detection, and stack submit require authenticated gh >= 2.40.0 or glab >= 1.50.0.
 ---
 
 # Shirei CLI
 
-Shirei is a terminal session manager with worktree-aware directory tracking. It combines live tmux sessions or Herdr workspaces, recent directories, registered Git worktrees, and configured project roots in one picker.
+Shirei is a terminal session manager with worktree-aware directory tracking. It combines live tmux sessions, Herdr workspaces, or Rex sessions with recent directories, registered Git worktrees, and configured project roots in one picker.
 
 ## Retrieve Current Behavior First
 
@@ -33,6 +33,7 @@ When working in the Shirei source repository, read `README.md` and the relevant 
 | Backend abstraction | `src/session.rs` |
 | tmux | `src/tmux.rs` |
 | Herdr | `src/herdr.rs` |
+| Rex | `src/rex.rs` |
 | Automatic project setup | `src/install.rs` |
 | Pi extension | `integrations/pi/shirei.ts` |
 
@@ -131,7 +132,7 @@ Without `NAME`, Shirei opens a branch picker. For a new named branch without `--
 - Create a Git branch and linked worktree
 - Create directories below `worktree_root`
 - Update Shirei worktree and recent state
-- Create or reuse a tmux session or Herdr workspace (not with `--no-open`)
+- Create or reuse a tmux session, Herdr workspace, or Rex session (not with `--no-open`)
 - Switch or attach the user's terminal client (not with `--no-open`)
 - Run repository-controlled setup commands when `run_install_on_create = true` or `--install=sync`
 
@@ -159,7 +160,7 @@ List sessions:
 shirei sessions
 ```
 
-The configured backend is tmux or Herdr. The leading `*` marks the attached tmux session or focused Herdr workspace.
+The configured backend is tmux, Herdr, or Rex. The leading `*` marks the current backend session or workspace.
 
 Close sessions:
 
@@ -296,7 +297,7 @@ Supported examples:
 /shirei stack submit --branch feature/ui --dry-run
 ```
 
-`/shirei branch` and `/shirei stack branch` require Pi to run inside tmux or Herdr and open the session (`--open`). `/shirei worktrees prune` is intentionally blocked because prune requires an interactive terminal. Only the `/shirei stack submit` slash command requires `--dry-run`; Pi does not block running `shirei stack submit` through bash. For LLM-assisted cascade rebases, use the `shirei_stack_rebase_assist` tool rather than a plain `/shirei stack rebase` command.
+`/shirei branch` and `/shirei stack branch` require Pi to run inside tmux, Herdr, or Rex and open the session (`--open`). `/shirei worktrees prune` is intentionally blocked because prune requires an interactive terminal. Only the `/shirei stack submit` slash command requires `--dry-run`; Pi does not block running `shirei stack submit` through bash. For LLM-assisted cascade rebases, use the `shirei_stack_rebase_assist` tool rather than a plain `/shirei stack rebase` command.
 
 The extension also registers `shirei_pr_create`. Use it for standalone PR/MR creation instead of invoking forge CLIs directly. It requires a short title and body that follow the `pr-description` skill, accepts an optional repository, base, and draft flag, runs `shirei pr create --dry-run`, shows the final review in the preview, and offers Create, Create as draft, or Cancel with a note before pushing or creating it. Calls run one at a time.
 
@@ -365,7 +366,7 @@ type = "pane"
 command = "shirei"
 ```
 
-Inside tmux, Shirei switches clients; outside tmux, it attaches and may block until detachment. Herdr behaves similarly.
+For Rex, set `backend = "rex"` and run `shirei` in a Rex terminal. Set `rex_picker_split = true` to make picker directory selections open a shell in a split in the current session, without Remote Control. Otherwise enable Remote Control under Rex Server in Rex.app's settings to switch sessions. Inside tmux, Shirei switches clients; outside tmux, it attaches and may block until detachment. Herdr behaves similarly, while Rex selects the session in Rex.app.
 
 ## Agent Safety Rules
 

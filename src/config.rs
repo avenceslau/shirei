@@ -9,12 +9,16 @@ pub enum BackendKind {
     #[default]
     Tmux,
     Herdr,
+    Rex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub backend: BackendKind,
+    /// Open picker directories in the current Rex session instead of switching sessions.
+    #[serde(default)]
+    pub rex_picker_split: bool,
     #[serde(default = "default_roots")]
     pub roots: Vec<String>,
     #[serde(default = "default_recent_cap")]
@@ -73,6 +77,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             backend: BackendKind::default(),
+            rex_picker_split: false,
             roots: default_roots(),
             recent_cap: default_recent_cap(),
             worktree_root: default_worktree_root(),
@@ -154,5 +159,18 @@ mod tests {
     fn backend_accepts_herdr() {
         let config: Config = toml::from_str("backend = \"herdr\"").unwrap();
         assert!(matches!(config.backend, BackendKind::Herdr));
+    }
+
+    #[test]
+    fn backend_accepts_rex() {
+        let config: Config = toml::from_str("backend = \"rex\"").unwrap();
+        assert!(matches!(config.backend, BackendKind::Rex));
+        assert!(!config.rex_picker_split);
+    }
+
+    #[test]
+    fn rex_picker_split_is_opt_in() {
+        let config: Config = toml::from_str("backend = \"rex\"\nrex_picker_split = true").unwrap();
+        assert!(config.rex_picker_split);
     }
 }
