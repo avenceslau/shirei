@@ -264,13 +264,19 @@ pub fn pick(rows: &[Row]) -> Result<Option<Selection>> {
     {
         let stdin = child.stdin.as_mut().context("failed to open fzf stdin")?;
         for (idx, row) in rows.iter().enumerate() {
-            writeln!(
+            let written = writeln!(
                 stdin,
                 "{idx}\t{}{:<8}\x1b[0m {}",
                 row.section.ansi(),
                 row.section.label(),
                 row.display
-            )?;
+            );
+            // fzf closes its input when it exits before reading every row, such as
+            // when the picker is cancelled; its exit status decides the outcome.
+            match written {
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break,
+                result => result?,
+            }
         }
     }
 
