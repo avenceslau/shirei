@@ -32,14 +32,6 @@ impl Picker {
         let folder = root.join("project with spaces");
         fs::create_dir(&bin).unwrap();
         fs::create_dir(&folder).unwrap();
-        fs::write(
-            &config,
-            format!(
-                "backend = \"rex\"\nrex_picker_split = true\nroots = [{}]\n",
-                toml::Value::String(folder.to_string_lossy().into_owned())
-            ),
-        )
-        .unwrap();
         // Any session listing, creation, app action, or window creation fails.
         executable(
             &bin.join("rex"),
@@ -50,7 +42,7 @@ impl Picker {
             // Mimics `--expect`: the accepting key, empty for Enter, precedes the row.
             "#!/bin/sh\nif [ \"${SHIREI_TEST_CANCEL:-0}\" = 1 ]; then exit 130; fi\nprintf '%s\\n' \"$SHIREI_TEST_KEY\"\nhead -n 1\n",
         );
-        Self {
+        let picker = Self {
             _temp: temp,
             root,
             config,
@@ -58,7 +50,20 @@ impl Picker {
             bin,
             log,
             folder,
-        }
+        };
+        picker.write_config(&picker.folder.to_string_lossy());
+        picker
+    }
+
+    fn write_config(&self, root: &str) {
+        fs::write(
+            &self.config,
+            format!(
+                "backend = \"rex\"\nrex_picker_split = true\nroots = [{}]\n",
+                toml::Value::String(root.to_string())
+            ),
+        )
+        .unwrap();
     }
 
     fn command(&self) -> Command {
@@ -163,4 +168,24 @@ fn cancelling_the_picker_does_not_open_a_split() {
     picker.assert_success(&output);
     assert!(!picker.log.exists());
     assert!(!picker.state.join("state.json").exists());
+}
+
+#[test]
+fn cancelling_before_fzf_reads_every_row_is_not_an_error() {
+    let picker = Picker::new();
+    let projects = picker.root.join("projects");
+    // More rows than a pipe buffer holds, so writing them outlives the cancelled fzf.
+    for index in 0..2000 {
+        fs::create_dir_all(projects.join(format!("project-{index:04}"))).unwrap();
+    }
+    picker.write_config(&format!("{}/*", projects.display()));
+
+    let output = picker
+        .command()
+        .env("SHIREI_TEST_CANCEL", "1")
+        .output()
+        .unwrap();
+
+    picker.assert_success(&output);
+    assert!(!picker.log.exists());
 }
