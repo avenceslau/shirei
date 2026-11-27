@@ -32,10 +32,10 @@ impl Picker {
         let folder = root.join("project with spaces");
         fs::create_dir(&bin).unwrap();
         fs::create_dir(&folder).unwrap();
-        // Any session listing, creation, app action, or window creation fails.
+        // Any rex command other than a split or a new window fails.
         executable(
             &bin.join("rex"),
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$SHIREI_TEST_REX_LOG\"\n[ \"$1\" = split ] || exit 99\nexit \"${SHIREI_TEST_REX_EXIT:-0}\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$SHIREI_TEST_REX_LOG\"\ncase \"$1\" in split|window) ;; *) exit 99 ;; esac\nexit \"${SHIREI_TEST_REX_EXIT:-0}\"\n",
         );
         executable(
             &bin.join("fzf"),
@@ -130,6 +130,24 @@ fn alt_enter_opens_the_split_below_the_given_block() {
         fs::read_to_string(&picker.log).unwrap(),
         format!(
             "split\n--session\nsession:test\n--block\nblock:origin\n--split\nbelow\n--cwd\n{}\n--json\n",
+            picker.folder.display()
+        )
+    );
+}
+
+#[test]
+fn alt_t_opens_the_folder_in_a_new_tab() {
+    let picker = Picker::new();
+    let output = picker
+        .command()
+        .env("SHIREI_TEST_KEY", "alt-t")
+        .output()
+        .unwrap();
+    picker.assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(&picker.log).unwrap(),
+        format!(
+            "window\nnew\n--session\nsession:test\n--cwd\n{}\n--json\n",
             picker.folder.display()
         )
     );

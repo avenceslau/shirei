@@ -106,30 +106,24 @@ pub fn create_session(name: &str, path: &Path) -> Result<String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SplitDirection {
-    Right,
-    Below,
+pub enum Placement {
+    SplitRight,
+    SplitBelow,
+    Tab,
 }
 
-impl SplitDirection {
-    fn as_arg(self) -> &'static str {
-        match self {
-            SplitDirection::Right => "right",
-            SplitDirection::Below => "below",
-        }
-    }
-}
-
-/// Open a shell in a split; no Rex.app action or Remote Control is needed.
-pub fn open_directory_split(
-    path: &Path,
-    anchor_block: Option<&str>,
-    direction: SplitDirection,
-) -> Result<()> {
+/// Open a shell in a split or a new tab of the current session; no Rex.app
+/// action or Remote Control is needed.
+pub fn open_directory(path: &Path, anchor_block: Option<&str>, placement: Placement) -> Result<()> {
     let session = std::env::var("REX_SESSION")
         .ok()
         .filter(|id| !id.is_empty())
         .context("rex_picker_split requires running Shirei inside a Rex terminal")?;
+    let direction = match placement {
+        Placement::SplitRight => "right",
+        Placement::SplitBelow => "below",
+        Placement::Tab => return open_window(&session, path),
+    };
     let anchor_block = anchor_block
         .filter(|block| !block.is_empty())
         .map(str::to_string)
@@ -142,13 +136,23 @@ pub fn open_directory_split(
         command.args(["--block", block]);
     }
     let output = command
-        .args(["--split", direction.as_arg()])
+        .args(["--split", direction])
         .arg("--cwd")
         .arg(path)
         .arg("--json")
         .output()
         .context("failed to run `rex split`; is rex installed?")?;
     ensure_success(output, "rex split")
+}
+
+fn open_window(session: &str, path: &Path) -> Result<()> {
+    let output = Command::new("rex")
+        .args(["window", "new", "--session", session, "--cwd"])
+        .arg(path)
+        .arg("--json")
+        .output()
+        .context("failed to run `rex window new`; is rex installed?")?;
+    ensure_success(output, "rex window new")
 }
 
 pub fn select_session(id: &str) -> Result<()> {
