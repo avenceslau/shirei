@@ -448,7 +448,7 @@ fn run_picker(split_beside: Option<&str>) -> Result<()> {
         .context("picker returned an out-of-range row index")?;
     apply_selection(
         row,
-        selection.split_direction,
+        selection.placement,
         split_beside,
         &cfg,
         backend,
@@ -458,7 +458,7 @@ fn run_picker(split_beside: Option<&str>) -> Result<()> {
 
 fn apply_selection(
     row: &Row,
-    split_direction: rex::SplitDirection,
+    placement: rex::Placement,
     split_beside: Option<&str>,
     cfg: &Config,
     backend: Backend,
@@ -470,7 +470,7 @@ fn apply_selection(
         }
         Target::OpenDir { path, name_hint } => {
             if matches!(backend, Backend::Rex) && cfg.rex_picker_split {
-                rex::open_directory_split(path, split_beside, split_direction)?;
+                rex::open_directory(path, split_beside, placement)?;
             } else {
                 open_session(backend, path, name_hint, None)?;
             }

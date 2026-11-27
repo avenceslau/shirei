@@ -193,15 +193,16 @@ rex_picker_split = true
 ```
 
 In this mode the picker shows directories, not live sessions. Enter opens a
-focused split to the right of the picker and Alt+Enter opens one below it; the
-temporary picker pane can then close. It requires running inside Rex but does
+focused split to the right of the picker, Alt+Enter opens one below it, and
+Alt+T opens a new tab in the current session; the temporary picker pane can then
+close. It requires running inside Rex but does
 not need Remote Control. Branch commands and `shirei sessions` keep their
 normal session-based behavior.
 
 To run the picker in a floating layer, open the split beside the block that
 launched it with `shirei pick --split-beside BLOCK`. This `init.lua` binds
 `ctrl+a>f` to a floating picker, and makes Shift+Enter in that picker act as
-Alt+Enter, because fzf cannot tell Shift+Enter from Enter:
+Alt+T, because fzf cannot tell Shift+Enter from Enter:
 
 ```lua
 rex.action{
@@ -228,7 +229,7 @@ rex.bind("shift+enter", function(ctx)
   if described == nil or described.block.label ~= "shirei" then
     return false
   end
-  rex.block.call("com.superlogical.terminal", "write", { block_id = ctx.block_id, data = "\27\r" })
+  rex.block.call("com.superlogical.terminal", "write", { block_id = ctx.block_id, data = "\27t" })
   return true
 end)
 ```

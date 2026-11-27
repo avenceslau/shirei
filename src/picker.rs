@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::config::{expand_tilde, Config};
-use crate::rex::SplitDirection;
+use crate::rex::Placement;
 use crate::session::{self, Backend, Session};
 use crate::state::{StackBranch, State};
 
@@ -230,7 +230,7 @@ fn push_dir_row(
 
 pub struct Selection {
     pub index: usize,
-    pub split_direction: SplitDirection,
+    pub placement: Placement,
 }
 
 pub fn pick(rows: &[Row]) -> Result<Option<Selection>> {
@@ -254,7 +254,7 @@ pub fn pick(rows: &[Row]) -> Result<Option<Selection>> {
             "--tiebreak",
             "begin,index",
             "--expect",
-            "alt-enter",
+            "alt-enter,alt-t",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -287,9 +287,10 @@ pub fn pick(rows: &[Row]) -> Result<Option<Selection>> {
     let selected = String::from_utf8(output.stdout).context("fzf returned invalid utf-8")?;
     // --expect prints the accepting key (empty for Enter) on the line before the row.
     let mut lines = selected.lines();
-    let split_direction = match lines.next() {
-        Some("alt-enter") => SplitDirection::Below,
-        _ => SplitDirection::Right,
+    let placement = match lines.next() {
+        Some("alt-enter") => Placement::SplitBelow,
+        Some("alt-t") => Placement::Tab,
+        _ => Placement::SplitRight,
     };
     let Some(first) = lines
         .next()
@@ -306,6 +307,6 @@ pub fn pick(rows: &[Row]) -> Result<Option<Selection>> {
     }
     Ok(Some(Selection {
         index: idx,
-        split_direction,
+        placement,
     }))
 }
